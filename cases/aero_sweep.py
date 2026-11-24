@@ -4,7 +4,7 @@ Runs super_heavy_descent.py over a Mach x angle-of-attack matrix (default: point
 along CatchSim's nominal descent) with CUDA_VISIBLE_DEVICES pinned per process,
 then gathers every loads.json into one CSV that quatsim/aero.py can interpolate.
 
-  python cases/aero_sweep.py --gpus 12 --h 0.1 --fins cad_filled
+  python cases/aero_sweep.py --gpus 1 --h 0.3 --fins cad_filled
 """
 import sys, os, json, argparse, subprocess, itertools, time, csv
 
@@ -21,7 +21,7 @@ WINDWARD = [0.0, 90.0, 180.0]
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--gpus", type=int, default=1)
-    ap.add_argument("--h", type=float, default=0.1)
+    ap.add_argument("--h", type=float, default=0.3, help="0.3 m fits a 6 GB GPU")
     ap.add_argument("--fins", default="cad_filled")
     ap.add_argument("--out", default="results/sweep")
     ap.add_argument("--dry-run", action="store_true")

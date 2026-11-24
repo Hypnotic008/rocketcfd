@@ -37,8 +37,15 @@ python cases/validate_sod.py
 python cases/validate_cylinder.py 4
 python cases/super_heavy_geometry.py                         # STL + renders
 python cases/super_heavy_descent.py --h 0.1 --fins cad_filled
-python cases/aero_sweep.py --gpus 1 --h 0.25                 # descent x AoA x windward side
+python cases/aero_sweep.py --gpus 1 --h 0.3                  # descent x AoA x windward side
 ```
+
+### Sizing for the GPU
+
+The solver uses about 650 bytes per cell (float32, measured with XLA's memory analysis).
+On a 6 GB laptop RTX 4050, that's about 7 M cells, or h ~ 0.3 m for the full Super Heavy domain
+(106 x 44 x 44 m). Halving h needs 8x the memory and ~16x the time. Local refinement
+(roadmap 2) and a lower-memory flux loop are how finer grids will fit.
 
 
 ## Limits of this milestone (read before using numbers)
@@ -50,8 +57,8 @@ python cases/aero_sweep.py --gpus 1 --h 0.25                 # descent x AoA x w
   refinement exists, `cad_filled` treats each fin as a solid plate of the same outline.
   That overstates fin drag, especially supersonically, where real grid fins pass most of the flow.
   The transonic choking that CatchSim's notes call for needs the resolved lattice.
-* **Uniform grid, single device per case.** Fine for a 12-GPU sweep (one case per GPU);
-  a single huge case across GPUs comes later.
+* **Uniform grid, one GPU per case.** The sweep runs cases one after another on a single GPU,
+  or one per GPU on a multi-GPU machine.
 * **Geometry is estimated.** Dimensions follow the photo-measured V3 notes in
   [spacecraft-models/starship `dimensions.md`](https://github.com/spacecraft-models/starship/blob/main/dimensions.md),
   which tag each number as published, reported or estimated. Chine width is a guess.
@@ -59,7 +66,8 @@ python cases/aero_sweep.py --gpus 1 --h 0.25                 # descent x AoA x w
 
 ## Roadmap
 
-1. GPU run on the target machine; grid-convergence study (h = 0.4, 0.2, 0.1 m).
+1. GPU run on the target machine; grid-convergence study (h = 0.6, 0.45, 0.3 m);
+   cut memory per cell (~650 B now) so finer grids fit in 6 GB.
 2. Local refinement around the fins -> resolved lattice, fin-alone runs for
    Cn(Mach, alpha, deflection) and hinge moments, including transonic choking.
 3. Navier-Stokes + wall model (skin friction, base flow); transonic descent.
