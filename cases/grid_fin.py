@@ -30,6 +30,10 @@ def main():
     ap.add_argument("--alt", type=float, default=10745.0)
     ap.add_argument("--h", type=float, default=0.025, help="cell size around the fin [m]")
     ap.add_argument("--h-far", type=float, default=0.0, help="farfield cell size (default 24 x h)")
+    ap.add_argument("--fin", default="parametric", choices=["parametric", "cad"],
+                    help="parametric: V3 model with teeth (vehicles/grid_fin.py); cad: CatchSim's CAD scaled")
+    ap.add_argument("--plate", type=float, default=0.0, help="parametric fin: lattice plate thickness [m]")
+    ap.add_argument("--no-teeth", action="store_true", help="parametric fin without the toothed face")
     ap.add_argument("--plate-offset", type=float, default=0.0,
                     help="thin every plate by this much on each side [m] (e.g. 0.01 turns 4.5 cm into 2.5 cm)")
     ap.add_argument("--ascending", action="store_true",
@@ -50,17 +54,26 @@ def main():
     from rocketcfd.vehicles.super_heavy import load_fin_cad, SuperHeavyParams
     from rocketcfd.output import plot_slices
 
-    P = SuperHeavyParams()
-    sx, sy, sz = P.fin_scale
-    cad = load_fin_cad(P.fin_cad_path, P.fin_cad_res, False)
-    smin = min(sx, sy, sz)
     off = a.plate_offset
-    fin_sdf = lambda X, Y, Z: smin * cad(X / sx, Y / sy, Z / sz) + off
-    outline = load_fin_cad(P.fin_cad_path, P.fin_cad_res, True)
-    S_ref = outline.solid.any(axis=0).sum() * outline.res ** 2 * sy * sz
-    c_ref, b_ref = 6.0 * sy, 7.0 * sz
-    box = ((-0.75 * sx / 2 - 0.05, -3.0 * sy - 0.05, -0.05), (0.75 * sx / 2 + 0.05, 3.0 * sy + 0.05, 7.0 * sz + 0.05))
-    print(f"fin: {0.75*sx:.2f} m deep x {6*sy:.2f} m wide x {7*sz:.2f} m span, outline area S = {S_ref:.2f} m^2")
+    if a.fin == "parametric":
+        from rocketcfd.vehicles.grid_fin import GridFinParams, grid_fin_sdf, grid_fin_box, planform_area
+        GP = GridFinParams(teeth=not a.no_teeth, **({"plate": a.plate} if a.plate else {}))
+        fin_sdf = lambda X, Y, Z: grid_fin_sdf(X, Y, Z, GP) + off
+        S_ref, c_ref, b_ref = planform_area(GP), GP.width, GP.z_tip
+        box = grid_fin_box(GP, pad=0.05)
+        print(GP.summary(), f"| outline area S = {S_ref:.2f} m^2")
+    else:
+        P = SuperHeavyParams()
+        sx, sy, sz = P.fin_scale
+        cad = load_fin_cad(P.fin_cad_path, P.fin_cad_res, False)
+        smin = min(sx, sy, sz)
+        fin_sdf = lambda X, Y, Z: smin * cad(X / sx, Y / sy, Z / sz) + off
+        outline = load_fin_cad(P.fin_cad_path, P.fin_cad_res, True)
+        S_ref = outline.solid.any(axis=0).sum() * outline.res ** 2 * sy * sz
+        c_ref, b_ref = 6.0 * sy, 7.0 * sz
+        box = ((-0.75 * sx / 2 - 0.05, -3.0 * sy - 0.05, -0.05), (0.75 * sx / 2 + 0.05, 3.0 * sy + 0.05, 7.0 * sz + 0.05))
+        print(f"fin (CatchSim CAD): {0.75*sx:.2f} m deep x {6*sy:.2f} m wide x {7*sz:.2f} m span, "
+              f"outline area S = {S_ref:.2f} m^2")
 
     # generous farfield: choked / subsonic cases spill flow around the fin and need room
     lo, hi = (-9.0, -9.0, -6.0), (12.0, 9.0, 11.0)
@@ -88,6 +101,7 @@ def main():
     s = Solver(None, None, None, fs0, faces=faces, thin_sdf=fin_sdf, thin_box=box, cfl=0.7)
     print(f"setup {time.time()-t0:.1f} s")
     rows = []
+    zmid = 0.5 * (box[0][2] + box[1][2]) + 0.11      # a mid-span plane, off the lattice nodes
     first = True
     for mi, M in enumerate(machs):
         # descending: sweep incidence up then down so each new Mach starts from the alpha-0 state
@@ -130,9 +144,9 @@ def main():
             if al == max(alphas) or (al == 0 and M in (machs[0], machs[-1])):
                 f = s.fields()
                 plot_slices(f, f"{a.out}/fin_M{M:g}_a{al:g}_midspan.png",
-                            title=f"V3 grid fin, M {M}, alpha {al} deg: mid-span plane (z = 2.1 m)"
+                            title=f"V3 grid fin ({a.fin}), M {M}, alpha {al} deg: mid-span plane (z = {zmid:.1f} m)"
                                   f"{', plates thinned by %g m/side' % off if off else ''}",
-                            p_inf=p, normal_axis=2, at=2.1, window=((-1.5, 2.5), (-2.6, 2.6)))
+                            p_inf=p, normal_axis=2, at=zmid, window=((-1.5, 2.5), (-2.6, 2.6)))
             with open(f"{a.out}/grid_fin_sweep.csv", "w", newline="") as fh:
                 w = csv.DictWriter(fh, fieldnames=list(rows[0]))
                 w.writeheader()
@@ -163,7 +177,8 @@ def main():
         ax.set_title(t_)
         ax.grid(alpha=0.3)
         ax.legend(fontsize=8)
-    fig.suptitle(f"V3 grid fin (CatchSim CAD, isolated, inviscid), h = {a.h} m, S = {S_ref:.2f} m^2, "
+    fig.suptitle(f"V3 grid fin ({'parametric' + (', no teeth' if a.no_teeth else ', teeth') if a.fin == 'parametric' else 'CatchSim CAD'}"
+                 f", isolated, inviscid), h = {a.h} m, S = {S_ref:.2f} m^2, "
                  f"Mach {'ascending from rest' if a.ascending else 'descending, warm-started'}"
                  f"{', plates thinned %g m/side' % off if off else ''}")
     fig.savefig(f"{a.out}/grid_fin_sweep.png", dpi=130)

@@ -70,7 +70,7 @@ class SuperHeavyParams:
     fin_azimuths: tuple = (0.0, 90.0, 270.0)
     fin_x_center: float = 65.35
     fin_root_x_offset: float = -0.05      # CAD root sits just inside the hull
-    fin_model: str = "cad"                # 'cad' | 'cad_filled' | 'none'
+    fin_model: str = "parametric"         # 'parametric' (vehicles/grid_fin.py, as thin walls) | 'cad' | 'cad_filled' | 'none'
     fin_cad_path: str = DEFAULT_FIN_CAD
     # CAD is 0.75 (axial) x 6.0 (around) x 7.0 (radial) m; scale to 0.5 x 3.5 x 4.2 m
     fin_scale: tuple = (0.5 / 0.75, 3.5 / 6.0, 4.2 / 7.0)
@@ -132,15 +132,44 @@ def super_heavy_sdf(X, Y, Z, P: SuperHeavyParams = SuperHeavyParams()):
     a = P.dome_rise
     ell = (np.sqrt(((X - P.tank_top_x) / a) ** 2 + (rho / R) ** 2) - 1.0) * min(a, R)
     parts.append(g.intersect(ell, P.tank_top_x - 0.01 - X))
-    # grid fins and pods
+    # fin pods (always part of the hull) and, for the CAD fin models, the fins themselves
     if P.fin_model != "none":
         for k, az in enumerate(P.fin_azimuths):
             th = _az(az)
-            parts.append(_grid_fin_cad(X, Y, Z, P, th, np.radians(P.fin_deflection_deg[k])))
+            if P.fin_model in ("cad", "cad_filled"):
+                parts.append(_grid_fin_cad(X, Y, Z, P, th, np.radians(P.fin_deflection_deg[k])))
             r, t = g.radial_frame(Y, Z, th)
             parts.append(g.box_local(X - P.fin_x_center, r - (R + 0.5 * P.fin_pod_height - 0.1), t,
                                      P.fin_pod_radius, 0.5 * P.fin_pod_height + 0.1, P.fin_pod_radius))
     return g.union(*parts)
+
+
+def super_heavy_fins_sdf(X, Y, Z, P: SuperHeavyParams = SuperHeavyParams(), fin=None):
+    """The three parametric grid fins only (pass as the solver's thin_sdf: their ~1 cm plates
+    are thinner than any practical cell, so they are represented as blocked faces)."""
+    from .grid_fin import GridFinParams, grid_fin_sdf
+    fin = fin or GridFinParams()
+    out = np.full(np.shape(X), 1e9)
+    for k, az in enumerate(P.fin_azimuths):
+        th = _az(az)
+        r, t = g.radial_frame(Y, Z, th)
+        a = X - P.fin_x_center
+        near = (np.abs(a) < 0.5 * fin.depth + 0.5) & (r > P.radius - 0.5) & \
+            (r < P.radius + fin.z_tip + 0.5) & (np.abs(t) < fin.w + 0.5)
+        if not near.any():
+            continue
+        dl = np.radians(P.fin_deflection_deg[k])
+        cd, sd = np.cos(dl), np.sin(dl)
+        a2, t2 = a[near] * cd + t[near] * sd, -a[near] * sd + t[near] * cd
+        out[near] = np.minimum(out[near], grid_fin_sdf(a2, t2, r[near] - P.radius, fin))
+    return out
+
+
+def super_heavy_fins_box(P: SuperHeavyParams = SuperHeavyParams(), fin=None):
+    from .grid_fin import GridFinParams
+    fin = fin or GridFinParams()
+    rr = P.radius + fin.z_tip + 0.1
+    return ((P.fin_x_center - 0.5 * fin.depth - 0.1, -rr, -rr), (P.fin_x_center + 0.5 * fin.depth + 0.1, rr, rr))
 
 
 def _grid_fin_cad(X, Y, Z, P, theta, delta):

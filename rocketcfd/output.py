@@ -79,6 +79,35 @@ def write_stl(sdf, lo, hi, h, path):
     return verts, faces
 
 
+def write_stl_chunked(sdf, lo, hi, h, path, slab=48):
+    """Watertight STL of phi = 0 by marching cubes in slabs along z (bounded memory).
+    Slabs overlap by one voxel layer, so the pieces join without gaps."""
+    from skimage.measure import marching_cubes
+    ax = [np.arange(lo[d], hi[d] + h, h) for d in range(3)]
+    X, Y = np.meshgrid(ax[0], ax[1], indexing="ij")
+    tris = []
+    nz = len(ax[2])
+    for k0 in range(0, nz - 1, slab):
+        k1 = min(k0 + slab + 1, nz)
+        zs = ax[2][k0:k1]
+        phi = np.stack([sdf(X, Y, np.full_like(X, z)) for z in zs], axis=-1)
+        if phi.min() > 0 or phi.max() < 0 or phi.shape[2] < 2:
+            continue
+        v, f, _, _ = marching_cubes(phi, 0.0, spacing=(h, h, h))
+        v += np.array([ax[0][0], ax[1][0], zs[0]])
+        tris.append(v[f])
+    tri = np.concatenate(tris)
+    nrm = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+    nrm /= np.linalg.norm(nrm, axis=1, keepdims=True) + 1e-30
+    rec = np.zeros(len(tri), dtype=[("n", "<f4", 3), ("v", "<f4", (3, 3)), ("a", "<u2")])
+    rec["n"], rec["v"] = nrm, tri
+    with open(path, "wb") as fh:
+        fh.write(b"rocketcfd".ljust(80, b" "))
+        fh.write(np.uint32(len(tri)).tobytes())
+        fh.write(rec.tobytes())
+    return tri
+
+
 def render_mesh(verts, faces, path, title="", elev=15, azim=-60):
     from mpl_toolkits.mplot3d.art3d import Poly3DCollection
     tri = verts[faces]

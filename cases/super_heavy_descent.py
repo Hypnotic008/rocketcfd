@@ -49,7 +49,9 @@ def main(argv=None):
     ap.add_argument("--dry-run", action="store_true", help="print the grid and exit")
     ap.add_argument("--time-accurate", action="store_true",
                     help="global time step, all cells every step (off: local time steps + active tiles)")
-    ap.add_argument("--fins", default="cad_filled", choices=["none", "cad", "cad_filled"])
+    ap.add_argument("--fins", default="none", choices=["none", "parametric", "cad", "cad_filled"],
+                    help="parametric = V3 fin model as thin walls (needs cells well below the 0.31 m "
+                         "lattice spacing near the fins, e.g. --h-fins 0.03)")
     ap.add_argument("--fin-deflection", type=float, nargs=3, default=(0.0, 0.0, 0.0))
     ap.add_argument("--flowthroughs", type=float, default=4.0, help="maximum run length")
     ap.add_argument("--min-flowthroughs", type=float, default=1.0, help="never stop before this")
@@ -79,6 +81,11 @@ def main(argv=None):
 
     P = v3_params(fin_model=a.fins, fin_deflection_deg=tuple(a.fin_deflection))
     sdf = lambda X, Y, Z: super_heavy_sdf(X, Y, Z, P)
+    thin_sdf = thin_box = None
+    if a.fins == "parametric":
+        from rocketcfd.vehicles.super_heavy import super_heavy_fins_sdf, super_heavy_fins_box
+        thin_sdf = lambda X, Y, Z: super_heavy_fins_sdf(X, Y, Z, P)
+        thin_box = super_heavy_fins_box(P)
 
     L = P.length
     lo = (-15.5, -22.0, -22.0)
@@ -105,7 +112,7 @@ def main(argv=None):
             print(f"estimated GPU memory ~{n * per / 2**30:.1f} GB ({what}, ~{per} B/cell); "
                   f"setup needs ~{n * 120 / 2**30:.0f} GB of system RAM")
             return None
-    s = Solver(lo, hi, a.h, fs, sdf=sdf, cfl=0.7, dtype=dtype, faces=faces)
+    s = Solver(lo, hi, a.h, fs, sdf=sdf, cfl=0.7, dtype=dtype, faces=faces, thin_sdf=thin_sdf, thin_box=thin_box)
     if s.n_ib_fallback:
         print(f"note: {s.n_ib_fallback} ghost cells used nearest-fluid fallback (thin features)")
 
@@ -120,8 +127,10 @@ def main(argv=None):
     hist = []
     full = []
     # regions for the force breakdown (x ranges in the body frame)
+    xf0 = P.fin_x_center - 0.8
     PARTS = {"aft end": (0, -5.0, P.skirt_bottom_x + 0.6),
-             "hull": (0, P.skirt_bottom_x + 0.6, P.tank_top_x - 0.05),
+             "hull": (0, P.skirt_bottom_x + 0.6, xf0),
+             "fin band": (0, xf0, P.tank_top_x - 0.05),      # fins, pods and the hull beside them
              "top": (0, P.tank_top_x - 0.05, 1e9)}
     KEYS = ("CD", "CL", "CN", "CS", "C_roll", "C_restore")
     min_steps = int(a.min_flowthroughs / a.flowthroughs * nsteps)
@@ -193,7 +202,7 @@ def main(argv=None):
     print(f"  CD {avg['CD']:.4f} ± {std['CD']:.4f}   CN {avg['CN']:+.4f} ± {std['CN']:.4f}   "
           f"C_restore {avg['C_restore']:+.5f} ± {std['C_restore']:.5f}")
     for n in PARTS:
-        print(f"    {n:8s}: CD {avg[f'CD[{n}]']:+.4f} ± {std[f'CD[{n}]']:.4f}   CN {avg[f'CN[{n}]']:+.4f}   "
+        print(f"    {n:9s}: CD {avg[f'CD[{n}]']:+.4f} ± {std[f'CD[{n}]']:.4f}   CN {avg[f'CN[{n}]']:+.4f}   "
               f"C_restore {avg[f'C_restore[{n}]']:+.5f}")
     print(f"drag coefficient        CFD {ce['drag_coefficient']:.3f}   CatchSim body {ref['cd_body']:.3f}, "
           f"with fin factor {ref['cd_with_fins']:.3f}")
