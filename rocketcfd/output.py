@@ -34,15 +34,17 @@ def plot_slices(f, path, title="", p_inf=None, normal_axis=2, extra=None):
 
 
 def write_vtk(f, path):
-    """Legacy binary VTK structured points, readable by ParaView/VisIt."""
+    """Legacy binary VTK rectilinear grid (handles stretched grids), for ParaView/VisIt."""
     x, y, z = f["x"], f["y"], f["z"]
     nx, ny, nz = len(x), len(y), len(z)
-    dx = [a[1] - a[0] if len(a) > 1 else 1.0 for a in (x, y, z)]
     with open(path, "wb") as fh:
-        hdr = (f"# vtk DataFile Version 3.0\nrocketcfd\nBINARY\nDATASET STRUCTURED_POINTS\n"
-               f"DIMENSIONS {nx} {ny} {nz}\nORIGIN {x[0]} {y[0]} {z[0]}\n"
-               f"SPACING {dx[0]} {dx[1]} {dx[2]}\nPOINT_DATA {nx*ny*nz}\n")
-        fh.write(hdr.encode())
+        fh.write(f"# vtk DataFile Version 3.0\nrocketcfd\nBINARY\nDATASET RECTILINEAR_GRID\n"
+                 f"DIMENSIONS {nx} {ny} {nz}\n".encode())
+        for name, c in (("X", x), ("Y", y), ("Z", z)):
+            fh.write(f"{name}_COORDINATES {len(c)} float\n".encode())
+            fh.write(np.asarray(c).astype(">f4").tobytes())
+            fh.write(b"\n")
+        fh.write(f"POINT_DATA {nx*ny*nz}\n".encode())
         for name in ("rho", "p", "mach", "phi"):
             fh.write(f"SCALARS {name} float 1\nLOOKUP_TABLE default\n".encode())
             fh.write(np.ascontiguousarray(f[name].transpose(2, 1, 0)).astype(">f4").tobytes())

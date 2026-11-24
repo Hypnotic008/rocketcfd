@@ -40,10 +40,12 @@ def _limit(a, b, kind):
 class Solver:
     def __init__(self, lo, hi, h, freestream, sdf=None, gamma=1.4, bcs="auto", cfl=0.7,
                  limiter="vanleer", shock_threshold=0.5, dtype=torch.float32, device=None,
-                 verbose=True):
+                 verbose=True, faces=None):
         """
         lo, hi     : domain corners (m)
         h          : cell size, scalar or (hx, hy, hz)
+        faces      : optional [x_faces, y_faces, z_faces] for a stretched grid
+                     (see rocketcfd.grid); overrides lo, hi and h
         freestream : dict(rho, u, v, w, p)  (SI)
         sdf        : callable(X, Y, Z) -> phi  (phi < 0 inside solid), or None
         bcs        : 'auto' or {(axis, side): 'freestream'|'extrapolate'|'periodic'}
@@ -54,17 +56,32 @@ class Solver:
         self.dtype = dtype
         self.device = torch.device(device) if device is not None else default_device()
         self.verbose = verbose
-        self.lo = np.asarray(lo, float)
-        self.h = np.broadcast_to(np.asarray(h, float), (3,)).copy()
-        self.n = tuple(int(round(v)) for v in (np.asarray(hi, float) - self.lo) / self.h)
-        self.hi = self.lo + self.h * np.array(self.n)
+        if faces is None:
+            lo_ = np.asarray(lo, float)
+            h_ = np.broadcast_to(np.asarray(h, float), (3,))
+            n_ = [int(round(v)) for v in (np.asarray(hi, float) - lo_) / h_]
+            faces = [lo_[d] + h_[d] * np.arange(n_[d] + 1) for d in range(3)]
+        self.faces = [np.asarray(f, float) for f in faces]
+        self.n = tuple(len(f) - 1 for f in self.faces)
+        self.lo = np.array([f[0] for f in self.faces])
+        self.hi = np.array([f[-1] for f in self.faces])
+        w = [np.diff(f) for f in self.faces]
+        self.h = np.array([wd.min() for wd in w])          # smallest cell size per axis
+        self.h_max = np.array([wd.max() for wd in w])
+        # padded cell widths and centres (ghost layers copy the edge cell width)
+        self.widths = [np.concatenate([np.full(NG, wd[0]), wd, np.full(NG, wd[-1])]) for wd in w]
+        self.axes = []
+        for d in range(3):
+            c = 0.5 * (self.faces[d][:-1] + self.faces[d][1:])
+            left = c[0] - w[d][0] * np.arange(NG, 0, -1)
+            right = c[-1] + w[d][-1] * np.arange(1, NG + 1)
+            self.axes.append(np.concatenate([left, c, right]))
         self.fs = freestream
         self.W_inf = np.array([freestream[k] for k in ("rho", "u", "v", "w", "p")], float)
         self.rho_min = 1e-4 * freestream["rho"]
         self.p_min = 1e-4 * freestream["p"]
 
         t0 = time.time()
-        self.axes = [self.lo[d] + (np.arange(-NG, self.n[d] + NG) + 0.5) * self.h[d] for d in range(3)]
         shape = tuple(m + 2 * NG for m in self.n)
         if sdf is None:
             self.phi = np.full(shape, 1e9)
@@ -77,7 +94,9 @@ class Solver:
         dev = self.device
         if verbose:
             name = torch.cuda.get_device_name(dev) if dev.type == "cuda" else "cpu"
-            print(f"grid {self.n} = {np.prod(self.n)/1e6:.2f} M cells, h = {self.h}, "
+            hs = ", ".join(f"{a:.3g}" if abs(a - b) < 1e-9 else f"{a:.3g}..{b:.3g}"
+                           for a, b in zip(self.h, self.h_max))
+            print(f"grid {self.n} = {np.prod(self.n)/1e6:.2f} M cells, cell size [{hs}] m, "
                   f"{self.n_ghost} IB ghost cells, setup {time.time()-t0:.1f} s, device {name}")
 
         interior = np.zeros(shape, bool)
@@ -85,6 +104,11 @@ class Solver:
         self.update_mask = torch.as_tensor((self.fluid & interior)[NG:-NG, NG:-NG, NG:-NG], device=dev)
         self.n_fluid = int(self.update_mask.sum())
         self.W_inf_t = torch.as_tensor(self.W_inf, dtype=dtype, device=dev)
+        self.invw = []
+        for d in range(3):
+            shp = [1, 1, 1]
+            shp[d] = self.n[d]
+            self.invw.append(torch.as_tensor(1.0 / w[d], dtype=dtype, device=dev).reshape(shp))
         W0 = self.W_inf_t.reshape(5, 1, 1, 1).expand((5,) + shape).contiguous()
         self.U = prim_to_cons(W0, gamma)
         self.t = 0.0
@@ -104,7 +128,7 @@ class Solver:
                 self.bcs[(d, side)] = kind
 
     def _setup_ib(self):
-        phi, h = self.phi, self.h
+        phi = self.phi
         self.fluid = phi > 0
         solid = ~self.fluid
         cross = ndimage.generate_binary_structure(3, 1)
@@ -115,13 +139,14 @@ class Solver:
         if gi.size == 0:
             self.ib = None
             return
-        grads = np.gradient(phi, *h)
+        grads = np.gradient(phi, *self.axes)
         nrm = np.stack([gd.ravel()[gi] for gd in grads])
         nrm /= np.linalg.norm(nrm, axis=0) + 1e-30
         shape = phi.shape
         ijk = np.stack(np.unravel_index(gi, shape)).astype(float)
         xg = np.stack([self.axes[d][ijk[d].astype(int)] for d in range(3)])
-        dist0 = np.maximum(-2.0 * phi.ravel()[gi], 0.5 * h.min())
+        hloc = np.minimum.reduce([self.widths[d][ijk[d].astype(int)] for d in range(3)])
+        dist0 = np.maximum(-2.0 * phi.ravel()[gi], 0.5 * hloc)
         fluid_f = self.fluid.ravel()
 
         cidx = np.zeros((gi.size, 8), np.int64)
@@ -131,10 +156,14 @@ class Solver:
             if not todo.any():
                 break
             sel = np.flatnonzero(todo)
-            xi = xg[:, sel] + (dist0[sel] + extra * h.min()) * nrm[:, sel]
-            f = np.stack([(xi[d] - self.lo[d]) / h[d] - 0.5 + NG for d in range(3)])
-            i0 = np.floor(f).astype(np.int64)
-            fr = f - i0
+            xi = xg[:, sel] + (dist0[sel] + extra * hloc[sel]) * nrm[:, sel]
+            i0 = np.empty((3, sel.size), np.int64)
+            fr = np.empty((3, sel.size))
+            for d in range(3):
+                c = self.axes[d]
+                k = np.clip(np.searchsorted(c, xi[d]) - 1, 0, len(c) - 2)
+                i0[d] = k
+                fr[d] = np.clip((xi[d] - c[k]) / (c[k + 1] - c[k]), 0.0, 1.0)
             k = 0
             for a in (0, 1):
                 for b in (0, 1):
@@ -225,7 +254,7 @@ class Solver:
             WR = torch.where(bad, qp1, WR)
             hl = _sl(Sc, d, 1, N + 2) | _sl(Sc, d, 2, N + 3)
             F = hllc_flux(WL, WR, d, g, hl)
-            div = (_sl(F, ax, 1, N + 1) - _sl(F, ax, 0, N)) / float(self.h[d])
+            div = (_sl(F, ax, 1, N + 1) - _sl(F, ax, 0, N)) * self.invw[d]
             R = -div if R is None else R - div
         return R
 
@@ -243,7 +272,7 @@ class Solver:
         W = self._prim(U)
         Wi = self._interior(W)
         c = torch.sqrt(g * Wi[4] / Wi[0])
-        rate = sum((Wi[1 + d].abs() + c) / float(self.h[d]) for d in range(3) if self.n[d] > 1)
+        rate = sum((Wi[1 + d].abs() + c) * self.invw[d] for d in range(3) if self.n[d] > 1)
         dt = self.cfl / torch.where(m, rate, torch.zeros_like(rate)).max()
         R0 = self._residual(W, order)
         Ui = self._interior(U)
@@ -314,17 +343,20 @@ class Solver:
         Returns body-axis force/moment coefficients and wind-axis drag/lift."""
         W = self.primitive()
         phi = self.phi
-        eps = band * self.h.min()
+        wx, wy, wz = self.widths
+        hloc = np.minimum(np.minimum(wx[:, None, None], wy[None, :, None]), wz[None, None, :])
+        eps = band * hloc
         bandm = np.abs(phi) < eps
-        delta = np.where(bandm, (1 + np.cos(np.pi * phi / eps)) / (2 * eps), 0.0)
-        grads = np.gradient(phi, *self.h)
-        gn = np.sqrt(sum(gd * gd for gd in grads)) + 1e-30
-        dV = np.prod(self.h)
-        dp = (W[4] - self.W_inf[4]) * delta * dV
         idx = np.nonzero(bandm)
-        F = np.array([-(dp[idx] * grads[d][idx] / gn[idx]).sum() for d in range(3)])
+        e = eps[idx]
+        delta = (1 + np.cos(np.pi * phi[idx] / e)) / (2 * e)
+        grads = np.gradient(phi, *self.axes)
+        gn = np.sqrt(sum(gd[idx] ** 2 for gd in grads)) + 1e-30
+        dV = wx[idx[0]] * wy[idx[1]] * wz[idx[2]]
+        dp = (W[4][idx] - self.W_inf[4]) * delta * dV
+        dF = np.stack([-(dp * grads[d][idx] / gn) for d in range(3)])
+        F = dF.sum(1)
         r = np.stack([self.axes[d][idx[d]] - x_ref[d] for d in range(3)])
-        dF = np.stack([-(dp[idx] * grads[d][idx] / gn[idx]) for d in range(3)])
         M = np.cross(r.T, dF.T).sum(0)
         V = self.W_inf[1:4]
         Vm = np.linalg.norm(V)
@@ -351,7 +383,8 @@ class Solver:
 
     def save(self, path):
         np.savez_compressed(path, U=self.U.cpu().numpy(), t=self.t, step=self.step_count,
-                            lo=self.lo, h=self.h, n=self.n, history=np.array(self.history))
+                            fx=self.faces[0], fy=self.faces[1], fz=self.faces[2],
+                            history=np.array(self.history))
 
     def load(self, path):
         d = np.load(path)
