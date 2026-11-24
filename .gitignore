@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+# large generated outputs
+results/**/*.vtk
+results/**/*.npz
+results/**/*.stl
+results/**/log.txt
+results/*.log
