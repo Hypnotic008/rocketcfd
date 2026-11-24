@@ -35,6 +35,46 @@ guessed aero coefficients in CatchSim (`quatsim/aero.py`).
 | Same plate tilted across the grid (staircase walls) | shock-expansion theory | CN +6.1 % (100 cells/chord), -2.5 % (200 cells/chord) |
 | Warp kernels vs PyTorch reference (Sod, cylinder, 3-D sphere) | identical numerics | max difference 2e-4 (float32) |
 
+## Results so far
+
+### Super Heavy V3 body without fins: grid-convergence study
+
+Mach 2.82 at 10.7 km (CatchSim's peak dynamic pressure on descent), 5 deg off engines-first,
+crossflow onto the raceway side. Run on an RTX 4050 Laptop GPU; the finest grid (20.8 M cells,
+0.125 m near the body) took 16 minutes. Coefficients use CatchSim's references
+(S = 63.6 m^2, L = 72.3 m, moments about the centre of mass at 0.40 L from the engines).
+
+| near-body cell size | 0.5 m | 0.35 m | 0.25 m | 0.18 m | 0.125 m |
+|---|---|---|---|---|---|
+| cells | 0.48 M | 1.22 M | 3.01 M | 7.46 M | 20.8 M |
+| CD | 2.218 | 2.158 | 2.265 | 2.064 | 2.108 |
+| CN | 0.207 | 0.188 | 0.208 | 0.216 | 0.219 |
+| restoring moment | -0.050 | -0.041 | -0.050 | -0.056 | -0.055 |
+
+Breakdown on the finest grid (averaged over the end of the run; the flow is steady to 0.1 %):
+
+| region | CD | CN | restoring moment |
+|---|---|---|---|
+| engine end (33 bells, thrust plate) | 1.929 | 0.057 | -0.021 |
+| hull and chines | 0.034 | 0.162 | -0.034 |
+| top (dome, wake) | 0.146 | 0.000 | +0.000 |
+
+Best estimates and how they compare with CatchSim (`quatsim/aero.py`):
+
+| | CFD | CatchSim |
+|---|---|---|
+| drag CD (body) | 2.11 +/- 0.10 | 1.285 (body guess); 2.57 total after the flight-calibrated x2 fin factor |
+| normal-force slope (per rad) | 2.5 +/- 0.1 | 2.0 |
+| restoring-moment slope (per rad) | -0.63 +/- 0.03: the bare body is unstable engines-first | +0.35 (whole vehicle) |
+
+* Normal force and restoring moment converge (finest two grids within 1-2 %).
+* Drag scatters by about +/- 5 % because almost all of it acts on the engine end, where the
+  outer nozzles are only ~4 cm apart: each grid opens or closes those gaps differently. Resolving
+  them needs a ~6 cm engine-end zone.
+* The body supplies ~2.1 of CatchSim's flight-calibrated 2.57; fins and viscous drag share the rest.
+* For CatchSim's +0.35 stability, the grid fins must contribute about +1.0: the fin sweep
+  (`cases/grid_fin.py`) is the next result.
+
 ## Running
 
 Windows or Linux, NVIDIA GPU (no WSL needed):
