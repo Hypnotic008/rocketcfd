@@ -522,7 +522,7 @@ class Solver:
                     phi=self.phi[NG:-NG, NG:-NG, NG:-NG],
                     x=self.axes[0][NG:-NG], y=self.axes[1][NG:-NG], z=self.axes[2][NG:-NG])
 
-    def loads(self, S_ref, L_ref, x_ref=(0.0, 0.0, 0.0), band=1.5):
+    def loads(self, S_ref, L_ref, x_ref=(0.0, 0.0, 0.0), band=1.5, parts=None):
         """Integrate surface pressure: -∮ (p - p_inf) n dA via a smoothed delta function.
         Returns body-axis force/moment coefficients and wind-axis drag/lift.
         The surface band and its weights are computed once; each call only gathers the
@@ -557,6 +557,16 @@ class Solver:
             M_thin = np.cross(rt.T, dFt.T).sum(0)
         F = F_ib + F_thin
         M = M_ib + M_thin
+        part_out = {}
+        for name, (axis, lo_, hi_) in (parts or {}).items():
+            sel = (sf["pos"][axis] >= lo_) & (sf["pos"][axis] < hi_)
+            Fp = dF[:, sel].sum(1)
+            Mp = np.cross(r[:, sel].T, dF[:, sel].T).sum(0)
+            if tf is not None:
+                selt = (tf["pos"][axis] >= lo_) & (tf["pos"][axis] < hi_)
+                Fp = Fp + dFt[:, selt].sum(1)
+                Mp = Mp + np.cross(rt[:, selt].T, dFt[:, selt].T).sum(0)
+            part_out[name] = (Fp, Mp)
         V = self.W_inf[1:4]
         Vm = np.linalg.norm(V)
         q = 0.5 * self.W_inf[0] * Vm ** 2
@@ -576,7 +586,11 @@ class Solver:
         restore_axis = np.cross(ex, e_d)
         restore_axis = restore_axis / np.linalg.norm(restore_axis) if np.linalg.norm(restore_axis) > 1e-9 \
             else -side
-        return dict(F=F, M=M, F_thin=F_thin, M_thin=M_thin, q_inf=q,
+        qs = q * S_ref
+        parts_c = {k: dict(CD=float(v[0] @ e_d / qs), CN=float(v[0] @ cross / qs),
+                           C_restore=float(v[1] @ restore_axis / (qs * L_ref)))
+                   for k, v in part_out.items()}
+        return dict(F=F, M=M, F_thin=F_thin, M_thin=M_thin, q_inf=q, parts=parts_c,
                     C_thin=F_thin / (q * S_ref), Cm_thin=M_thin / (q * S_ref * L_ref),
                     CX=Cf[0], CY=Cf[1], CZ=Cf[2],
                     Cl=Cm[0], Cm=Cm[1], Cn=Cm[2], CD=Cf @ e_d, CL=Cf @ lift_dir,

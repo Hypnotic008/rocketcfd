@@ -12,6 +12,7 @@ import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 KEYS = (("CD", "drag CD"), ("CN", "normal force CN"), ("C_restore", "restoring moment"))
+FORMAL_ORDER = 2.0      # MUSCL + SSP-RK2; staircase/immersed walls can reduce it locally
 
 
 def richardson(hs, fs):
@@ -26,10 +27,16 @@ def richardson(hs, fs):
     for _ in range(50):
         q = np.log((r21 ** p - np.sign(e32 / e21)) / (r32 ** p - np.sign(e32 / e21)))
         p = abs(np.log(abs(e32 / e21)) + q) / np.log(r21)
-    p = float(np.clip(p, 0.5, 4.0))
+    # An observed order above the scheme's formal order (2) means the differences are not
+    # yet in the asymptotic range; using it would give an over-optimistic error band.
+    # Standard practice (Roache): cap at the formal order and use safety factor 3 when capped.
+    p_obs = float(p)
+    capped = p_obs > FORMAL_ORDER or p_obs < 0.5
+    p = float(np.clip(p_obs, 0.5, FORMAL_ORDER))
+    fs_ = 3.0 if capped else 1.25
     f_ext = f1 + (f1 - f2) / (r21 ** p - 1)
-    gci = 1.25 * abs(e21) / (r21 ** p - 1)
-    return p, f_ext, gci
+    gci = fs_ * abs(e21) / (r21 ** p - 1)
+    return p_obs, f_ext, gci
 
 
 def main():
@@ -58,8 +65,9 @@ def main():
             print(f"=== h = {h} m done in {(time.time()-t0)/60:.1f} min\n", flush=True)
         if os.path.exists(f"{out}/loads.json"):
             r = json.load(open(f"{out}/loads.json"))
+            co = r.get("averaged", r["coefficients"])          # time-averaged loads when available
             rows.append(dict(h=h, cells=r["grid"]["cells"], wall_s=r["grid"]["wall_s"],
-                             **{k: r["coefficients"][k] for k, _ in KEYS}))
+                             **{k: co.get(k, r["coefficients"][k]) for k, _ in KEYS}))
 
     if len(rows) < 2:
         print("need at least two finished grids")
@@ -76,7 +84,7 @@ def main():
         ax.plot(hs, fs, "o-", color="C0", label="CFD")
         p, f_ext, gci = richardson(hs, fs) if len(rows) >= 3 else (None, None, None)
         if f_ext is not None:
-            ax.axhline(f_ext, color="C3", ls="--", lw=1, label=f"extrapolated {f_ext:.4f} (order {p:.2f})")
+            ax.axhline(f_ext, color="C3", ls="--", lw=1, label=f"extrapolated {f_ext:.4f} (observed order {p:.1f})")
             ax.axhspan(f_ext - gci, f_ext + gci, color="C3", alpha=0.12, label=f"GCI ±{gci:.4f}")
         summary[k] = dict(values=fs.tolist(), extrapolated=f_ext, order=p, gci=gci)
         ax.set_xlabel("near-body cell size h [m]")
@@ -96,7 +104,9 @@ def main():
     for k, _ in KEYS:
         sm = summary[k]
         if sm["extrapolated"] is not None:
-            print(f"{k:>10}: grid-converged {sm['extrapolated']:.4f} ± {sm['gci']:.4f} (observed order {sm['order']:.2f})")
+            note = "" if 0.5 <= sm["order"] <= FORMAL_ORDER else \
+                f" (observed order {sm['order']:.1f} > {FORMAL_ORDER:g}: capped, safety factor 3)"
+            print(f"{k:>10}: grid-converged {sm['extrapolated']:.4f} ± {sm['gci']:.4f}{note}")
         else:
             print(f"{k:>10}: not yet in the asymptotic range (values not monotonic); add a finer grid")
 

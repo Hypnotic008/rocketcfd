@@ -116,11 +116,19 @@ def main(argv=None):
     print(f"running up to {nsteps} steps ({a.flowthroughs:g} flow-throughs), stopping early when converged")
 
     hist = []
+    full = []
+    # regions for the force breakdown (x ranges in the body frame)
+    PARTS = {"aft end": (0, -5.0, P.skirt_bottom_x + 0.6),
+             "hull": (0, P.skirt_bottom_x + 0.6, P.tank_top_x - 0.05),
+             "top": (0, P.tank_top_x - 0.05, 1e9)}
+    KEYS = ("CD", "CL", "CN", "CS", "C_roll", "C_restore")
     min_steps = int(a.min_flowthroughs / a.flowthroughs * nsteps)
 
     def report(sv):
-        ld = sv.loads(**REFERENCE)
+        ld = sv.loads(**REFERENCE, parts=PARTS)
         hist.append((sv.step_count, sv.t, ld["CD"], ld["CN"], ld["C_restore"]))
+        full.append(dict({k: float(ld[k]) for k in KEYS},
+                         **{f"{k}[{n}]": v[k] for n, v in ld["parts"].items() for k in ("CD", "CN", "C_restore")}))
         print(f"      CD {ld['CD']:.4f}  CL {ld['CL']:+.4f}  CN {ld['CN']:+.4f}  CS {ld['CS']:+.4f}  "
               f"C_restore {ld['C_restore']:+.5f}  C_roll {ld['C_roll']:+.5f}", flush=True)
         if a.tol > 0 and sv.step_count >= min_steps and len(hist) >= 4:
@@ -137,8 +145,13 @@ def main(argv=None):
     s.run(nsteps, chunk=chunk, first_order_steps=400, report=report)
     wall = time.time() - t0
 
-    ld = s.loads(**REFERENCE)
+    ld = s.loads(**REFERENCE, parts=PARTS)
     sa = np.sin(al)
+    # average over the last quarter of the load checks (at least 4): unsteady wakes make a
+    # single snapshot misleading; the standard deviation shows how unsteady it was
+    tail = full[-max(4, len(full) // 4):]
+    avg = {k: float(np.mean([t_[k] for t_ in tail])) for k in tail[0]}
+    std = {k: float(np.std([t_[k] for t_ in tail])) for k in tail[0]}
     ref = catchsim_reference(a.mach, a.aoa)
     res = dict(
         condition=dict(alt=a.alt, mach=a.mach, aoa_from_engines_first=a.aoa, V=V, q=q, p=p, rho=rho, T=T),
@@ -150,10 +163,11 @@ def main(argv=None):
         condition_windward=a.windward,
         coefficients={k: float(ld[k]) for k in ("CD", "CL", "CN", "CS", "CX", "CY", "CZ",
                                                   "Cl", "Cm", "Cn", "C_roll", "C_restore")},
+        averaged=avg, averaged_std=std, averaged_over_checks=len(tail),
         catchsim_equivalent=dict(
-            drag_coefficient=ld["CD"],
-            cn_alpha=ld["CN"] / sa if sa > 1e-6 else None,
-            cm_alpha=ld["C_restore"] / sa if sa > 1e-6 else None,   # >0: restoring (engines-first stable)
+            drag_coefficient=avg["CD"],
+            cn_alpha=avg["CN"] / sa if sa > 1e-6 else None,
+            cm_alpha=avg["C_restore"] / sa if sa > 1e-6 else None,   # >0: restoring (engines-first stable)
         ),
         catchsim_current=ref,
         reference=dict(S_ref=REFERENCE["S_ref"], L_ref=REFERENCE["L_ref"], x_ref=list(REFERENCE["x_ref"])),
@@ -173,6 +187,12 @@ def main(argv=None):
     ce = res["catchsim_equivalent"]
     print("\n=== result ===")
     print(f"cells {np.prod(s.n)/1e6:.2f} M, {s.step_count} steps, {wall/60:.1f} min")
+    print(f"averaged over the last {len(tail)} load checks (± = unsteadiness, 1 std):")
+    print(f"  CD {avg['CD']:.4f} ± {std['CD']:.4f}   CN {avg['CN']:+.4f} ± {std['CN']:.4f}   "
+          f"C_restore {avg['C_restore']:+.5f} ± {std['C_restore']:.5f}")
+    for n in PARTS:
+        print(f"    {n:8s}: CD {avg[f'CD[{n}]']:+.4f} ± {std[f'CD[{n}]']:.4f}   CN {avg[f'CN[{n}]']:+.4f}   "
+              f"C_restore {avg[f'C_restore[{n}]']:+.5f}")
     print(f"drag coefficient        CFD {ce['drag_coefficient']:.3f}   CatchSim body {ref['cd_body']:.3f}, "
           f"with fin factor {ref['cd_with_fins']:.3f}")
     if ce["cn_alpha"] is not None:
