@@ -40,7 +40,7 @@ def _limit(a, b, kind):
 class Solver:
     def __init__(self, lo, hi, h, freestream, sdf=None, gamma=1.4, bcs="auto", cfl=0.7,
                  limiter="vanleer", shock_threshold=0.5, dtype=torch.float32, device=None,
-                 verbose=True, faces=None):
+                 verbose=True, faces=None, backend="auto"):
         """
         lo, hi     : domain corners (m)
         h          : cell size, scalar or (hx, hy, hz)
@@ -50,6 +50,7 @@ class Solver:
         sdf        : callable(X, Y, Z) -> phi  (phi < 0 inside solid), or None
         bcs        : 'auto' or {(axis, side): 'freestream'|'extrapolate'|'periodic'}
         device     : torch device; default CUDA if available, else CPU
+        backend    : 'warp' (fused kernels, float32), 'torch' (reference), or 'auto'
         """
         self.gamma, self.cfl, self.limiter = gamma, cfl, limiter
         self.shock_threshold = shock_threshold
@@ -114,6 +115,63 @@ class Solver:
         self.t = 0.0
         self.step_count = 0
         self.history = []
+        self.backend = self._pick_backend(backend)
+        if self.backend == "warp":
+            self._setup_warp()
+        if verbose:
+            print(f"backend: {self.backend}")
+
+    def _pick_backend(self, backend):
+        if backend == "torch":
+            return "torch"
+        ok = self.dtype == torch.float32
+        try:
+            import warp  # noqa: F401
+        except ImportError:
+            ok = False
+        if backend == "warp" and not ok:
+            raise RuntimeError("warp backend needs `pip install warp-lang` and float32")
+        return "warp" if ok else "torch"
+
+    def _setup_warp(self):
+        import warp as wp
+        from . import kernels as K
+        self._wp, self._K = wp, K
+        wp.init()
+        dev = self.device
+        self._wdev = f"cuda:{dev.index or 0}" if dev.type == "cuda" else "cpu"
+        shape = self.U.shape[1:]
+        self.W_buf = torch.empty_like(self.U)
+        self.U1 = self.U.clone()
+        self.R_buf = torch.zeros((5,) + self.n, dtype=self.dtype, device=dev)
+        self.S_buf = torch.zeros(shape, dtype=torch.int32, device=dev)
+        self.rate_buf = torch.zeros(self.n, dtype=self.dtype, device=dev)
+        self.dt_buf = torch.zeros(1, dtype=self.dtype, device=dev)
+        self.mask_f = self.update_mask.to(self.dtype)
+        self.invw1 = [self.invw[d].reshape(-1).contiguous() for d in range(3)]
+        f = wp.from_torch
+        self._w = dict(U=f(self.U), U1=f(self.U1), W=f(self.W_buf), R=f(self.R_buf), S=f(self.S_buf),
+                       rate=f(self.rate_buf), dt=f(self.dt_buf), mask=f(self.mask_f),
+                       ix=f(self.invw1[0]), iy=f(self.invw1[1]), iz=f(self.invw1[2]))
+        self._active_flux = wp.vec3i(*[0 if (self.n[d] == 1 and self.bcs[(d, 0)] == "periodic") else 1
+                                       for d in range(3)])
+        self._active_sensor = wp.vec3i(*[1 if self.n[d] > 1 else 0 for d in range(3)])
+        self._wp_ib = None
+        if self.ib is not None:
+            shape_np = tuple(int(v) for v in shape)
+            gi = self.ib["g"].cpu().numpy()
+            ci = self.ib["c"].cpu().numpy()
+            g3 = np.stack(np.unravel_index(gi, shape_np), -1).astype(np.int32)
+            c3 = np.stack(np.unravel_index(ci, shape_np), -1).astype(np.int32)
+            self._wp_ib = dict(
+                n=len(gi),
+                ghost=wp.array(g3, dtype=wp.vec3i, device=self._wdev),
+                corner=wp.array(c3, dtype=wp.vec3i, device=self._wdev),
+                weight=wp.array(self.ib["w"].cpu().numpy().astype(np.float32), dtype=wp.float32,
+                                device=self._wdev),
+                normal=wp.array(self.ib["n"].cpu().numpy().T.astype(np.float32), dtype=wp.vec3,
+                                device=self._wdev))
+        self._wp_stream = wp.stream_from_torch(torch.cuda.current_stream(dev)) if dev.type == "cuda" else None
 
     # ------------------------------------------------------------------ setup
     def _setup_bcs(self, bcs):
@@ -265,8 +323,49 @@ class Solver:
     def _interior(self, A):
         return A[:, NG:-NG, NG:-NG, NG:-NG]
 
-    def _step(self, order):
+    # ------------------------------------------------------------ warp path
+    def _wprim(self, Ukey):
+        wp, K, w = self._wp, self._K, self._w
+        shape = tuple(self.U.shape[1:])
+        wp.launch(K.prim_kernel, dim=shape, inputs=[w[Ukey], self.gamma, self.rho_min, self.p_min, w["W"]],
+                  device=self._wdev, stream=self._wp_stream)
+        self._fill_bc(self.W_buf)
+        ib = self._wp_ib
+        if ib is not None:
+            wp.launch(K.ib_kernel, dim=ib["n"], inputs=[w["W"], ib["ghost"], ib["corner"], ib["weight"],
+                                                       ib["normal"]], device=self._wdev, stream=self._wp_stream)
+        wp.launch(K.shock_kernel, dim=shape, inputs=[w["W"], self._active_sensor, self.shock_threshold, w["S"]],
+                  device=self._wdev, stream=self._wp_stream)
+
+    def _wresidual(self, order):
+        wp, K, w = self._wp, self._K, self._w
+        kind = 1 if self.limiter == "minmod" else 0
+        wp.launch(K.residual_kernel, dim=self.n,
+                  inputs=[w["W"], w["S"], w["ix"], w["iy"], w["iz"], self._active_flux, self.gamma,
+                          float(order), kind, w["R"]], device=self._wdev, stream=self._wp_stream)
+
+    def _step_warp(self, order, want_res=False):
+        wp, K, w = self._wp, self._K, self._w
+        self._wprim("U")
+        wp.launch(K.rate_kernel, dim=self.n, inputs=[w["W"], w["ix"], w["iy"], w["iz"], self._active_flux,
+                                                     w["mask"], self.gamma, w["rate"]],
+                  device=self._wdev, stream=self._wp_stream)
+        torch.div(self.cfl, self.rate_buf.max(), out=self.dt_buf[0])
+        self._wresidual(order)
+        res = torch.sqrt(((self.R_buf[0] * self.mask_f) ** 2).sum() / self.n_fluid) if want_res else None
+        wp.launch(K.rk_kernel, dim=self.n, inputs=[w["U"], w["U"], w["R"], w["dt"], w["mask"], 0.0, 1.0, w["U1"]],
+                  device=self._wdev, stream=self._wp_stream)
+        self._wprim("U1")
+        self._wresidual(order)
+        wp.launch(K.rk_kernel, dim=self.n, inputs=[w["U"], w["U1"], w["R"], w["dt"], w["mask"], 0.5, 0.5, w["U"]],
+                  device=self._wdev, stream=self._wp_stream)
+        return self.dt_buf[0].clone(), res
+
+    # ----------------------------------------------------------- torch path
+    def _step(self, order, want_res=True):
         """One SSP-RK2 step. Returns (dt, density residual) as device tensors (no host sync)."""
+        if self.backend == "warp":
+            return self._step_warp(order, want_res)
         g, m = self.gamma, self.update_mask
         U = self.U
         W = self._prim(U)
@@ -295,8 +394,10 @@ class Solver:
                 k = min(chunk, nsteps - done)
                 order = 0.0 if self.step_count < first_order_steps else 1.0
                 dt_sum = torch.zeros((), dtype=self.dtype, device=self.device)
-                for _ in range(k):
-                    dt, res = self._step(order)
+                for kk in range(k):
+                    dt, r = self._step(order, want_res=(kk == k - 1))
+                    if r is not None:
+                        res = r
                     dt_sum += dt
                 res = float(res)              # one host sync per chunk
                 self.t += float(dt_sum)
@@ -320,7 +421,9 @@ class Solver:
     def set_primitive(self, W):
         """Set the state from a primitive-variable array (5, nx+4, ny+4, nz+4) (numpy or tensor)."""
         W = torch.as_tensor(np.asarray(W), dtype=self.dtype, device=self.device)
-        self.U = prim_to_cons(W, self.gamma)
+        self.U.copy_(prim_to_cons(W, self.gamma))       # in place: warp views stay valid
+        if self.backend == "warp":
+            self.U1.copy_(self.U)
 
     # ------------------------------------------------------------- outputs
     def primitive(self):
@@ -388,6 +491,8 @@ class Solver:
 
     def load(self, path):
         d = np.load(path)
-        self.U = torch.as_tensor(d["U"], dtype=self.dtype, device=self.device)
+        self.U.copy_(torch.as_tensor(d["U"], dtype=self.dtype, device=self.device))
+        if self.backend == "warp":
+            self.U1.copy_(self.U)
         self.t, self.step_count = float(d["t"]), int(d["step"])
         self.history = [tuple(r) for r in d["history"]]

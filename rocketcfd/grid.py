@@ -34,17 +34,43 @@ def axis_faces(lo, hi, base, intervals, growth=1.15):
             s = min(s, h + (growth - 1.0) * d)
         return s
 
-    faces = [lo]
-    x = lo
-    while x < hi - 1e-9:
-        s = size(x)
-        s = size(x + 0.5 * s)          # midpoint evaluation keeps growth symmetric
-        x = x + s
-        faces.append(x)
-    faces = np.array(faces)
-    # land exactly on hi: stretch the cells proportionally
-    faces = lo + (faces - lo) * (hi - lo) / (faces[-1] - lo)
-    return faces
+    def march(x0, bound, sgn):
+        out = []
+        x = x0
+        while sgn * (bound - x) > 1e-9:
+            s = size(x)
+            s = size(x + 0.5 * sgn * s)          # midpoint evaluation keeps growth smooth
+            x = x + sgn * s
+            out.append(x)
+        return out
+
+    # March outward from the middle of the finest zone, so a zone placed symmetrically in
+    # the domain gives a mirror-symmetric grid (no spurious side force from discretisation).
+    inside = [(a, b, h) for a, b, h in intervals if b > lo and a < hi]
+    if inside:
+        a, b, _ = min(inside, key=lambda z: z[2])
+        x0 = 0.5 * (max(a, lo) + min(b, hi))
+        zlo = max(lo, min(z[0] for z in inside))
+        zhi = min(hi, max(z[1] for z in inside))
+    else:
+        x0, zlo, zhi = lo, lo, lo
+    right = np.array(march(x0, hi, +1.0))
+    left = np.array(march(x0, lo, -1.0))[::-1]
+    # land exactly on the bounds by stretching only the cells outside the zones
+    if right.size:
+        e = right[-1]
+        m = right > zhi
+        right[m] = zhi + (right[m] - zhi) * (hi - zhi) / (e - zhi) if e > zhi else right[m]
+        right[-1] = hi
+    if left.size:
+        e = left[0]
+        m = left < zlo
+        left[m] = zlo - (zlo - left[m]) * (zlo - lo) / (zlo - e) if e < zlo else left[m]
+        left[0] = lo
+    faces = np.concatenate([left, [x0] if x0 > lo else [], right])
+    if faces[0] > lo:
+        faces = np.concatenate([[lo], faces])
+    return np.unique(faces)
 
 
 def stretched_faces(lo, hi, base, zones=(), growth=1.15):

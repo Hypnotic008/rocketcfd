@@ -10,7 +10,9 @@ guessed aero coefficients in CatchSim (`quatsim/aero.py`).
 |---|---|
 | 3-D compressible Euler, finite volume, HLLC + HLLE shock fix, MUSCL, SSP-RK2 | done |
 | Cartesian grid + ghost-cell immersed boundary (geometry from signed distance functions; no meshing) | done |
-| CPU and NVIDIA GPU from the same code (PyTorch; native Windows and Linux) | done (GPU untested until it runs on your machine) |
+| CPU and NVIDIA GPU from the same code (PyTorch; native Windows and Linux) | done, verified on an RTX 4050 Laptop GPU |
+| Fused NVIDIA Warp kernels (one pass per cell per stage); PyTorch path kept as the reference (`tests/compare_backends.py`) | done, matches the reference to 5e-5 |
+| Stretched grids with refinement zones and growth-rate limit; symmetric about the finest zone | done |
 | U.S. Standard Atmosphere 1976 | done |
 | Super Heavy V3 geometry: hull, tapered thrust plate, 33 exposed Raptor 3 bells (outer ring overhanging the hull), 4 chines (taller pair on the raceway side), raceway, fin pods, forward dome | done |
 | Grid fins from CatchSim's STEP-derived mesh (`rocketcfd/data/gridfin.i16`), scaled per axis to 3.5 m wide x 4.2 m reach x 0.5 m deep | done |
@@ -46,11 +48,13 @@ python cases/validate_cylinder.py 4
 python cases/super_heavy_geometry.py                         # STL + renders
 python cases/super_heavy_descent.py --h 0.1 --fins cad_filled
 python cases/aero_sweep.py --gpus 1 --h 0.3                  # descent x AoA x windward side
+python cases/benchmark.py                                    # speed: PyTorch vs Warp kernels
+python tests/compare_backends.py                             # Warp kernels vs PyTorch reference
 ```
 
 ### Sizing for the GPU
 
-The JAX version used about 650 bytes per cell (float32); the PyTorch version prints peak GPU memory as it runs.
+Measured on an RTX 4050 Laptop GPU: about 0.46 KB per cell with the PyTorch path, so 6 GB holds ~11 M cells.
 On a 6 GB laptop RTX 4050, that's about 7 M cells, or h ~ 0.3 m for the full Super Heavy domain
 (106 x 44 x 44 m). Halving h needs 8x the memory and ~16x the time. Local refinement
 (roadmap 2) and a lower-memory flux loop are how finer grids will fit.
