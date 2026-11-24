@@ -10,7 +10,7 @@ guessed aero coefficients in CatchSim (`quatsim/aero.py`).
 |---|---|
 | 3-D compressible Euler, finite volume, HLLC + HLLE shock fix, MUSCL, SSP-RK2 | done |
 | Cartesian grid + ghost-cell immersed boundary (geometry from signed distance functions; no meshing) | done |
-| CPU and NVIDIA GPU from the same code (JAX) | done (GPU untested until it runs on your machine) |
+| CPU and NVIDIA GPU from the same code (PyTorch; native Windows and Linux) | done (GPU untested until it runs on your machine) |
 | U.S. Standard Atmosphere 1976 | done |
 | Super Heavy V3 geometry: hull, tapered thrust plate, 33 exposed Raptor 3 bells (outer ring overhanging the hull), 4 chines (taller pair on the raceway side), raceway, fin pods, forward dome | done |
 | Grid fins from CatchSim's STEP-derived mesh (`rocketcfd/data/gridfin.i16`), scaled per axis to 3.5 m wide x 4.2 m reach x 0.5 m deep | done |
@@ -30,9 +30,17 @@ guessed aero coefficients in CatchSim (`quatsim/aero.py`).
 
 ## Running
 
+Windows or Linux, NVIDIA GPU (no WSL needed):
+
 ```bash
-pip install "jax[cuda12]" scipy matplotlib scikit-image     # GPU machine
-# pip install "jax[cpu]" scipy matplotlib scikit-image      # CPU only
+pip install torch --index-url https://download.pytorch.org/whl/cu126
+pip install -r requirements.txt
+python -c "import torch; print(torch.cuda.get_device_name(0))"
+```
+
+Then:
+
+```bash
 python cases/validate_sod.py
 python cases/validate_cylinder.py 4
 python cases/super_heavy_geometry.py                         # STL + renders
@@ -42,7 +50,7 @@ python cases/aero_sweep.py --gpus 1 --h 0.3                  # descent x AoA x w
 
 ### Sizing for the GPU
 
-The solver uses about 650 bytes per cell (float32, measured with XLA's memory analysis).
+The JAX version used about 650 bytes per cell (float32); the PyTorch version prints peak GPU memory as it runs.
 On a 6 GB laptop RTX 4050, that's about 7 M cells, or h ~ 0.3 m for the full Super Heavy domain
 (106 x 44 x 44 m). Halving h needs 8x the memory and ~16x the time. Local refinement
 (roadmap 2) and a lower-memory flux loop are how finer grids will fit.

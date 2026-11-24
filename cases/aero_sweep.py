@@ -45,7 +45,7 @@ def main():
                 print(f"[gpu {gpu}] {' '.join(cmd[2:])}", flush=True)
                 if a.dry_run:
                     continue
-                env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(gpu), XLA_PYTHON_CLIENT_PREALLOCATE="false")
+                env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(gpu))
                 os.makedirs(out, exist_ok=True)
                 log = open(f"{out}/log.txt", "w")
                 running[gpu] = (subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT), out)

@@ -49,10 +49,7 @@ def main(argv=None):
     ap.add_argument("--x64", action="store_true", help="double precision")
     a = ap.parse_args(argv)
 
-    import jax
-    if a.x64:
-        jax.config.update("jax_enable_x64", True)
-    import jax.numpy as jnp
+    import torch
     from rocketcfd import Solver, atmosphere
     from rocketcfd.vehicles.super_heavy import super_heavy_sdf, v3_params, REFERENCE
     from rocketcfd.output import plot_slices, write_vtk
@@ -75,7 +72,7 @@ def main(argv=None):
     L = P.length
     lo = (-15.5, -22.0, -22.0)
     hi = (L + 18.0, 22.0, 22.0)
-    dtype = jnp.float64 if a.x64 else jnp.float32
+    dtype = torch.float64 if a.x64 else torch.float32
     s = Solver(lo, hi, a.h, fs, sdf=sdf, cfl=0.7, dtype=dtype)
     if s.n_ib_fallback:
         print(f"note: {s.n_ib_fallback} ghost cells used nearest-fluid fallback (thin features)")

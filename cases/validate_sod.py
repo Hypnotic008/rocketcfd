@@ -2,13 +2,11 @@
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import numpy as np
-import jax.numpy as jnp
 from scipy.optimize import brentq
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from rocketcfd import Solver
-from rocketcfd.gas import prim_to_cons
 
 G = 1.4
 
@@ -61,7 +59,7 @@ def main(out="results"):
     left = (x < 0.5)[:, None, None]
     W[0] = np.where(left, 1.0, 0.125)
     W[4] = np.where(left, 1.0, 0.1)
-    s.U = prim_to_cons(jnp.asarray(W, s.dtype), G)
+    s.set_primitive(W)
     while s.t < 0.2:  # run to t = 0.2 (last chunk may slightly overshoot; use exact t)
         s.run(5, chunk=5, first_order_steps=0)
     f = s.fields()

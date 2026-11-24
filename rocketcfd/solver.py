@@ -7,13 +7,12 @@ Numerics
   * SSP-RK2 time integration, global CFL time step
   * ghost-cell immersed boundary: each solid cell next to the fluid gets the
     mirror-image state, interpolated from fluid cells, with the normal velocity reflected
-Runs on CPU or GPU through JAX (same code).
+Runs with PyTorch on CPU or an NVIDIA GPU (Windows, Linux) with the same code.
 """
+import os
 import time
 import numpy as np
-import jax
-import jax.numpy as jnp
-from jax import lax
+import torch
 from scipy import ndimage
 
 from .gas import prim_to_cons, cons_to_prim, hllc_flux
@@ -21,30 +20,39 @@ from .gas import prim_to_cons, cons_to_prim, hllc_flux
 NG = 2  # ghost layers on the domain boundary
 
 
+def default_device():
+    if os.environ.get("ROCKETCFD_DEVICE"):
+        return torch.device(os.environ["ROCKETCFD_DEVICE"])
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
 def _sl(a, ax, start, stop):
-    return lax.slice_in_dim(a, start, stop, axis=ax)
+    return a.narrow(ax, start, stop - start)
 
 
 def _limit(a, b, kind):
     if kind == "minmod":
-        return jnp.where(a * b > 0, jnp.sign(a) * jnp.minimum(jnp.abs(a), jnp.abs(b)), 0.0)
+        return torch.where(a * b > 0, torch.sign(a) * torch.minimum(a.abs(), b.abs()), torch.zeros_like(a))
     ab = a * b
-    return jnp.where(ab > 0, 2.0 * ab / (a + b + (ab <= 0)), 0.0)  # van Leer
+    return torch.where(ab > 0, 2.0 * ab / (a + b + (ab <= 0).to(a.dtype)), torch.zeros_like(a))  # van Leer
 
 
 class Solver:
     def __init__(self, lo, hi, h, freestream, sdf=None, gamma=1.4, bcs="auto", cfl=0.7,
-                 limiter="vanleer", shock_threshold=0.5, dtype=jnp.float32, verbose=True):
+                 limiter="vanleer", shock_threshold=0.5, dtype=torch.float32, device=None,
+                 verbose=True):
         """
         lo, hi     : domain corners (m)
         h          : cell size, scalar or (hx, hy, hz)
         freestream : dict(rho, u, v, w, p)  (SI)
         sdf        : callable(X, Y, Z) -> phi  (phi < 0 inside solid), or None
         bcs        : 'auto' or {(axis, side): 'freestream'|'extrapolate'|'periodic'}
+        device     : torch device; default CUDA if available, else CPU
         """
         self.gamma, self.cfl, self.limiter = gamma, cfl, limiter
         self.shock_threshold = shock_threshold
         self.dtype = dtype
+        self.device = torch.device(device) if device is not None else default_device()
         self.verbose = verbose
         self.lo = np.asarray(lo, float)
         self.h = np.broadcast_to(np.asarray(h, float), (3,)).copy()
@@ -66,20 +74,22 @@ class Solver:
             del X, Y, Z
         self._setup_bcs(bcs)
         self._setup_ib()
+        dev = self.device
         if verbose:
+            name = torch.cuda.get_device_name(dev) if dev.type == "cuda" else "cpu"
             print(f"grid {self.n} = {np.prod(self.n)/1e6:.2f} M cells, h = {self.h}, "
-                  f"{self.n_ghost} IB ghost cells, setup {time.time()-t0:.1f} s, device {jax.devices()[0]}")
+                  f"{self.n_ghost} IB ghost cells, setup {time.time()-t0:.1f} s, device {name}")
 
         interior = np.zeros(shape, bool)
         interior[NG:-NG, NG:-NG, NG:-NG] = True
-        self.update_mask = jnp.asarray((self.fluid & interior)[NG:-NG, NG:-NG, NG:-NG], dtype)
-        self.W_inf_j = jnp.asarray(self.W_inf, dtype)
-        W0 = np.broadcast_to(self.W_inf[:, None, None, None], (5,) + shape)
-        self.U = prim_to_cons(jnp.asarray(W0, dtype), gamma)
+        self.update_mask = torch.as_tensor((self.fluid & interior)[NG:-NG, NG:-NG, NG:-NG], device=dev)
+        self.n_fluid = int(self.update_mask.sum())
+        self.W_inf_t = torch.as_tensor(self.W_inf, dtype=dtype, device=dev)
+        W0 = self.W_inf_t.reshape(5, 1, 1, 1).expand((5,) + shape).contiguous()
+        self.U = prim_to_cons(W0, gamma)
         self.t = 0.0
         self.step_count = 0
         self.history = []
-        self._advance = jax.jit(self._advance_impl, static_argnums=(1,))
 
     # ------------------------------------------------------------------ setup
     def _setup_bcs(self, bcs):
@@ -149,52 +159,53 @@ class Solver:
             cw[sel] = 0.0
             cw[sel, 0] = 1.0
         self.n_ib_fallback = int(todo.sum())
-        self.ib = dict(g=jnp.asarray(gi), c=jnp.asarray(cidx), w=jnp.asarray(cw, self.dtype),
-                       n=jnp.asarray(nrm, self.dtype))
+        dev = self.device
+        self.ib = dict(g=torch.as_tensor(gi, device=dev), c=torch.as_tensor(cidx, device=dev),
+                       w=torch.as_tensor(cw, dtype=self.dtype, device=dev),
+                       n=torch.as_tensor(nrm, dtype=self.dtype, device=dev))
 
     # ---------------------------------------------------------------- kernels
     def _fill_bc(self, W):
+        """Fill the domain-boundary ghost layers in place."""
         n = self.n
         for d in range(3):
             ax = d + 1
             N = n[d]
             for side in (0, 1):
                 kind = self.bcs[(d, side)]
-                lo_idx = (0, NG) if side == 0 else (N + NG, N + 2 * NG)
+                dst = _sl(W, ax, 0, NG) if side == 0 else _sl(W, ax, N + NG, N + 2 * NG)
                 if kind == "periodic":
-                    src = _sl(W, ax, N, N + NG) if side == 0 else _sl(W, ax, NG, 2 * NG)
+                    dst.copy_(_sl(W, ax, N, N + NG) if side == 0 else _sl(W, ax, NG, 2 * NG))
                 elif kind == "extrapolate":
                     edge = _sl(W, ax, NG, NG + 1) if side == 0 else _sl(W, ax, N + NG - 1, N + NG)
-                    src = jnp.repeat(edge, NG, axis=ax)
+                    dst.copy_(edge.expand_as(dst))
                 else:  # freestream
-                    shp = list(W.shape)
-                    shp[ax] = NG
-                    src = jnp.broadcast_to(self.W_inf_j.reshape(5, 1, 1, 1), shp)
-                W = lax.dynamic_update_slice_in_dim(W, src.astype(W.dtype), lo_idx[0], axis=ax)
+                    dst.copy_(self.W_inf_t.reshape(5, 1, 1, 1).expand_as(dst))
         return W
 
     def _fill_ib(self, W):
+        """Set immersed-boundary ghost cells in place (mirror state, normal velocity reflected)."""
         if self.ib is None:
             return W
         ib = self.ib
-        Wf = W.reshape(5, -1)
-        qi = jnp.sum(Wf[:, ib["c"]] * ib["w"][None], axis=-1)  # (5, Ng)
+        Wf = W.view(5, -1)
+        qi = (Wf[:, ib["c"]] * ib["w"]).sum(-1)            # (5, Ng)
         vel = qi[1:4]
-        vn = jnp.sum(vel * ib["n"], axis=0)
-        vel = vel - 2.0 * vn[None] * ib["n"]
-        qg = jnp.concatenate([qi[:1], vel, qi[4:]], axis=0)
-        return Wf.at[:, ib["g"]].set(qg).reshape(W.shape)
+        vn = (vel * ib["n"]).sum(0)
+        vel = vel - 2.0 * vn * ib["n"]
+        Wf[:, ib["g"]] = torch.cat([qi[:1], vel, qi[4:]], 0)
+        return W
 
     def _residual(self, W, order):
         n, g = self.n, self.gamma
         p = W[4]
-        s = jnp.zeros_like(p)
+        s = torch.zeros_like(p)
         for d in range(3):
             if n[d] > 1:
-                pp, pm = jnp.roll(p, -1, d), jnp.roll(p, 1, d)
-                s = jnp.maximum(s, jnp.abs(pp - pm) / jnp.minimum(pp, pm))
+                pp, pm = torch.roll(p, -1, d), torch.roll(p, 1, d)
+                s = torch.maximum(s, (pp - pm).abs() / torch.minimum(pp, pm))
         shock = s > self.shock_threshold
-        R = 0.0
+        R = None
         for d in range(3):
             if n[d] == 1 and self.bcs[(d, 0)] == "periodic":
                 continue
@@ -206,15 +217,16 @@ class Solver:
                     Sc = _sl(Sc, o, NG, NG + n[o])
             N = n[d]
             qm1, q0, qp1, qp2 = (_sl(Wc, ax, k, N + 1 + k) for k in range(4))
-            dL, dC, dR = q0 - qm1, qp1 - q0, qp2 - qp1
-            WL = q0 + 0.5 * order * _limit(dL, dC, self.limiter)
-            WR = qp1 - 0.5 * order * _limit(dC, dR, self.limiter)
+            dC = qp1 - q0
+            WL = q0 + (0.5 * order) * _limit(q0 - qm1, dC, self.limiter)
+            WR = qp1 - (0.5 * order) * _limit(dC, qp2 - qp1, self.limiter)
             bad = (WL[0] <= 0) | (WL[4] <= 0) | (WR[0] <= 0) | (WR[4] <= 0)
-            WL = jnp.where(bad[None], q0, WL)
-            WR = jnp.where(bad[None], qp1, WR)
+            WL = torch.where(bad, q0, WL)
+            WR = torch.where(bad, qp1, WR)
             hl = _sl(Sc, d, 1, N + 2) | _sl(Sc, d, 2, N + 3)
             F = hllc_flux(WL, WR, d, g, hl)
-            R = R - (_sl(F, ax, 1, N + 1) - _sl(F, ax, 0, N)) / self.h[d]
+            div = (_sl(F, ax, 1, N + 1) - _sl(F, ax, 0, N)) / float(self.h[d])
+            R = -div if R is None else R - div
         return R
 
     def _prim(self, U):
@@ -224,59 +236,68 @@ class Solver:
     def _interior(self, A):
         return A[:, NG:-NG, NG:-NG, NG:-NG]
 
-    def _advance_impl(self, U, nsteps, order):
+    def _step(self, order):
+        """One SSP-RK2 step. Returns (dt, density residual) as device tensors (no host sync)."""
         g, m = self.gamma, self.update_mask
-
-        def update(U, Ui_new):
-            Ui = self._interior(U)
-            Ui_new = jnp.where(m[None] > 0, Ui_new, Ui)
-            return lax.dynamic_update_slice(U, Ui_new, (0, NG, NG, NG))
-
-        def body(_, carry):
-            U, t, _r = carry
-            W = self._prim(U)
-            Wi = self._interior(W)
-            c = jnp.sqrt(g * Wi[4] / Wi[0])
-            rate = sum((jnp.abs(Wi[1 + d]) + c) / self.h[d] for d in range(3) if self.n[d] > 1)
-            dt = self.cfl / jnp.max(rate * m)
-            R0 = self._residual(W, order)
-            U1 = update(U, self._interior(U) + dt * R0)
-            R1 = self._residual(self._prim(U1), order)
-            U2 = update(U, 0.5 * self._interior(U) + 0.5 * (self._interior(U1) + dt * R1))
-            res = jnp.sqrt(jnp.sum((R0[0] * m) ** 2) / jnp.sum(m))
-            return U2, t + dt, res
-
-        return lax.fori_loop(0, nsteps, body, (U, jnp.asarray(0.0, U.dtype), jnp.asarray(0.0, U.dtype)))
+        U = self.U
+        W = self._prim(U)
+        Wi = self._interior(W)
+        c = torch.sqrt(g * Wi[4] / Wi[0])
+        rate = sum((Wi[1 + d].abs() + c) / float(self.h[d]) for d in range(3) if self.n[d] > 1)
+        dt = self.cfl / torch.where(m, rate, torch.zeros_like(rate)).max()
+        R0 = self._residual(W, order)
+        Ui = self._interior(U)
+        U1 = U.clone()
+        self._interior(U1).copy_(torch.where(m, Ui + dt * R0, Ui))
+        R1 = self._residual(self._prim(U1), order)
+        U1i = self._interior(U1)
+        U2i = torch.where(m, 0.5 * Ui + 0.5 * (U1i + dt * R1), Ui)
+        Ui.copy_(U2i)
+        res = torch.sqrt(((R0[0] * m) ** 2).sum() / self.n_fluid)
+        return dt, res
 
     # -------------------------------------------------------------- driver
     def run(self, nsteps, chunk=100, first_order_steps=200, report=None):
         """Advance nsteps time steps. `report(solver)` is called after every chunk."""
         done = 0
         t0 = time.time()
-        while done < nsteps:
-            k = min(chunk, nsteps - done)
-            order = 0.0 if self.step_count < first_order_steps else 1.0
-            self.U, dt_sum, res = self._advance(self.U, k, order)
-            res = float(res)
-            self.t += float(dt_sum)
-            self.step_count += k
-            done += k
-            self.history.append((self.step_count, self.t, res))
-            if not np.isfinite(res):
-                raise FloatingPointError(f"solution diverged at step {self.step_count}")
-            if self.verbose:
-                el = time.time() - t0
-                cps = np.prod(self.n) * done / el / 1e6
-                print(f"step {self.step_count:6d}  t = {self.t:.4e} s  "
-                      f"res(rho) = {res/self.fs['rho']:.3e} 1/s  [{cps:.1f} Mcell-steps/s]", flush=True)
-            if report:
-                report(self)
+        with torch.no_grad():
+            while done < nsteps:
+                k = min(chunk, nsteps - done)
+                order = 0.0 if self.step_count < first_order_steps else 1.0
+                dt_sum = torch.zeros((), dtype=self.dtype, device=self.device)
+                for _ in range(k):
+                    dt, res = self._step(order)
+                    dt_sum += dt
+                res = float(res)              # one host sync per chunk
+                self.t += float(dt_sum)
+                self.step_count += k
+                done += k
+                self.history.append((self.step_count, self.t, res))
+                if not np.isfinite(res):
+                    raise FloatingPointError(f"solution diverged at step {self.step_count}")
+                if self.verbose:
+                    el = time.time() - t0
+                    cps = np.prod(self.n) * done / el / 1e6
+                    mem = (f"  GPU mem {torch.cuda.max_memory_allocated(self.device)/2**30:.2f} GB"
+                           if self.device.type == "cuda" else "")
+                    print(f"step {self.step_count:6d}  t = {self.t:.4e} s  "
+                          f"res(rho) = {res/self.fs['rho']:.3e} 1/s  [{cps:.1f} Mcell-steps/s]{mem}",
+                          flush=True)
+                if report:
+                    report(self)
         return self
+
+    def set_primitive(self, W):
+        """Set the state from a primitive-variable array (5, nx+4, ny+4, nz+4) (numpy or tensor)."""
+        W = torch.as_tensor(np.asarray(W), dtype=self.dtype, device=self.device)
+        self.U = prim_to_cons(W, self.gamma)
 
     # ------------------------------------------------------------- outputs
     def primitive(self):
         """Primitive variables on the padded grid (numpy), ghosts filled."""
-        return np.asarray(jax.jit(self._prim)(self.U))
+        with torch.no_grad():
+            return self._prim(self.U).cpu().numpy().astype(np.float64)
 
     def fields(self):
         W = self.primitive()[:, NG:-NG, NG:-NG, NG:-NG]
@@ -329,11 +350,11 @@ class Solver:
                     CN=Cf @ cross, CS=Cf @ side, C_roll=Cm[0], C_restore=Cm @ restore_axis)
 
     def save(self, path):
-        np.savez_compressed(path, U=np.asarray(self.U), t=self.t, step=self.step_count,
+        np.savez_compressed(path, U=self.U.cpu().numpy(), t=self.t, step=self.step_count,
                             lo=self.lo, h=self.h, n=self.n, history=np.array(self.history))
 
     def load(self, path):
         d = np.load(path)
-        self.U = jnp.asarray(d["U"], self.dtype)
+        self.U = torch.as_tensor(d["U"], dtype=self.dtype, device=self.device)
         self.t, self.step_count = float(d["t"]), int(d["step"])
         self.history = [tuple(r) for r in d["history"]]
