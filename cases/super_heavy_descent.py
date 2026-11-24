@@ -49,7 +49,10 @@ def main(argv=None):
     ap.add_argument("--dry-run", action="store_true", help="print the grid and exit")
     ap.add_argument("--fins", default="cad_filled", choices=["none", "cad", "cad_filled"])
     ap.add_argument("--fin-deflection", type=float, nargs=3, default=(0.0, 0.0, 0.0))
-    ap.add_argument("--flowthroughs", type=float, default=3.0)
+    ap.add_argument("--flowthroughs", type=float, default=4.0, help="maximum run length")
+    ap.add_argument("--min-flowthroughs", type=float, default=1.0, help="never stop before this")
+    ap.add_argument("--tol", type=float, default=5e-4,
+                    help="stop when CD, CN, C_restore change less than this over the last 3 checks (0 = off)")
     ap.add_argument("--steps", type=int, default=0, help="override step count")
     ap.add_argument("--out", default="results/sh_descent")
     ap.add_argument("--x64", action="store_true", help="double precision")
@@ -92,7 +95,13 @@ def main(argv=None):
         print(describe(faces))
         if a.dry_run:
             n = np.prod([len(f) - 1 for f in faces])
-            print(f"estimated GPU memory ~{n * 900 / 2**30:.1f} GB (about 0.9 KB per cell)")
+            try:
+                import warp  # noqa: F401
+                per, what = 115, "Warp kernels"
+            except ImportError:
+                per, what = 500, "PyTorch path"
+            print(f"estimated GPU memory ~{n * per / 2**30:.1f} GB ({what}, ~{per} B/cell); "
+                  f"setup needs ~{n * 120 / 2**30:.0f} GB of system RAM")
             return None
     s = Solver(lo, hi, a.h, fs, sdf=sdf, cfl=0.7, dtype=dtype, faces=faces)
     if s.n_ib_fallback:
@@ -104,18 +113,28 @@ def main(argv=None):
     dt_est = s.cfl / ((V + cs) / hmin + 2 * (cs + V * np.sin(al)) / hmin)
     nsteps = a.steps or int(a.flowthroughs * (s.hi[0] - s.lo[0]) / V / dt_est)
     nsteps = int(np.ceil(nsteps / 100) * 100)
-    print(f"running {nsteps} steps")
+    print(f"running up to {nsteps} steps ({a.flowthroughs:g} flow-throughs), stopping early when converged")
 
     hist = []
+    min_steps = int(a.min_flowthroughs / a.flowthroughs * nsteps)
 
     def report(sv):
         ld = sv.loads(**REFERENCE)
         hist.append((sv.step_count, sv.t, ld["CD"], ld["CN"], ld["C_restore"]))
         print(f"      CD {ld['CD']:.4f}  CL {ld['CL']:+.4f}  CN {ld['CN']:+.4f}  CS {ld['CS']:+.4f}  "
               f"C_restore {ld['C_restore']:+.5f}  C_roll {ld['C_roll']:+.5f}", flush=True)
+        if a.tol > 0 and sv.step_count >= min_steps and len(hist) >= 4:
+            recent = np.array([h[2:] for h in hist[-4:]])
+            change = np.abs(recent - recent[-1]).max(0)
+            change[0] /= max(abs(recent[-1, 0]), 1e-6)          # CD relative, CN / C_restore absolute
+            if np.all(change < a.tol):
+                print(f"      converged: loads changed < {a.tol:g} over the last 3 checks", flush=True)
+                return True
+        return False
 
     t0 = time.time()
-    s.run(nsteps, chunk=200, first_order_steps=400, report=report)
+    chunk = max(100, int(round(nsteps / 40 / 50)) * 50)       # ~40 load checks over the max length
+    s.run(nsteps, chunk=chunk, first_order_steps=400, report=report)
     wall = time.time() - t0
 
     ld = s.loads(**REFERENCE)

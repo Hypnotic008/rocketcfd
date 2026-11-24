@@ -414,8 +414,8 @@ class Solver:
                     print(f"step {self.step_count:6d}  t = {self.t:.4e} s  "
                           f"res(rho) = {res/self.fs['rho']:.3e} 1/s  [{cps:.1f} Mcell-steps/s]{mem}",
                           flush=True)
-                if report:
-                    report(self)
+                if report and report(self):
+                    break                      # the report callback asked to stop (converged)
         return self
 
     def set_primitive(self, W):
@@ -443,23 +443,20 @@ class Solver:
 
     def loads(self, S_ref, L_ref, x_ref=(0.0, 0.0, 0.0), band=1.5):
         """Integrate surface pressure: -∮ (p - p_inf) n dA via a smoothed delta function.
-        Returns body-axis force/moment coefficients and wind-axis drag/lift."""
-        W = self.primitive()
-        phi = self.phi
-        wx, wy, wz = self.widths
-        hloc = np.minimum(np.minimum(wx[:, None, None], wy[None, :, None]), wz[None, None, :])
-        eps = band * hloc
-        bandm = np.abs(phi) < eps
-        idx = np.nonzero(bandm)
-        e = eps[idx]
-        delta = (1 + np.cos(np.pi * phi[idx] / e)) / (2 * e)
-        grads = np.gradient(phi, *self.axes)
-        gn = np.sqrt(sum(gd[idx] ** 2 for gd in grads)) + 1e-30
-        dV = wx[idx[0]] * wy[idx[1]] * wz[idx[2]]
-        dp = (W[4][idx] - self.W_inf[4]) * delta * dV
-        dF = np.stack([-(dp * grads[d][idx] / gn) for d in range(3)])
+        Returns body-axis force/moment coefficients and wind-axis drag/lift.
+        The surface band and its weights are computed once; each call only gathers the
+        pressure in the band (a few thousand values) from the device."""
+        sf = self._surface(band)
+        with torch.no_grad():
+            if self.backend == "warp":
+                self._wprim("U")
+                pb = self.W_buf[4].reshape(-1)[sf["flat_t"]]
+            else:
+                pb = self._prim(self.U)[4].reshape(-1)[sf["flat_t"]]
+        dp = pb.double().cpu().numpy() - self.W_inf[4]
+        dF = sf["wF"] * dp                                  # (3, Nb)
         F = dF.sum(1)
-        r = np.stack([self.axes[d][idx[d]] - x_ref[d] for d in range(3)])
+        r = sf["pos"] - np.asarray(x_ref, float)[:, None]
         M = np.cross(r.T, dF.T).sum(0)
         V = self.W_inf[1:4]
         Vm = np.linalg.norm(V)
@@ -483,6 +480,35 @@ class Solver:
         return dict(F=F, M=M, q_inf=q, CX=Cf[0], CY=Cf[1], CZ=Cf[2],
                     Cl=Cm[0], Cm=Cm[1], Cn=Cm[2], CD=Cf @ e_d, CL=Cf @ lift_dir,
                     CN=Cf @ cross, CS=Cf @ side, C_roll=Cm[0], C_restore=Cm @ restore_axis)
+
+    def _surface(self, band):
+        key = ("surface", band)
+        if getattr(self, "_surf_key", None) != key:
+            phi = self.phi
+            wx, wy, wz = self.widths
+            hloc = np.minimum(np.minimum(wx[:, None, None], wy[None, :, None]), wz[None, None, :])
+            eps = band * hloc
+            idx = np.nonzero(np.abs(phi) < eps)
+            e = eps[idx]
+            delta = (1 + np.cos(np.pi * phi[idx] / e)) / (2 * e)
+            # gradient of phi only at band cells (central differences on the padded grid)
+            g = []
+            for d in range(3):
+                c = self.axes[d]
+                ip = [i.copy() for i in idx]
+                im = [i.copy() for i in idx]
+                ip[d] = np.minimum(idx[d] + 1, phi.shape[d] - 1)
+                im[d] = np.maximum(idx[d] - 1, 0)
+                g.append((phi[tuple(ip)] - phi[tuple(im)]) / (c[ip[d]] - c[im[d]]))
+            g = np.stack(g)
+            g /= np.linalg.norm(g, axis=0) + 1e-30
+            dV = wx[idx[0]] * wy[idx[1]] * wz[idx[2]]
+            flat = np.ravel_multi_index(idx, phi.shape)
+            self._surf = dict(wF=-(delta * dV) * g,
+                              pos=np.stack([self.axes[d][idx[d]] for d in range(3)]),
+                              flat_t=torch.as_tensor(flat, device=self.device))
+            self._surf_key = key
+        return self._surf
 
     def save(self, path):
         np.savez_compressed(path, U=self.U.cpu().numpy(), t=self.t, step=self.step_count,
