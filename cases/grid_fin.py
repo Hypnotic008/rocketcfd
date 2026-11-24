@@ -29,7 +29,12 @@ def main():
     ap.add_argument("--alpha", type=float, nargs="+", default=[0.0, 5.0, 10.0])
     ap.add_argument("--alt", type=float, default=10745.0)
     ap.add_argument("--h", type=float, default=0.025, help="cell size around the fin [m]")
-    ap.add_argument("--h-far", type=float, default=0.0, help="farfield cell size (default 12 x h)")
+    ap.add_argument("--h-far", type=float, default=0.0, help="farfield cell size (default 24 x h)")
+    ap.add_argument("--plate-offset", type=float, default=0.0,
+                    help="thin every plate by this much on each side [m] (e.g. 0.01 turns 4.5 cm into 2.5 cm)")
+    ap.add_argument("--ascending", action="store_true",
+                    help="sweep Mach upward, each Mach started from rest (default: downward with warm starts, "
+                         "like the real descent, which keeps a started lattice started)")
     ap.add_argument("--growth", type=float, default=1.12)
     ap.add_argument("--flowthroughs", type=float, default=6.0, help="maximum per case")
     ap.add_argument("--tol", type=float, default=1e-3)
@@ -49,17 +54,19 @@ def main():
     sx, sy, sz = P.fin_scale
     cad = load_fin_cad(P.fin_cad_path, P.fin_cad_res, False)
     smin = min(sx, sy, sz)
-    fin_sdf = lambda X, Y, Z: smin * cad(X / sx, Y / sy, Z / sz)
+    off = a.plate_offset
+    fin_sdf = lambda X, Y, Z: smin * cad(X / sx, Y / sy, Z / sz) + off
     outline = load_fin_cad(P.fin_cad_path, P.fin_cad_res, True)
     S_ref = outline.solid.any(axis=0).sum() * outline.res ** 2 * sy * sz
     c_ref, b_ref = 6.0 * sy, 7.0 * sz
     box = ((-0.75 * sx / 2 - 0.05, -3.0 * sy - 0.05, -0.05), (0.75 * sx / 2 + 0.05, 3.0 * sy + 0.05, 7.0 * sz + 0.05))
     print(f"fin: {0.75*sx:.2f} m deep x {6*sy:.2f} m wide x {7*sz:.2f} m span, outline area S = {S_ref:.2f} m^2")
 
-    lo, hi = (-3.0, -4.5, -2.5), (5.0, 4.5, 7.0)
+    # generous farfield: choked / subsonic cases spill flow around the fin and need room
+    lo, hi = (-9.0, -9.0, -6.0), (12.0, 9.0, 11.0)
     m = 0.15
     zone = Zone((box[0][0] - m, box[0][1] - m, box[0][2] - m), (box[1][0] + m, box[1][1] + m, box[1][2] + m), a.h, "fin")
-    faces = stretched_faces(lo, hi, a.h_far or 12 * a.h, [zone], growth=a.growth)
+    faces = stretched_faces(lo, hi, a.h_far or 24 * a.h, [zone], growth=a.growth)
     print(describe(faces))
     if a.dry_run:
         n = np.prod([len(f) - 1 for f in faces])
@@ -74,15 +81,22 @@ def main():
         al = np.radians(al_deg)
         return dict(rho=rho, u=V * np.cos(al), v=V * np.sin(al), w=0.0, p=p), 0.5 * rho * V * V, V
 
-    fs0, _, _ = freestream(a.mach[0], a.alpha[0])
+    machs = sorted(a.mach) if a.ascending else sorted(a.mach, reverse=True)
+    alphas = sorted(a.alpha)
+    fs0, _, _ = freestream(machs[0], alphas[0])
     t0 = time.time()
     s = Solver(None, None, None, fs0, faces=faces, thin_sdf=fin_sdf, thin_box=box, cfl=0.7)
     print(f"setup {time.time()-t0:.1f} s")
     rows = []
-    for mi, M in enumerate(a.mach):
-        for ai, al in enumerate(sorted(a.alpha)):
+    first = True
+    for mi, M in enumerate(machs):
+        # descending: sweep incidence up then down so each new Mach starts from the alpha-0 state
+        al_order = alphas if (a.ascending or mi % 2 == 0) else alphas[::-1]
+        for ai, al in enumerate(al_order):
             fs, q, V = freestream(M, al)
-            s.set_freestream(fs, keep_state=(ai > 0))     # warm start along incidence at fixed Mach
+            warm = (not first) and (ai > 0 or not a.ascending)
+            s.set_freestream(fs, keep_state=warm)
+            first = False
             hmin = s.h.min()
             dt_est = s.cfl / ((V + c) / hmin + 2 * (c + V * np.sin(np.radians(al))) / hmin)
             nmax = a.max_steps or int(a.flowthroughs * (hi[0] - lo[0]) / V / dt_est)
@@ -103,7 +117,7 @@ def main():
 
             print(f"=== M {M}  alpha {al} deg  (up to {nmax} steps)", flush=True)
             t1 = time.time()
-            s.run(nmax, chunk=chunk, first_order_steps=(300 if ai == 0 else 0), report=report,
+            s.run(nmax, chunk=chunk, first_order_steps=(0 if warm else 300), report=report,
                   steady=not a.time_accurate)
             ld = s.loads(S_ref=S_ref, L_ref=c_ref, x_ref=(0.0, 0.0, 0.0))
             Ft, Mt = ld["F_thin"], ld["M_thin"]
@@ -113,17 +127,20 @@ def main():
             rows.append(row)
             print(f"    -> CN {row['CN']:+.4f}  CA {row['CA']:+.4f}  Ch {row['Ch']:+.5f}  ({row['steps']} steps, "
                   f"{row['wall_s']:.0f} s)", flush=True)
-            if al == max(a.alpha):
+            if al == max(alphas) or (al == 0 and M in (machs[0], machs[-1])):
                 f = s.fields()
                 plot_slices(f, f"{a.out}/fin_M{M:g}_a{al:g}_midspan.png",
-                            title=f"V3 grid fin, M {M}, alpha {al} deg: mid-span plane (z = 2.1 m)",
+                            title=f"V3 grid fin, M {M}, alpha {al} deg: mid-span plane (z = 2.1 m)"
+                                  f"{', plates thinned by %g m/side' % off if off else ''}",
                             p_inf=p, normal_axis=2, at=2.1, window=((-1.5, 2.5), (-2.6, 2.6)))
             with open(f"{a.out}/grid_fin_sweep.csv", "w", newline="") as fh:
                 w = csv.DictWriter(fh, fieldnames=list(rows[0]))
                 w.writeheader()
                 w.writerows(rows)
 
-    json.dump(dict(S_ref=S_ref, c_ref=c_ref, b_ref=b_ref, h=a.h, cells=int(np.prod(s.n)), rows=rows),
+    rows.sort(key=lambda r: (r["mach"], r["alpha"]))
+    json.dump(dict(S_ref=S_ref, c_ref=c_ref, b_ref=b_ref, h=a.h, plate_offset=off,
+                   order="ascending" if a.ascending else "descending", cells=int(np.prod(s.n)), rows=rows),
               open(f"{a.out}/grid_fin_sweep.json", "w"), indent=2, default=float)
     # slopes and plots
     import matplotlib
@@ -146,7 +163,9 @@ def main():
         ax.set_title(t_)
         ax.grid(alpha=0.3)
         ax.legend(fontsize=8)
-    fig.suptitle(f"V3 grid fin (CatchSim CAD, isolated, inviscid), h = {a.h} m, S = {S_ref:.2f} m^2")
+    fig.suptitle(f"V3 grid fin (CatchSim CAD, isolated, inviscid), h = {a.h} m, S = {S_ref:.2f} m^2, "
+                 f"Mach {'ascending from rest' if a.ascending else 'descending, warm-started'}"
+                 f"{', plates thinned %g m/side' % off if off else ''}")
     fig.savefig(f"{a.out}/grid_fin_sweep.png", dpi=130)
     if slope:
         print("\nnormal-force slope dCN/dalpha per rad (fin area):")
