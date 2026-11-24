@@ -183,6 +183,7 @@ class Solver:
 
     # ------------------------------------------------------------------ setup
     def _setup_bcs(self, bcs):
+        self._bcs_arg = bcs
         vel = self.W_inf[1:4]
         self.bcs = {}
         for d in range(3):
@@ -478,6 +479,25 @@ class Solver:
                 if report and report(self):
                     break                      # the report callback asked to stop (converged)
         return self
+
+    def set_freestream(self, freestream, keep_state=False):
+        """Change the flight condition without rebuilding the grid, geometry or wall data
+        (all of which are independent of the freestream). keep_state=True warm-starts from
+        the current solution instead of a uniform field."""
+        self.fs = freestream
+        self.W_inf = np.array([freestream[k] for k in ("rho", "u", "v", "w", "p")], float)
+        self.rho_min = 1e-4 * freestream["rho"]
+        self.p_min = 1e-4 * freestream["p"]
+        self._setup_bcs(self._bcs_arg)
+        self.W_inf_t.copy_(torch.as_tensor(self.W_inf, dtype=self.dtype, device=self.device))
+        if not keep_state:
+            shape = self.U.shape[1:]
+            self.U.copy_(prim_to_cons(self.W_inf_t.reshape(5, 1, 1, 1).expand((5,) + tuple(shape)), self.gamma))
+        if self.backend == "warp":
+            self.U1.copy_(self.U)
+        self.t = 0.0
+        self.step_count = 0
+        self.history = []
 
     def set_primitive(self, W):
         """Set the state from a primitive-variable array (5, nx+4, ny+4, nz+4) (numpy or tensor)."""

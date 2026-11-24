@@ -5,10 +5,11 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
-def plot_slices(f, path, title="", p_inf=None, normal_axis=2, extra=None):
-    """Mach and pressure on the mid-plane normal to `normal_axis` (0=x, 1=y, 2=z)."""
+def plot_slices(f, path, title="", p_inf=None, normal_axis=2, extra=None, at=None, window=None):
+    """Mach and pressure on the plane normal to `normal_axis` (0=x, 1=y, 2=z), through the
+    middle of the domain or at coordinate `at`. window = ((a0, a1), (b0, b1)) crops the view."""
     ax_names = "xyz"
-    k = f["solid"].shape[normal_axis] // 2
+    k = f["solid"].shape[normal_axis] // 2 if at is None else int(np.argmin(np.abs(f[ax_names[normal_axis]] - at)))
     take = lambda a: np.take(a, k, axis=normal_axis)
     inplane = [d for d in range(3) if d != normal_axis]
     c0, c1 = f[ax_names[inplane[0]]], f[ax_names[inplane[1]]]
@@ -26,6 +27,10 @@ def plot_slices(f, path, title="", p_inf=None, normal_axis=2, extra=None):
         axp.set_xlabel(f"{ax_names[inplane[0]]} [m]")
         axp.set_ylabel(f"{ax_names[inplane[1]]} [m]")
         fig.colorbar(im, ax=axp, label=lab, shrink=0.9)
+    if window is not None:
+        for axp in axs:
+            axp.set_xlim(*window[0])
+            axp.set_ylim(*window[1])
     axs[0].set_title(title)
     if extra:
         extra(axs)
