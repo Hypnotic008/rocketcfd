@@ -40,7 +40,7 @@ def _limit(a, b, kind):
 class Solver:
     def __init__(self, lo, hi, h, freestream, sdf=None, gamma=1.4, bcs="auto", cfl=0.7,
                  limiter="vanleer", shock_threshold=0.5, dtype=torch.float32, device=None,
-                 verbose=True, faces=None, backend="auto"):
+                 verbose=True, faces=None, backend="auto", thin_sdf=None, thin_box=None):
         """
         lo, hi     : domain corners (m)
         h          : cell size, scalar or (hx, hy, hz)
@@ -51,6 +51,10 @@ class Solver:
         bcs        : 'auto' or {(axis, side): 'freestream'|'extrapolate'|'periodic'}
         device     : torch device; default CUDA if available, else CPU
         backend    : 'warp' (fused kernels, float32), 'torch' (reference), or 'auto'
+        thin_sdf   : callable(X, Y, Z) -> phi for thin-walled parts (grid fins). These are
+                     represented by blocked cell faces instead of ghost cells, so plates
+                     thinner than a cell stay solid. Needs the warp backend.
+        thin_box   : ((x0, y0, z0), (x1, y1, z1)) bounding box of the thin parts (speeds up setup)
         """
         self.gamma, self.cfl, self.limiter = gamma, cfl, limiter
         self.shock_threshold = shock_threshold
@@ -91,6 +95,7 @@ class Solver:
             self.phi = sdf(X, Y, Z).astype(np.float64)
             del X, Y, Z
         self._setup_bcs(bcs)
+        self._setup_thin(thin_sdf, thin_box)
         self._setup_ib()
         dev = self.device
         if verbose:
@@ -123,14 +128,16 @@ class Solver:
 
     def _pick_backend(self, backend):
         if backend == "torch":
+            if self.has_thin:
+                raise RuntimeError("thin walls (thin_sdf) need the warp backend")
             return "torch"
         ok = self.dtype == torch.float32
         try:
             import warp  # noqa: F401
         except ImportError:
             ok = False
-        if backend == "warp" and not ok:
-            raise RuntimeError("warp backend needs `pip install warp-lang` and float32")
+        if (backend == "warp" or self.has_thin) and not ok:
+            raise RuntimeError("warp backend (needed for thin walls) needs `pip install warp-lang` and float32")
         return "warp" if ok else "torch"
 
     def _setup_warp(self):
@@ -147,11 +154,12 @@ class Solver:
         self.S_buf = torch.zeros(shape, dtype=torch.int32, device=dev)
         self.rate_buf = torch.zeros(self.n, dtype=self.dtype, device=dev)
         self.dt_buf = torch.zeros(1, dtype=self.dtype, device=dev)
+        self.blk_buf = torch.as_tensor(self.blk, device=dev)
         self.mask_f = self.update_mask.to(self.dtype)
         self.invw1 = [self.invw[d].reshape(-1).contiguous() for d in range(3)]
         f = wp.from_torch
         self._w = dict(U=f(self.U), U1=f(self.U1), W=f(self.W_buf), R=f(self.R_buf), S=f(self.S_buf),
-                       rate=f(self.rate_buf), dt=f(self.dt_buf), mask=f(self.mask_f),
+                       rate=f(self.rate_buf), dt=f(self.dt_buf), mask=f(self.mask_f), blk=f(self.blk_buf),
                        ix=f(self.invw1[0]), iy=f(self.invw1[1]), iz=f(self.invw1[2]))
         self._active_flux = wp.vec3i(*[0 if (self.n[d] == 1 and self.bcs[(d, 0)] == "periodic") else 1
                                        for d in range(3)])
@@ -185,10 +193,63 @@ class Solver:
                     kind = "freestream" if into else "extrapolate"
                 self.bcs[(d, side)] = kind
 
+    def _setup_thin(self, thin_sdf, thin_box):
+        """Blocked faces for thin parts: face (i -> i+1 along d) is a wall if either cell centre
+        is inside the part, or the segment between the centres passes through it. The segment
+        test samples phi at quarter points; with a distance function, phi(a) + phi(b) < |a - b|
+        between consecutive samples means the part may lie between them (conservative)."""
+        shape = self.phi.shape
+        self.thin_solid = np.zeros(shape, bool)
+        self.blk = np.zeros(shape, np.int32)
+        self.has_thin = thin_sdf is not None
+        if not self.has_thin:
+            return
+        r0, r1 = [], []
+        for d in range(3):
+            c = self.axes[d]
+            if thin_box is None:
+                a, b = 0, len(c) - 1
+            else:
+                a = max(int(np.searchsorted(c, thin_box[0][d])) - 3, 0)
+                b = min(int(np.searchsorted(c, thin_box[1][d])) + 3, len(c) - 1)
+            r0.append(a)
+            r1.append(b)
+        ax = [self.axes[d][r0[d]:r1[d] + 1] for d in range(3)]
+        sub = tuple(slice(r0[d], r1[d] + 1) for d in range(3))
+        G = np.meshgrid(*ax, indexing="ij")
+        pc = thin_sdf(*G)
+        ts = pc < 0
+        self.thin_solid[sub] = ts
+        for d in range(3):
+            if len(ax[d]) < 2 or (self.n[d] == 1 and self.bcs[(d, 0)] == "periodic"):
+                continue
+            lo_sl = [slice(None)] * 3
+            hi_sl = [slice(None)] * 3
+            lo_sl[d] = slice(0, -1)
+            hi_sl[d] = slice(1, None)
+            lo_sl, hi_sl = tuple(lo_sl), tuple(hi_sl)
+            Gs = [g_[lo_sl] for g_ in G]
+            step = (G[d][hi_sl] - G[d][lo_sl])
+            samples = [pc[lo_sl]]
+            for t in (0.25, 0.5, 0.75):
+                P = list(Gs)
+                P[d] = Gs[d] + t * step
+                samples.append(thin_sdf(*P))
+            samples.append(pc[hi_sl])
+            blocked = ts[lo_sl] | ts[hi_sl]
+            for k in range(4):
+                blocked |= (samples[k] < 0) | (samples[k] + samples[k + 1] < 0.25 * step)
+            blocked |= samples[4] < 0
+            tgt = tuple(slice(r0[e], r1[e] + 1) if e != d else slice(r0[e], r1[e]) for e in range(3))
+            self.blk[tgt] |= (blocked.astype(np.int32) << d)
+        if self.verbose:
+            nb = [int(((self.blk >> d) & 1).sum()) for d in range(3)]
+            print(f"thin walls: {int(ts.sum())} solid cells, blocked faces x/y/z = {nb}")
+
     def _setup_ib(self):
         phi = self.phi
-        self.fluid = phi > 0
-        solid = ~self.fluid
+        self.fluid = (phi > 0) & ~self.thin_solid
+        solid = phi <= 0                    # thick (ghost-cell) solids only; thin parts use blocked faces
         cross = ndimage.generate_binary_structure(3, 1)
         near = ndimage.binary_dilation(self.fluid, structure=cross, iterations=NG)
         ghost = solid & near
@@ -239,7 +300,7 @@ class Solver:
             cw[sel[ok]] /= s[ok, None]
             todo[sel[ok]] = False
         if todo.any():  # fall back to nearest fluid cell
-            _, inds = ndimage.distance_transform_edt(solid, return_indices=True)
+            _, inds = ndimage.distance_transform_edt(~self.fluid, return_indices=True)
             sel = np.flatnonzero(todo)
             near_idx = np.ravel_multi_index(tuple(ind.ravel()[gi[sel]] for ind in inds), shape)
             cidx[sel] = near_idx[:, None]
@@ -342,7 +403,7 @@ class Solver:
         kind = 1 if self.limiter == "minmod" else 0
         wp.launch(K.residual_kernel, dim=self.n,
                   inputs=[w["W"], w["S"], w["ix"], w["iy"], w["iz"], self._active_flux, self.gamma,
-                          float(order), kind, w["R"]], device=self._wdev, stream=self._wp_stream)
+                          float(order), kind, w["blk"], w["R"]], device=self._wdev, stream=self._wp_stream)
 
     def _step_warp(self, order, want_res=False):
         wp, K, w = self._wp, self._K, self._w
@@ -447,17 +508,35 @@ class Solver:
         The surface band and its weights are computed once; each call only gathers the
         pressure in the band (a few thousand values) from the device."""
         sf = self._surface(band)
+        tf = sf.get("thin")
         with torch.no_grad():
             if self.backend == "warp":
                 self._wprim("U")
-                pb = self.W_buf[4].reshape(-1)[sf["flat_t"]]
+                Wsrc = self.W_buf
             else:
-                pb = self._prim(self.U)[4].reshape(-1)[sf["flat_t"]]
+                Wsrc = self._prim(self.U)
+            pflat = Wsrc[4].reshape(-1)
+            pb = pflat[sf["flat_t"]]
+            if tf is not None:
+                pa = pflat[tf["a_t"]].double().cpu().numpy()
+                pbb = pflat[tf["b_t"]].double().cpu().numpy()
         dp = pb.double().cpu().numpy() - self.W_inf[4]
         dF = sf["wF"] * dp                                  # (3, Nb)
-        F = dF.sum(1)
+        F_ib = dF.sum(1)
         r = sf["pos"] - np.asarray(x_ref, float)[:, None]
-        M = np.cross(r.T, dF.T).sum(0)
+        M_ib = np.cross(r.T, dF.T).sum(0)
+        F_thin = np.zeros(3)
+        M_thin = np.zeros(3)
+        if tf is not None:
+            pinf = self.W_inf[4]
+            mag = ((pa - pinf) * tf["fa"] - (pbb - pinf) * tf["fb"]) * tf["area"]
+            dFt = np.zeros((3, mag.size))
+            dFt[tf["dir"], np.arange(mag.size)] = mag      # the a side pushes the wall toward +d
+            F_thin = dFt.sum(1)
+            rt = tf["pos"] - np.asarray(x_ref, float)[:, None]
+            M_thin = np.cross(rt.T, dFt.T).sum(0)
+        F = F_ib + F_thin
+        M = M_ib + M_thin
         V = self.W_inf[1:4]
         Vm = np.linalg.norm(V)
         q = 0.5 * self.W_inf[0] * Vm ** 2
@@ -477,7 +556,9 @@ class Solver:
         restore_axis = np.cross(ex, e_d)
         restore_axis = restore_axis / np.linalg.norm(restore_axis) if np.linalg.norm(restore_axis) > 1e-9 \
             else -side
-        return dict(F=F, M=M, q_inf=q, CX=Cf[0], CY=Cf[1], CZ=Cf[2],
+        return dict(F=F, M=M, F_thin=F_thin, M_thin=M_thin, q_inf=q,
+                    C_thin=F_thin / (q * S_ref), Cm_thin=M_thin / (q * S_ref * L_ref),
+                    CX=Cf[0], CY=Cf[1], CZ=Cf[2],
                     Cl=Cm[0], Cm=Cm[1], Cn=Cm[2], CD=Cf @ e_d, CL=Cf @ lift_dir,
                     CN=Cf @ cross, CS=Cf @ side, C_roll=Cm[0], C_restore=Cm @ restore_axis)
 
@@ -507,6 +588,36 @@ class Solver:
             self._surf = dict(wF=-(delta * dV) * g,
                               pos=np.stack([self.axes[d][idx[d]] for d in range(3)]),
                               flat_t=torch.as_tensor(flat, device=self.device))
+            if self.has_thin:
+                interior = np.zeros(phi.shape, bool)
+                interior[NG:-NG, NG:-NG, NG:-NG] = True
+                A_, B_, D_, AR, PS, FA, FB = [], [], [], [], [], [], []
+                for d in range(3):
+                    ia = np.nonzero(((self.blk >> d) & 1).astype(bool))
+                    ib_ = list(ia)
+                    ib_[d] = ia[d] + 1
+                    ib_ = tuple(ib_)
+                    fa = self.fluid[ia] & interior[ia]
+                    fb = self.fluid[ib_] & interior[ib_]
+                    keep = fa | fb
+                    ia = tuple(v[keep] for v in ia)
+                    ib_ = tuple(v[keep] for v in ib_)
+                    o = [e for e in range(3) if e != d]
+                    area = self.widths[o[0]][ia[o[0]]] * self.widths[o[1]][ia[o[1]]]
+                    pos = np.stack([self.axes[e][ia[e]] for e in range(3)]).astype(float)
+                    pos[d] += 0.5 * self.widths[d][ia[d]]
+                    A_.append(np.ravel_multi_index(ia, phi.shape))
+                    B_.append(np.ravel_multi_index(ib_, phi.shape))
+                    D_.append(np.full(area.size, d))
+                    AR.append(area)
+                    PS.append(pos)
+                    FA.append(fa[keep].astype(float))
+                    FB.append(fb[keep].astype(float))
+                self._surf["thin"] = dict(a_t=torch.as_tensor(np.concatenate(A_), device=self.device),
+                                          b_t=torch.as_tensor(np.concatenate(B_), device=self.device),
+                                          dir=np.concatenate(D_), area=np.concatenate(AR),
+                                          pos=np.concatenate(PS, axis=1), fa=np.concatenate(FA),
+                                          fb=np.concatenate(FB))
             self._surf_key = key
         return self._surf
 

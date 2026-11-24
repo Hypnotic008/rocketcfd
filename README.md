@@ -17,6 +17,7 @@ guessed aero coefficients in CatchSim (`quatsim/aero.py`).
 | Super Heavy V3 geometry: hull, tapered thrust plate, 33 exposed Raptor 3 bells (outer ring overhanging the hull), 4 chines (taller pair on the raceway side), raceway, fin pods, forward dome | done |
 | Grid fins from CatchSim's STEP-derived mesh (`rocketcfd/data/gridfin.i16`), scaled per axis to 3.5 m wide x 4.2 m reach x 0.5 m deep | done |
 | Crossflow from any side (`--windward`): lift, side force, rolling moment for the gliding entry | done |
+| Thin walls (blocked faces) for parts thinner than a cell, e.g. grid fin lattice plates; separate thin-wall loads | done |
 | Pressure loads -> CD, CN, Cm in CatchSim's reference frame | done |
 | One-case-per-GPU sweep that writes an aero database CSV | done |
 | Output: slice plots, ParaView VTK, STL of the geometry | done |
@@ -29,6 +30,10 @@ guessed aero coefficients in CatchSim (`quatsim/aero.py`).
 | Cylinder, Mach 4: stagnation pressure | Rayleigh pitot formula | -1.0 % |
 | Cylinder, Mach 4: bow-shock standoff | Billig correlation | +6.9 % (40 cells / radius) |
 | Cylinder, Mach 4: surface pressure | modified Newtonian | matches near stagnation, above it further round (expected) |
+| Cylinder, Mach 4, stretched grid (2.8x fewer cells) | uniform-grid result | standoff within 1 %, stagnation pressure -0.5 % |
+| 1 mm flat plate, Mach 2, 5 deg, plate along the grid (thin walls) | shock-expansion theory | face pressures exact to 4 digits; CN -1.7 % |
+| Same plate tilted across the grid (staircase walls) | shock-expansion theory | CN +6.1 % (100 cells/chord), -2.5 % (200 cells/chord) |
+| Warp kernels vs PyTorch reference (Sod, cylinder, 3-D sphere) | identical numerics | max difference 2e-4 (float32) |
 
 ## Running
 
@@ -45,6 +50,7 @@ Then:
 ```bash
 python cases/validate_sod.py
 python cases/validate_cylinder.py 4
+python cases/validate_flat_plate.py            # thin walls (add --inclined for staircase walls)
 python cases/super_heavy_geometry.py                         # STL + renders
 python cases/super_heavy_descent.py --h 0.1 --fins cad_filled
 python cases/aero_sweep.py --gpus 1 --h 0.3                  # descent x AoA x windward side

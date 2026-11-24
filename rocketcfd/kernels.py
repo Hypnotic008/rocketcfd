@@ -100,18 +100,31 @@ def lim(a: float, b: float, kind: int):
 
 @wp.func
 def face_flux(qm: vec5, qa: vec5, qb: vec5, qp: vec5, d: int, g: float, order: float,
-              kind: int, hlle: int):
+              kind: int, hlle: int, zl: float, zr: float):
+    """Flux at the face between qa and qb. zl / zr = 0 switch off the slope of qa / qb
+    (used when the outer stencil cell lies across a thin wall)."""
     qL = qa
     qR = qb
     if order > 0.0:
         for c in range(5):
             dC = qb[c] - qa[c]
-            qL[c] = qa[c] + 0.5 * order * lim(qa[c] - qm[c], dC, kind)
-            qR[c] = qb[c] - 0.5 * order * lim(dC, qp[c] - qb[c], kind)
+            qL[c] = qa[c] + 0.5 * order * zl * lim(qa[c] - qm[c], dC, kind)
+            qR[c] = qb[c] - 0.5 * order * zr * lim(dC, qp[c] - qb[c], kind)
         if qL[0] <= 0.0 or qL[4] <= 0.0 or qR[0] <= 0.0 or qR[4] <= 0.0:
             qL = qa
             qR = qb
     return riemann(qL, qR, d, g, hlle)
+
+
+@wp.func
+def wall_flux(q: vec5, d: int, g: float, own_left: int):
+    """Flux through a blocked (thin-wall) face: Riemann problem against the mirror state.
+    Zero mass, energy and tangential-momentum flux; the normal momentum carries the wall pressure."""
+    m = q
+    m[1 + d] = -q[1 + d]
+    if own_left != 0:
+        return riemann(q, m, d, g, 0)
+    return riemann(m, q, d, g, 0)
 
 
 @wp.kernel
@@ -182,7 +195,8 @@ def shock_kernel(W: wp.array4d(dtype=wp.float32), active: wp.vec3i, thr: float,
 def residual_kernel(W: wp.array4d(dtype=wp.float32), S: wp.array3d(dtype=wp.int32),
                     ix: wp.array(dtype=wp.float32), iy: wp.array(dtype=wp.float32),
                     iz: wp.array(dtype=wp.float32), active: wp.vec3i, g: float, order: float,
-                    kind: int, R: wp.array4d(dtype=wp.float32)):
+                    kind: int, blk: wp.array3d(dtype=wp.int32), R: wp.array4d(dtype=wp.float32)):
+    """blk[i,j,k] bit d set = the face between cell (i,j,k) and its +d neighbour is a thin wall."""
     i, j, k = wp.tid()
     I = i + 2
     J = j + 2
@@ -211,8 +225,22 @@ def residual_kernel(W: wp.array4d(dtype=wp.float32), S: wp.array3d(dtype=wp.int3
             s0 = S[I, J, K]
             hl_l = wp.max(S[I - di, J - dj, K - dk], s0)
             hl_r = wp.max(s0, S[I + di, J + dj, K + dk])
-            fl = face_flux(qm2, qm1, q0, qp1, d, g, order, kind, hl_l)
-            fr = face_flux(qm1, q0, qp1, qp2, d, g, order, kind, hl_r)
+            bLL = (blk[I - 2 * di, J - 2 * dj, K - 2 * dk] >> d) & 1
+            bL = (blk[I - di, J - dj, K - dk] >> d) & 1
+            bR = (blk[I, J, K] >> d) & 1
+            bRR = (blk[I + di, J + dj, K + dk] >> d) & 1
+            fl = vec5()
+            fr = vec5()
+            if bL != 0:
+                fl = wall_flux(q0, d, g, 0)
+            else:
+                fl = face_flux(qm2, qm1, q0, qp1, d, g, order, kind, hl_l,
+                               float(1 - bLL), float(1 - bR))
+            if bR != 0:
+                fr = wall_flux(q0, d, g, 1)
+            else:
+                fr = face_flux(qm1, q0, qp1, qp2, d, g, order, kind, hl_r,
+                               float(1 - bL), float(1 - bRR))
             acc = acc - (fr - fl) * inv
     for c in range(5):
         R[c, i, j, k] = acc[c]
