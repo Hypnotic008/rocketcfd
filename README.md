@@ -75,6 +75,33 @@ Best estimates and how they compare with CatchSim (`quatsim/aero.py`):
 * For CatchSim's +0.35 stability, the grid fins must contribute about +1.0: the fin sweep
   (`cases/grid_fin.py`) is the next result.
 
+### V3 grid fin, isolated: Mach sweep
+
+Parametric V3 fin (`rocketcfd/vehicles/grid_fin.py`: 3.5 m x 3.9 m, 0.5 m deep, 10 mm plates
+0.31 m apart, teeth on the face toward the engines), 2.5 cm cells (5.7 M cells), inviscid,
+Mach swept downward with warm starts like the real descent. Slope of the normal force per
+radian, on the 11.26 m^2 outline area:
+
+| Mach | 0.6 | 0.8 | 0.9 | 1.0 | 1.1 | 1.3 | 1.6 | 2.0 | 2.8 | 4.0 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| dCN/dalpha | 1.93 | 1.49 | 1.55 | 1.56 | 1.62 | 1.45 | 1.40 | 2.01 | ~1.9* | 1.40 |
+| relative to Mach 0.6 | 1.00 | 0.77 | 0.80 | 0.81 | 0.84 | 0.75 | 0.73 | 1.04 | ~0.99 | 0.73 |
+
+\* From 5 and 10 deg only: the 0 deg case at Mach 2.8 kept an asymmetric, partly choked lattice
+from the previous (10 deg) case. The sweep now starts every incidence from the alpha-0 state.
+
+* At Mach 4 the lattice is **started**: oblique shocks at each plate edge, supersonic flow through
+  the cells, no shock ahead of the fin. Axial force ~0.18 (the old 4.5 cm square-edged CAD fin
+  stayed choked at 2.8 with ~0.45).
+* Between Mach ~1.6 and ~0.8 the lattice is **choked**: a detached shock stands ahead of the fin
+  and the effectiveness drops ~25 %. The fin restarts near Mach 2.
+* Compared with CatchSim's `effectiveness()` (dip to 0.55 at Mach 1.1, 0.9 above Mach 2): the dip
+  is shallower and wider, and the supersonic level varies (1.04 at Mach 2, 0.73 at Mach 4).
+* Per fin at Mach 2.8: ~21 x q N per radian (CatchSim: ~4.3 x q). With the body's -0.63, the two catch
+  fins (+0.34) leave the restoring-moment slope at about -0.29 without body upwash on the fins:
+  roughly neutral to mildly unstable engines-first at peak dynamic pressure, against CatchSim's
+  +0.35. An installed (fins-on) booster run is needed to settle it.
+
 ## Running
 
 Windows or Linux, NVIDIA GPU (no WSL needed):

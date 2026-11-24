@@ -36,6 +36,9 @@ def main():
     ap.add_argument("--no-teeth", action="store_true", help="parametric fin without the toothed face")
     ap.add_argument("--plate-offset", type=float, default=0.0,
                     help="thin every plate by this much on each side [m] (e.g. 0.01 turns 4.5 cm into 2.5 cm)")
+    ap.add_argument("--local-dt", action="store_true",
+                    help="per-cell time steps (steady): speeds up the subsonic cases, whose large farfield "
+                         "cells otherwise wait on the fin's small ones")
     ap.add_argument("--ascending", action="store_true",
                     help="sweep Mach upward, each Mach started from rest (default: downward with warm starts, "
                          "like the real descent, which keeps a started lattice started)")
@@ -102,12 +105,16 @@ def main():
     print(f"setup {time.time()-t0:.1f} s")
     rows = []
     zmid = 0.5 * (box[0][2] + box[1][2]) + 0.11      # a mid-span plane, off the lattice nodes
+    # Flight-like path: Mach descends along the alpha = 0 (symmetric) states; each incidence is
+    # an excursion from that Mach's alpha-0 state, swept upward. (Sweeping incidence back down
+    # first left asymmetric, partly choked lattices behind: real hysteresis, but not this path.)
     first = True
+    base = None                                   # alpha-0 state of the previous Mach
     for mi, M in enumerate(machs):
-        # descending: sweep incidence up then down so each new Mach starts from the alpha-0 state
-        al_order = alphas if (a.ascending or mi % 2 == 0) else alphas[::-1]
-        for ai, al in enumerate(al_order):
+        for ai, al in enumerate(alphas):
             fs, q, V = freestream(M, al)
+            if ai == 0 and base is not None and not a.ascending:
+                s.U.copy_(base)
             warm = (not first) and (ai > 0 or not a.ascending)
             s.set_freestream(fs, keep_state=warm)
             first = False
@@ -132,7 +139,9 @@ def main():
             print(f"=== M {M}  alpha {al} deg  (up to {nmax} steps)", flush=True)
             t1 = time.time()
             s.run(nmax, chunk=chunk, first_order_steps=(0 if warm else 300), report=report,
-                  steady=not a.time_accurate)
+                  steady=not a.time_accurate, local_dt=a.local_dt)
+            if ai == 0:
+                base = s.U.clone()
             ld = s.loads(S_ref=S_ref, L_ref=c_ref, x_ref=(0.0, 0.0, 0.0))
             Ft, Mt = ld["F_thin"], ld["M_thin"]
             row = dict(mach=M, alpha=al, CN=Ft[1] / (q * S_ref), CA=Ft[0] / (q * S_ref),
