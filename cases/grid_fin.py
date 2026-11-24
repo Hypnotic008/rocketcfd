@@ -36,6 +36,8 @@ def main():
     ap.add_argument("--max-steps", type=int, default=0)
     ap.add_argument("--out", default="results/grid_fin")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--time-accurate", action="store_true",
+                    help="global time step, all cells every step (off: local time steps + active tiles)")
     a = ap.parse_args()
 
     from rocketcfd import Solver, atmosphere
@@ -101,7 +103,8 @@ def main():
 
             print(f"=== M {M}  alpha {al} deg  (up to {nmax} steps)", flush=True)
             t1 = time.time()
-            s.run(nmax, chunk=chunk, first_order_steps=(300 if ai == 0 else 0), report=report)
+            s.run(nmax, chunk=chunk, first_order_steps=(300 if ai == 0 else 0), report=report,
+                  steady=not a.time_accurate)
             ld = s.loads(S_ref=S_ref, L_ref=c_ref, x_ref=(0.0, 0.0, 0.0))
             Ft, Mt = ld["F_thin"], ld["M_thin"]
             row = dict(mach=M, alpha=al, CN=Ft[1] / (q * S_ref), CA=Ft[0] / (q * S_ref),

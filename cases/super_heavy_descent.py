@@ -47,6 +47,8 @@ def main(argv=None):
     ap.add_argument("--growth", type=float, default=1.12, help="max cell-size ratio between neighbours")
     ap.add_argument("--uniform", action="store_true", help="uniform grid at --h everywhere (old behaviour)")
     ap.add_argument("--dry-run", action="store_true", help="print the grid and exit")
+    ap.add_argument("--time-accurate", action="store_true",
+                    help="global time step, all cells every step (off: local time steps + active tiles)")
     ap.add_argument("--fins", default="cad_filled", choices=["none", "cad", "cad_filled"])
     ap.add_argument("--fin-deflection", type=float, nargs=3, default=(0.0, 0.0, 0.0))
     ap.add_argument("--flowthroughs", type=float, default=4.0, help="maximum run length")
@@ -142,7 +144,7 @@ def main(argv=None):
 
     t0 = time.time()
     chunk = max(100, int(round(nsteps / 40 / 50)) * 50)       # ~40 load checks over the max length
-    s.run(nsteps, chunk=chunk, first_order_steps=400, report=report)
+    s.run(nsteps, chunk=chunk, first_order_steps=400, report=report, steady=not a.time_accurate)
     wall = time.time() - t0
 
     ld = s.loads(**REFERENCE, parts=PARTS)

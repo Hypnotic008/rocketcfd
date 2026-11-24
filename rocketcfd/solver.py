@@ -154,12 +154,16 @@ class Solver:
         self.S_buf = torch.zeros(shape, dtype=torch.int32, device=dev)
         self.rate_buf = torch.zeros(self.n, dtype=self.dtype, device=dev)
         self.dt_buf = torch.zeros(1, dtype=self.dtype, device=dev)
+        self.dtl_buf = torch.zeros(self.n, dtype=self.dtype, device=dev)
+        nt = tuple((m + 7) // 8 for m in self.n)
+        self.act_buf = torch.zeros(nt, dtype=self.dtype, device=dev)
         self.blk_buf = torch.as_tensor(self.blk, device=dev)
         self.mask_f = self.update_mask.to(self.dtype)
         self.invw1 = [self.invw[d].reshape(-1).contiguous() for d in range(3)]
         f = wp.from_torch
         self._w = dict(U=f(self.U), U1=f(self.U1), W=f(self.W_buf), R=f(self.R_buf), S=f(self.S_buf),
                        rate=f(self.rate_buf), dt=f(self.dt_buf), mask=f(self.mask_f), blk=f(self.blk_buf),
+                       dtl=f(self.dtl_buf), act=f(self.act_buf),
                        ix=f(self.invw1[0]), iy=f(self.invw1[1]), iz=f(self.invw1[2]))
         self._active_flux = wp.vec3i(*[0 if (self.n[d] == 1 and self.bcs[(d, 0)] == "periodic") else 1
                                        for d in range(3)])
@@ -399,29 +403,60 @@ class Solver:
         wp.launch(K.shock_kernel, dim=shape, inputs=[w["W"], self._active_sensor, self.shock_threshold, w["S"]],
                   device=self._wdev, stream=self._wp_stream)
 
-    def _wresidual(self, order):
+    def _wresidual(self, order, tiles=None):
         wp, K, w = self._wp, self._K, self._w
         kind = 1 if self.limiter == "minmod" else 0
-        wp.launch(K.residual_kernel, dim=self.n,
-                  inputs=[w["W"], w["S"], w["ix"], w["iy"], w["iz"], self._active_flux, self.gamma,
-                          float(order), kind, w["blk"], w["R"]], device=self._wdev, stream=self._wp_stream)
+        args = [w["W"], w["S"], w["ix"], w["iy"], w["iz"], self._active_flux, self.gamma, float(order), kind, w["blk"]]
+        if tiles is None:
+            wp.launch(K.residual_kernel, dim=self.n, inputs=args + [w["R"]],
+                      device=self._wdev, stream=self._wp_stream)
+        else:
+            wp.launch(K.residual_tiles_kernel, dim=tiles.shape[0] * 512, inputs=args + [tiles, w["R"]],
+                      device=self._wdev, stream=self._wp_stream)
 
-    def _step_warp(self, order, want_res=False):
+    def _wrk(self, Ua, a0, a1, out, local, tiles=None):
+        wp, K, w = self._wp, self._K, self._w
+        args = [w["U"], w[Ua], w["R"], w["dt"], w["dtl"], int(local), w["mask"], a0, a1]
+        if tiles is None:
+            wp.launch(K.rk_kernel, dim=self.n, inputs=args + [w[out]], device=self._wdev, stream=self._wp_stream)
+        else:
+            wp.launch(K.rk_tiles_kernel, dim=tiles.shape[0] * 512, inputs=args + [tiles, w[out]],
+                      device=self._wdev, stream=self._wp_stream)
+
+    def _step_warp(self, order, want_res=False, local=False, tiles=None):
+        """SSP-RK2 step. local: per-cell time steps (steady runs only). tiles: update only
+        these 8x8x8 tiles (active-region updating, steady runs only)."""
         wp, K, w = self._wp, self._K, self._w
         self._wprim("U")
         wp.launch(K.rate_kernel, dim=self.n, inputs=[w["W"], w["ix"], w["iy"], w["iz"], self._active_flux,
                                                      w["mask"], self.gamma, w["rate"]],
                   device=self._wdev, stream=self._wp_stream)
         torch.div(self.cfl, self.rate_buf.max(), out=self.dt_buf[0])
-        self._wresidual(order)
+        if local:
+            torch.div(self.cfl, torch.clamp(self.rate_buf, min=1e-30), out=self.dtl_buf)
+        elif tiles is None and getattr(self, "_tiles_on", False):
+            self.dtl_buf.copy_(self.dt_buf[0].expand_as(self.dtl_buf))   # for the activity measure
+        self._wresidual(order, tiles)
         res = torch.sqrt(((self.R_buf[0] * self.mask_f) ** 2).sum() / self.n_fluid) if want_res else None
-        wp.launch(K.rk_kernel, dim=self.n, inputs=[w["U"], w["U"], w["R"], w["dt"], w["mask"], 0.0, 1.0, w["U1"]],
-                  device=self._wdev, stream=self._wp_stream)
+        self._wrk("U", 0.0, 1.0, "U1", local, tiles)
         self._wprim("U1")
-        self._wresidual(order)
-        wp.launch(K.rk_kernel, dim=self.n, inputs=[w["U"], w["U1"], w["R"], w["dt"], w["mask"], 0.5, 0.5, w["U"]],
-                  device=self._wdev, stream=self._wp_stream)
+        self._wresidual(order, tiles)
+        self._wrk("U1", 0.5, 0.5, "U", local, tiles)
         return self.dt_buf[0].clone(), res
+
+    def _refresh_tiles(self, frac):
+        """Active tiles: those whose largest relative density change per step exceeds `frac`
+        times the largest anywhere, plus one tile around them (so changes can propagate)."""
+        wp, K, w = self._wp, self._K, self._w
+        self.act_buf.zero_()
+        wp.launch(K.activity_kernel, dim=self.n, inputs=[w["R"], w["W"], w["dtl"], w["mask"], w["act"]],
+                  device=self._wdev, stream=self._wp_stream)
+        a = self.act_buf
+        on = (a > frac * a.max()).to(self.dtype)[None, None]
+        on = torch.nn.functional.max_pool3d(on, 3, stride=1, padding=1)[0, 0] > 0
+        idx = torch.nonzero(on).to(torch.int32).contiguous()
+        self._tiles_t = idx                      # keep the tensor alive for the warp view
+        return wp.from_torch(idx, dtype=wp.vec3i) if idx.shape[0] else None, idx.shape[0] / on.numel()
 
     # ----------------------------------------------------------- torch path
     def _step(self, order, want_res=True):
@@ -447,17 +482,50 @@ class Solver:
         return dt, res
 
     # -------------------------------------------------------------- driver
-    def run(self, nsteps, chunk=100, first_order_steps=200, report=None):
-        """Advance nsteps time steps. `report(solver)` is called after every chunk."""
+    def run(self, nsteps, chunk=100, first_order_steps=200, report=None, steady=False,
+            active_tiles=None, tile_refresh=50, tile_frac=1e-3, local_dt=False):
+        """Advance nsteps time steps. `report(solver)` is called after every chunk; it can
+        return True to stop.
+
+        steady=True (warp backend) turns on the steady-state accelerations, which change the
+        path to the solution but not the converged answer:
+          * active tiles (default on when steady): every `tile_refresh` steps a full step
+            measures how fast each 8x8x8 tile is changing; until the next refresh only tiles
+            changing faster than `tile_frac` x the fastest (plus a one-tile margin) are updated;
+          * local_dt=True: every cell advances at its own stable step (off by default: on the
+            stretched grids tested it slowed convergence; worth trying with strong stretching).
+        Time-accurate runs (steady=False) always update every cell with one global step.
+        """
+        steady = steady and self.backend == "warp"
+        if active_tiles is None:
+            active_tiles = steady
+        active_tiles = active_tiles and steady
+        self._tiles_on = active_tiles
+        local = steady and local_dt
         done = 0
         t0 = time.time()
+        work = 0.0                       # cell updates actually done, in units of full steps
+        tiles = None
+        self.active_fraction = 1.0
         with torch.no_grad():
             while done < nsteps:
                 k = min(chunk, nsteps - done)
                 order = 0.0 if self.step_count < first_order_steps else 1.0
                 dt_sum = torch.zeros((), dtype=self.dtype, device=self.device)
                 for kk in range(k):
-                    dt, r = self._step(order, want_res=(kk == k - 1))
+                    if self.backend == "warp":
+                        full = (not active_tiles) or ((self.step_count + kk) % tile_refresh == 0) \
+                            or self.step_count + kk < first_order_steps
+                        dt, r = self._step_warp(order, want_res=(kk == k - 1), local=local,
+                                                tiles=None if full else tiles)
+                        if active_tiles and full and self.step_count + kk >= first_order_steps:
+                            tiles, self.active_fraction = self._refresh_tiles(tile_frac)
+                            if tiles is None:
+                                tiles, self.active_fraction = None, 1.0
+                        work += 1.0 if (full or tiles is None) else self.active_fraction
+                    else:
+                        dt, r = self._step(order, want_res=(kk == k - 1))
+                        work += 1.0
                     if r is not None:
                         res = r
                     dt_sum += dt
@@ -471,13 +539,15 @@ class Solver:
                 if self.verbose:
                     el = time.time() - t0
                     cps = np.prod(self.n) * done / el / 1e6
+                    act = f"  active {100*self.active_fraction:.0f}%" if active_tiles else ""
                     mem = (f"  GPU mem {torch.cuda.max_memory_allocated(self.device)/2**30:.2f} GB"
                            if self.device.type == "cuda" else "")
                     print(f"step {self.step_count:6d}  t = {self.t:.4e} s  "
-                          f"res(rho) = {res/self.fs['rho']:.3e} 1/s  [{cps:.1f} Mcell-steps/s]{mem}",
+                          f"res(rho) = {res/self.fs['rho']:.3e} 1/s  [{cps:.1f} Mcell-steps/s]{mem}{act}",
                           flush=True)
                 if report and report(self):
                     break                      # the report callback asked to stop (converged)
+        self.work_full_steps = work
         return self
 
     def set_freestream(self, freestream, keep_state=False):

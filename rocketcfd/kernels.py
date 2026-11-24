@@ -191,13 +191,13 @@ def shock_kernel(W: wp.array4d(dtype=wp.float32), active: wp.vec3i, thr: float,
     S[i, j, k] = flag
 
 
-@wp.kernel
-def residual_kernel(W: wp.array4d(dtype=wp.float32), S: wp.array3d(dtype=wp.int32),
-                    ix: wp.array(dtype=wp.float32), iy: wp.array(dtype=wp.float32),
-                    iz: wp.array(dtype=wp.float32), active: wp.vec3i, g: float, order: float,
-                    kind: int, blk: wp.array3d(dtype=wp.int32), R: wp.array4d(dtype=wp.float32)):
-    """blk[i,j,k] bit d set = the face between cell (i,j,k) and its +d neighbour is a thin wall."""
-    i, j, k = wp.tid()
+@wp.func
+def cell_residual(W: wp.array4d(dtype=wp.float32), S: wp.array3d(dtype=wp.int32),
+                  ix: wp.array(dtype=wp.float32), iy: wp.array(dtype=wp.float32),
+                  iz: wp.array(dtype=wp.float32), active: wp.vec3i, g: float, order: float,
+                  kind: int, blk: wp.array3d(dtype=wp.int32), i: int, j: int, k: int):
+    """Residual -div(F) of interior cell (i, j, k). blk[i,j,k] bit d set = the face between
+    cell (i,j,k) and its +d neighbour is a thin wall."""
     I = i + 2
     J = j + 2
     K = k + 2
@@ -242,8 +242,57 @@ def residual_kernel(W: wp.array4d(dtype=wp.float32), S: wp.array3d(dtype=wp.int3
                 fr = face_flux(qm1, q0, qp1, qp2, d, g, order, kind, hl_r,
                                float(1 - bL), float(1 - bRR))
             acc = acc - (fr - fl) * inv
+    return acc
+
+
+@wp.kernel
+def residual_kernel(W: wp.array4d(dtype=wp.float32), S: wp.array3d(dtype=wp.int32),
+                    ix: wp.array(dtype=wp.float32), iy: wp.array(dtype=wp.float32),
+                    iz: wp.array(dtype=wp.float32), active: wp.vec3i, g: float, order: float,
+                    kind: int, blk: wp.array3d(dtype=wp.int32), R: wp.array4d(dtype=wp.float32)):
+    i, j, k = wp.tid()
+    acc = cell_residual(W, S, ix, iy, iz, active, g, order, kind, blk, i, j, k)
     for c in range(5):
         R[c, i, j, k] = acc[c]
+
+
+TILE = 8
+
+
+@wp.func
+def tile_cell(tiles: wp.array(dtype=wp.vec3i), t: int):
+    """Cell (i, j, k) handled by thread t of an active-tile launch (8x8x8 cells per tile)."""
+    tl = tiles[t // 512]
+    loc = t % 512
+    return wp.vec3i(tl[0] * 8 + loc // 64, tl[1] * 8 + (loc // 8) % 8, tl[2] * 8 + loc % 8)
+
+
+@wp.kernel
+def residual_tiles_kernel(W: wp.array4d(dtype=wp.float32), S: wp.array3d(dtype=wp.int32),
+                          ix: wp.array(dtype=wp.float32), iy: wp.array(dtype=wp.float32),
+                          iz: wp.array(dtype=wp.float32), active: wp.vec3i, g: float, order: float,
+                          kind: int, blk: wp.array3d(dtype=wp.int32), tiles: wp.array(dtype=wp.vec3i),
+                          R: wp.array4d(dtype=wp.float32)):
+    c3 = tile_cell(tiles, wp.tid())
+    i = c3[0]
+    j = c3[1]
+    k = c3[2]
+    if i >= R.shape[1] or j >= R.shape[2] or k >= R.shape[3]:
+        return
+    acc = cell_residual(W, S, ix, iy, iz, active, g, order, kind, blk, i, j, k)
+    for c in range(5):
+        R[c, i, j, k] = acc[c]
+
+
+@wp.kernel
+def activity_kernel(R: wp.array4d(dtype=wp.float32), W: wp.array4d(dtype=wp.float32),
+                    dtl: wp.array3d(dtype=wp.float32), mask: wp.array3d(dtype=wp.float32),
+                    act: wp.array3d(dtype=wp.float32)):
+    """Per-tile maximum relative density change per step: |dt * R_rho / rho|."""
+    i, j, k = wp.tid()
+    if mask[i, j, k] > 0.5:
+        v = wp.abs(dtl[i, j, k] * R[0, i, j, k] / W[0, i + 2, j + 2, k + 2])
+        wp.atomic_max(act, i // 8, j // 8, k // 8, v)
 
 
 @wp.kernel
@@ -265,21 +314,45 @@ def rate_kernel(W: wp.array4d(dtype=wp.float32), ix: wp.array(dtype=wp.float32),
     rate[i, j, k] = r * mask[i, j, k]
 
 
-@wp.kernel
-def rk_kernel(U0: wp.array4d(dtype=wp.float32), Ua: wp.array4d(dtype=wp.float32),
-              R: wp.array4d(dtype=wp.float32), dt: wp.array(dtype=wp.float32),
-              mask: wp.array3d(dtype=wp.float32), a0: float, a1: float,
-              out: wp.array4d(dtype=wp.float32)):
-    """out = a0 * U0 + a1 * (Ua + dt * R) on fluid cells, U0 elsewhere (interior only)."""
-    i, j, k = wp.tid()
+@wp.func
+def rk_cell(U0: wp.array4d(dtype=wp.float32), Ua: wp.array4d(dtype=wp.float32),
+            R: wp.array4d(dtype=wp.float32), dt: wp.array(dtype=wp.float32),
+            dtl: wp.array3d(dtype=wp.float32), local: int, mask: wp.array3d(dtype=wp.float32),
+            a0: float, a1: float, out: wp.array4d(dtype=wp.float32), i: int, j: int, k: int):
     I = i + 2
     J = j + 2
     K = k + 2
     m = mask[i, j, k]
     h = dt[0]
+    if local != 0:
+        h = dtl[i, j, k]
     for c in range(5):
         u0 = U0[c, I, J, K]
         if m > 0.5:
             out[c, I, J, K] = a0 * u0 + a1 * (Ua[c, I, J, K] + h * R[c, i, j, k])
         else:
             out[c, I, J, K] = u0
+
+
+@wp.kernel
+def rk_kernel(U0: wp.array4d(dtype=wp.float32), Ua: wp.array4d(dtype=wp.float32),
+              R: wp.array4d(dtype=wp.float32), dt: wp.array(dtype=wp.float32),
+              dtl: wp.array3d(dtype=wp.float32), local: int,
+              mask: wp.array3d(dtype=wp.float32), a0: float, a1: float,
+              out: wp.array4d(dtype=wp.float32)):
+    """out = a0 * U0 + a1 * (Ua + dt * R) on fluid cells, U0 elsewhere (interior only).
+    dt is the global step, or the per-cell step dtl when local != 0 (steady runs)."""
+    i, j, k = wp.tid()
+    rk_cell(U0, Ua, R, dt, dtl, local, mask, a0, a1, out, i, j, k)
+
+
+@wp.kernel
+def rk_tiles_kernel(U0: wp.array4d(dtype=wp.float32), Ua: wp.array4d(dtype=wp.float32),
+                    R: wp.array4d(dtype=wp.float32), dt: wp.array(dtype=wp.float32),
+                    dtl: wp.array3d(dtype=wp.float32), local: int,
+                    mask: wp.array3d(dtype=wp.float32), a0: float, a1: float,
+                    tiles: wp.array(dtype=wp.vec3i), out: wp.array4d(dtype=wp.float32)):
+    c3 = tile_cell(tiles, wp.tid())
+    if c3[0] >= R.shape[1] or c3[1] >= R.shape[2] or c3[2] >= R.shape[3]:
+        return
+    rk_cell(U0, Ua, R, dt, dtl, local, mask, a0, a1, out, c3[0], c3[1], c3[2])
