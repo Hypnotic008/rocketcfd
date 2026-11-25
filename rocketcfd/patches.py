@@ -38,8 +38,29 @@ def _lattice(lo, hi, h):
     return f
 
 
+def _snap(pf, base_faces, h):
+    """Move each patch boundary out to the nearest base-grid face, so that every base cell is
+    either entirely inside a patch (and averaged from it) or entirely outside; the patch keeps a
+    near-uniform spacing close to h. Axes where the patch spans the whole base grid are unchanged."""
+    out = []
+    for fc in pf:
+        new = []
+        for d in range(3):
+            bf = base_faces[d]
+            a, b = fc[d][0], fc[d][-1]
+            if len(bf) <= 2:
+                new.append(fc[d])
+                continue
+            a2 = bf[max(np.searchsorted(bf, a + 1e-9 * max(1.0, abs(a)), side="right") - 1, 0)]
+            b2 = bf[min(np.searchsorted(bf, b - 1e-9 * max(1.0, abs(b)), side="left"), len(bf) - 1)]
+            n = max(1, int(round((b2 - a2) / h[d])))
+            new.append(np.linspace(a2, b2, n + 1))
+        out.append(new)
+    return out
+
+
 def wall_patches(base_faces, h, shell, sdf=None, thin_sdf=None, box=(32, 64, 64), margin=2,
-                 sample=2, inner=None, thin_box=None, region=None, verbose=True):
+                 sample=2, inner=None, thin_box=None, region=None, snap=True, verbose=True):
     """Patches of cells of size h = (hx, hy, hz) covering the fluid within `shell` metres of
     the walls of `sdf` (and of `thin_sdf`, for thin parts such as grid fins).
 
@@ -119,6 +140,8 @@ def wall_patches(base_faces, h, shell, sdf=None, thin_sdf=None, box=(32, 64, 64)
                     b = min(idx[d][on[-1]] + 1 + margin + (sample - 1), (i1, j1, k1)[d])
                     rng.append((a, b))
                 out.append([fine[d][rng[d][0]:rng[d][1] + 1].copy() for d in range(3)])
+    if snap:
+        out = _snap(out, base_faces, h)
     if verbose:
         cells = sum(int(np.prod([len(f) - 1 for f in p])) for p in out)
         print(f"wall_patches: {len(out)} patches from {n_cand} candidate boxes, {cells/1e6:.2f} M cells, "
@@ -506,6 +529,14 @@ class PatchGrid:
                     s0._L(self._rk, r["n"], [self._wbuf(name), 1, v["d1"], 0, v["start"], v["s1"], 0, v["w"]])
 
     # ------------------------------------------------------------ solve
+    def _prime(self):
+        """Primitive variables on every grid before the first coupled iteration: a patch fills its
+        ghost layers from sibling patches that may not have been converted yet in this iteration
+        (zeros on the very first one, which the viscous terms turn into NaN)."""
+        for g in self.grids:
+            K = g._K
+            g._L(K.prim_kernel, tuple(g.U.shape[1:]), [g._w["U"], g.gamma, g.rho_min, g.p_min, g._w["W"]])
+
     def run(self, iters, chunk=50, first_order_steps=200, report=None, cfl_max=20.0, cfl_start=1.0,
             cfl_ramp=300, sweeps=8, snapshot=None):
         """Implicit pseudo-time iterations on all grids together (see Solver.run(implicit=True))."""
@@ -514,6 +545,7 @@ class PatchGrid:
         order_by_size = list(np.argsort(-self.rank))     # coarse to fine: patches see this iteration's base
         ncell = sum(int(np.prod(s.n)) for s in self.grids)
         start_it = self.base.step_count
+        self._prime()
         with torch.no_grad():
             while done < iters:
                 k = min(chunk, iters - done)
@@ -553,6 +585,7 @@ class PatchGrid:
         order_by_size = list(np.argsort(-self.rank))
         ncell = sum(int(np.prod(s.n)) for s in self.grids)
         iters = 0
+        self._prime()
         with torch.no_grad():
             for n in range(nsteps):
                 duals = [g._dual_shift(bdf, dt) for g in self.grids]
@@ -605,6 +638,7 @@ class PatchGrid:
     def loads(self, S_ref, L_ref, x_ref=(0.0, 0.0, 0.0), band=1.5, parts=None, friction=True):
         """Surface loads summed over the grids, each over the cells it owns (all coefficients are
         linear in the forces, so the sum of the per-grid coefficients is the total)."""
+        self._prime()
         tot = None
         for s in self.grids:
             ld = s.loads(S_ref, L_ref, x_ref, band=band, parts=parts, friction=friction)
@@ -651,7 +685,7 @@ def feature_cells(solver, threshold=0.05, wall_shell=0.0, field="rho"):
     return cen, half
 
 
-def cell_patches(base_faces, h, cen, half, box=(48, 48, 48), margin=2, verbose=True):
+def cell_patches(base_faces, h, cen, half, box=(48, 48, 48), margin=2, snap=True, verbose=True):
     """Patches of cells of size h = (hx, hy, hz) covering the boxes cen +- half (e.g. from
     feature_cells), clustered on the same lattice and tiling as wall_patches."""
     base_faces = [np.asarray(f, float) for f in base_faces]
@@ -686,6 +720,8 @@ def cell_patches(base_faces, h, cen, half, box=(48, 48, 48), margin=2, verbose=T
                 lo_i, hi_i = 0, 1
             rng.append((lo_i, max(hi_i, lo_i + 1)))
         out.append([fine[d][rng[d][0]:rng[d][1] + 1].copy() for d in range(3)])
+    if snap:
+        out = _snap(out, base_faces, h)
     if verbose:
         cells = sum(int(np.prod([len(f) - 1 for f in p])) for p in out)
         print(f"cell_patches: {len(out)} patches, {cells/1e6:.2f} M cells, cell size {tuple(float(v) for v in h)} m")

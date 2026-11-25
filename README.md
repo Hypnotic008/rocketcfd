@@ -67,8 +67,9 @@ python cases/validate_cylinder_turbulent.py --dual --patch-h 0.001 --shell 0.06
 | Red-black Gauss-Seidel vs Jacobi relaxation | same steady state | Mach 3 sphere CD 0.9591 vs 0.9596 in 89 s vs 140 s; plate: same Cf after the same iterations (default now) |
 | Super Heavy bare body, 0.5 m grid, M 2.82, 5 deg (CPU) | earlier explicit van Leer run | implicit + Koren: CD 2.208, CN 0.205, C_restore -0.051 vs 2.218, 0.207, -0.050 |
 | Solution-adaptive patches, Mach 4 cylinder (`tests/adapt_cylinder.py`) | fine grid, Billig | bow-shock standoff +7.0 % (fine grid +7.4 %, coarse +13.9 %) |
+| Local refinement with SST turbulence, flat plate Re 1e7 (`tests/patch_turbulent_plate.py`) | one fine grid | friction drag 0.00581 vs 0.00581 (fully turbulent Prandtl-Schlichting 0.00601) |
 | Mach 8 / 12 cylinders (`tests/carbuncle.py`): carbuncle check | Billig, Rayleigh pitot | M 8: standoff +1.2 %, stagnation pressure -0.7 %, symmetric shock; M 12: +5.3 %, -6.1 %, no carbuncle (the shock switch to HLLE works; very high Mach loses some stagnation pressure) |
-| Wall patches, Mach 4 cylinder forebody drag (4x finer cells within 0.1 / 0.4 of the wall) | one fine grid (1.2355) | 1.2231 (-1.0 %) / 1.2467 (+0.9 %); coarse alone 1.1526 (-6.7 %). The inviscid wake behind the body stays grid-dependent |
+| Wall patches, Mach 4 cylinder forebody drag (4x finer cells within 0.1 / 0.4 of the wall) | one fine grid (1.2355) | 1.2231 (-1.0 %) / 1.2467 (+0.9 %); with patch edges snapped to base-grid faces (default): 1.2351 (-0.03 %); coarse alone 1.1526 (-6.7 %). The inviscid wake behind the body stays grid-dependent |
 | Local refinement, laminar plate (`tests/patch_blasius.py`) | one fine grid | friction drag 0.00899 vs 0.00896 (coarse grid alone 0.00967), 68 % of the cells |
 | Local refinement, Mach 3 sphere (`tests/patch_sphere.py`) | one fine grid | CD 0.9666 vs 0.9569 (coarse alone 1.0114), 45 % of the cells |
 | Laminar cylinder Re 100, dual time stepping | St 0.164 | St 0.160 (25 cells/D, 50 steps per period) |
@@ -243,7 +244,7 @@ Patches imply the implicit solver:
 
 ```bash
 # inviscid production setting: 0.3 m body grid, 6 cm patches on the engine end and the fins
-# (4.75 M cells, ~0.6 GB): the engine-end patches resolve the ~4 cm gaps between the outer
+# (6.1 M cells, ~0.8 GB): the engine-end patches resolve the ~4 cm gaps between the outer
 # nozzles that made drag scatter +/- 5 % between grids
 python cases/super_heavy_descent.py --h 0.3 --fins parametric --fin-h 0.06 --engine-h 0.06 --aoa 15 --windward 0
 # grid fins resolved by 3 cm patches around each fin (no fin slab), coarse base grid
