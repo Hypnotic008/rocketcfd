@@ -50,7 +50,7 @@ def write_vtk(f, path):
             fh.write(np.asarray(c).astype(">f4").tobytes())
             fh.write(b"\n")
         fh.write(f"POINT_DATA {nx*ny*nz}\n".encode())
-        for name in ("rho", "p", "mach", "phi"):
+        for name in [n for n in ("rho", "p", "mach", "phi", "mut", "k") if n in f]:
             fh.write(f"SCALARS {name} float 1\nLOOKUP_TABLE default\n".encode())
             fh.write(np.ascontiguousarray(f[name].transpose(2, 1, 0)).astype(">f4").tobytes())
             fh.write(b"\n")

@@ -241,13 +241,32 @@ def main(argv=None):
     xyz, tris, cp_s = surface_pressure(s, q, region)
     if len(tris) > 400_000:
         xyz, tris, cp_s = surface_pressure(s, q, region, stride=2)
-    write_vtk_surface(f"{a.out}/surface_cp.vtk", xyz, tris, cp_s)
+    extra_s, extra_v = {}, {}
+    if a.turbulent:
+        from rocketcfd.visual3d import surface_friction
+        cf_s, shear = surface_friction(s, xyz, tris, q, offset=a.h)
+        extra_s["Cf"], extra_v["wall_shear"] = cf_s, shear
+    write_vtk_surface(f"{a.out}/surface_cp.vtk", xyz, tris, cp_s, scalars=extra_s, vectors=extra_v)
     fin_polys = []
     if a.fins != "none":
         from rocketcfd.vehicles.grid_fin import GridFinParams
         fin_polys = fin_outline_polys(P, GridFinParams())
     tw_vec = (np.cos(tw), np.sin(tw))
     render_surface(f"{a.out}/surface_cp.png", xyz, tris, cp_s, title=title, fin_polys=fin_polys, windward=tw_vec)
+    if a.turbulent:
+        render_surface(f"{a.out}/skin_friction.png", xyz, tris, cf_s, title=title + "  (skin friction)",
+                       fin_polys=fin_polys, windward=tw_vec, label="Cf  (skin friction coefficient)",
+                       cmap_name="magma", diverging=False)
+        try:
+            from rocketcfd.visual3d import render_friction_lines
+            from rocketcfd.viewer import fin_meshes
+            render_friction_lines(f"{a.out}/friction_lines.png", f"{a.out}/surface_cp.vtk",
+                                  fin_meshes(res) if a.fins != "none" else [], windward=tw_vec, title=title)
+        except Exception as e:                    # noqa: BLE001  (pyvista is optional)
+            print(f"friction lines skipped: {type(e).__name__}: {e}")
+    from rocketcfd.visual3d import plot_summary
+    plot_summary(f"{a.out}/summary.png", title, hist, avg, std, PARTS, FIN_PARTS, ref, int(np.prod(s.n)),
+                 s.step_count, wall / 60)
 
     ce = res["catchsim_equivalent"]
     print("\n=== result ===")

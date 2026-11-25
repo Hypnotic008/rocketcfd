@@ -12,7 +12,8 @@ along them, and a cross-section slice that can be dragged or swept along the boo
   py -m rocketcfd.viewer results\\glide_rudder --movie evolve  MP4 of a run's --snapshots
 
 Interactive keys: space = pause/play particles, o = orbit once, k = sweep the slice,
-s = streamlines on/off, f = fins on/off, h = hull transparent/opaque, r = reset view.
+s = streamlines on/off, f = fins on/off, h = hull transparent/opaque, r = reset view,
+v = vortex surfaces (Q-criterion) on/off, l = skin-friction lines on/off (turbulent runs).
 The slider moves the slice along the booster. Mouse: rotate / pan (shift) / zoom (wheel).
 
 Frame: x along the booster from the engines (x = 0) to the top (x = 72.3 m); rudder fin on +z,
@@ -177,7 +178,54 @@ def build_scene(pl, folder, meta, flow, args):
                                               render_points_as_spheres=True)
             scene["particles"] = parts
         scene["flow"] = flow
+        if args.vortices:
+            vort = vortex_surfaces(flow if args.vortex_stride <= 1 else coarsen(flow, args.vortex_stride), args.q)
+            if vort is not None and vort.n_points:
+                actors["vortices"] = pl.add_mesh(vort, scalars="mach", cmap="turbo", clim=scene.get("mach_range"),
+                                                 opacity=0.75, smooth_shading=True, show_scalar_bar=False)
+    if "wall_shear" in surf.point_data:
+        rng = np.random.default_rng(0)
+        seeds = pv.PolyData(surf.points[rng.choice(surf.n_points, min(260, surf.n_points), replace=False)])
+        try:
+            fl = surf.streamlines_from_source(seeds, vectors="wall_shear", surface_streamlines=True,
+                                              integration_direction="both", max_steps=700,
+                                              initial_step_length=0.5, step_unit="cl")
+            if fl.n_points:
+                actors["friction"] = pl.add_mesh(fl, color="#3fb4ff", line_width=1.5)
+                actors["friction"].SetVisibility(False)        # 'l' toggles
+        except Exception:                                      # noqa: BLE001
+            pass
     return scene
+
+
+def coarsen(g, stride):
+    """Every stride-th point of a rectilinear grid (for heavy derived quantities)."""
+    if not isinstance(g, pv.RectilinearGrid):
+        return g
+    nx, ny, nz = g.dimensions
+    h = pv.RectilinearGrid(g.x[::stride], g.y[::stride], g.z[::stride])
+    for name in g.point_data:
+        a = np.asarray(g.point_data[name])
+        shp = (nz, ny, nx) + a.shape[1:]
+        h.point_data[name] = a.reshape(shp)[::stride, ::stride, ::stride].reshape((-1,) + a.shape[1:])
+    return h
+
+
+def vortex_surfaces(g, q_level=0.0):
+    """Q-criterion iso-surfaces (vortex cores), coloured by Mach. q_level = 0 picks a level
+    from the distribution of positive Q in the fluid."""
+    print("computing vortex surfaces (Q-criterion) ...", flush=True)
+    d = g.compute_derivative(scalars="velocity", qcriterion=True)
+    Q = np.asarray(d.point_data["qcriterion"]).copy()
+    if "phi" in d.point_data:
+        Q[np.asarray(d.point_data["phi"]) < 0.3] = 0.0     # not inside / right at the walls
+    pos = Q[Q > 0]
+    if pos.size == 0:
+        return None
+    level = q_level or float(np.percentile(pos, 97.0))
+    d.point_data["Q"] = Q
+    iso = d.contour([level], scalars="Q")
+    return iso
 
 
 def set_slice(pl, scene, x0):
@@ -269,6 +317,8 @@ def interactive(folder, meta, flow, args):
     pl.add_key_event("o", orbit)
     pl.add_key_event("k", sweep)
     pl.add_key_event("r", lambda: default_view(pl, meta))
+    pl.add_key_event("v", lambda: toggle("vortices"))
+    pl.add_key_event("l", lambda: toggle("friction"))
     pl.add_timer_event(max_steps=10 ** 7, duration=33, callback=tick)
     pl.show()
 
@@ -385,6 +435,10 @@ def main(argv=None):
     ap.add_argument("--stride", type=int, default=1, help="read every n-th flow point (faster, less memory)")
     ap.add_argument("--seeds", type=int, default=16, help="streamline rake size (n x n)")
     ap.add_argument("--no-flow", action="store_true", help="surface only (skip the 3-D flow file)")
+    ap.add_argument("--no-vortices", dest="vortices", action="store_false",
+                    help="skip the Q-criterion vortex surfaces (they need a gradient of the whole field)")
+    ap.add_argument("--vortex-stride", type=int, default=2, help="coarsening for the vortex surfaces")
+    ap.add_argument("--q", type=float, default=0.0, help="Q level for the vortex surfaces (0 = automatic)")
     ap.add_argument("--fin-stl", default=None)
     args = ap.parse_args(argv)
     folder = args.folder

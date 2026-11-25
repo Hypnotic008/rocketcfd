@@ -221,6 +221,21 @@ py -m rocketcfd.viewer results\glide_rudder --movie evolve
 
 plays the saved frames: surface Cp on the hull and Mach on the rudder/tower and catch-fin planes.
 
+What a booster run writes (in its `--out` folder):
+
+| file | contents |
+|---|---|
+| `summary.png` | load history, drag / normal force / restoring moment by region, per-fin contributions, key numbers vs CatchSim |
+| `stations.png` | Cp and Mach on seven cross-sections from the engine bells to the top |
+| `surface_cp.png` | surface pressure: windward / leeward views, engine-end and fin close-ups |
+| `skin_friction.png`, `friction_lines.png` | (`--turbulent`) skin friction and friction lines; converging lines mark separation |
+| `slice_xz.png`, `slice_xy.png` | Mach and pressure on the two planes through the axis |
+| `loads.json` | every number, including the history |
+| `surface_cp.vtk`, `flow.vtk` | for the viewer / ParaView (surface Cp, Cf and wall shear; 3-D field incl. eddy viscosity) |
+| `snapshots/` | (`--snapshots N`) frames for `viewer --movie evolve` |
+
+The viewer adds Q-criterion vortex surfaces (`v`) and friction lines (`l`).
+
 ## Limits of this milestone (read before using numbers)
 
 * **Inviscid.** No boundary layers or skin friction. Pressure loads on the forebody, fins
