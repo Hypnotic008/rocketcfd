@@ -128,6 +128,8 @@ class Solver:
         self.split_residual = True
         self.face_scratch = None    # optional callable(shape) -> shared scratch tensor (patches)
         self.cache_lam = True       # implicit sweeps read cached spectral radii (lam_kernel)
+        # implicit turbulent runs: pseudo-time CFL cap in wall-function cells (None = off)
+        self.cfl_wall = None
         self._iface = None          # interface ghost-cell fill (rocketcfd.patches)
         self.owned = None           # cells whose surface loads this grid reports (rocketcfd.patches)
         self.gamma, self.cfl, self.limiter = gamma, cfl, limiter
@@ -965,6 +967,9 @@ class Solver:
                 w["lam"] = wp.from_torch(self.lam_buf)
             self._L(K.lam_kernel, self.n, [w["W"], w["ix"], w["iy"], w["iz"], self._active_flux, self._vp,
                                            self.gamma, w["lam"]])
+            if self.turbulence and self.cfl_wall and not getattr(self, "wall_stiffness", False):
+                self._L(K.wall_cfl_kernel, self.n, [w["lam"], w["ix"], w["iy"], w["iz"], self._active_flux, w["blk"],
+                                                    self._vp, float(cfl), float(self.cfl_wall), w["wst"]])
             sweep = K.implicit_sweep_lam_kernel
             common = [w["U"], w["lam"], w["R"], w["ix"], w["iy"], w["iz"], self._active_flux, w["blk"], w["mask"],
                       w["wst"], self.gamma, float(cfl), dd]

@@ -1507,3 +1507,32 @@ def jet_kernel(W: wp.array4d(dtype=wp.float32), cells: wp.array(dtype=wp.vec3i),
     q = ambient + (state[t] - ambient) * throttle
     for m in range(5):
         W[m, c[0], c[1], c[2]] = q[m]
+
+
+@wp.kernel
+def wall_cfl_kernel(lam: wp.array4d(dtype=wp.float32), ix: wp.array(dtype=wp.float32), iy: wp.array(dtype=wp.float32),
+                    iz: wp.array(dtype=wp.float32), active: wp.vec3i, blk: wp.array3d(dtype=wp.int32), vp: Visc,
+                    cfl: float, cfl_wall: float, out: wp.array3d(dtype=wp.float32)):
+    """Extra implicit diagonal that caps the pseudo-time CFL number at cfl_wall in cells next to a
+    wall-function wall (thin-wall face or immersed solid neighbour). The law-of-the-wall shear is
+    explicit in the implicit operator; at large pseudo time steps these cells oscillate and the
+    run stalls. Pseudo time only: the converged state is unchanged."""
+    i, j, k = wp.tid()
+    I = i + 2
+    J = j + 2
+    K = k + 2
+    out[i, j, k] = 0.0
+    if cfl <= cfl_wall or vp.fluid[I, J, K] < 0.5:
+        return
+    wall = int(0)
+    s = float(0.0)
+    for d in range(3):
+        if active[d] != 0:
+            e, inv, pos = dir_info(ix, iy, iz, d, i, j, k)
+            s = s + lam[d, i, j, k] * inv
+            if ((blk[I - e[0], J - e[1], K - e[2]] >> d) & 1) != 0 or ((blk[I, J, K] >> d) & 1) != 0:
+                wall = 1
+            if vp.fluid[I - e[0], J - e[1], K - e[2]] < 0.5 or vp.fluid[I + e[0], J + e[1], K + e[2]] < 0.5:
+                wall = 1
+    if wall != 0:
+        out[i, j, k] = s * (1.0 / cfl_wall - 1.0 / cfl)

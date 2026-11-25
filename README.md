@@ -38,7 +38,7 @@ guessed aero coefficients in CatchSim (`quatsim/aero.py`).
   fused kernel needed 174 registers per thread and a 232-byte spill frame (one 256-thread block
   per SM, ~17 % occupancy); the new inviscid kernels need 52-63 registers and no spills (viscous
   80-91). Each face flux is also computed once instead of twice. CPU: 1.9x faster inviscid
-  residual. Results identical to the fused kernel (inviscid bit for bit, viscous to 2.5e-5;
+  residual. The implicit sweeps read cached spectral radii (96 -> 70 registers, identical results). Results identical to the fused kernel (inviscid bit for bit, viscous to 2.5e-5;
   `tests/split_residual.py`). `--profile 20` measures it on your GPU.
 * **Patch layout**: candidate patches are tiled on base-grid cells, so snapping no longer pushes
   neighbouring patches into each other, and under anisotropic cells the depth kept inside a wall
@@ -384,10 +384,11 @@ python tests/run_checks.py      # quick verification cases with PASS / FAIL
 
 ### Sizing for the GPU
 
-Measured on an RTX 4050 Laptop GPU: about 0.46 KB per cell with the PyTorch path, so 6 GB holds ~11 M cells.
-On a 6 GB laptop RTX 4050, that's about 7 M cells, or h ~ 0.3 m for the full Super Heavy domain
-(106 x 44 x 44 m). Halving h needs 8x the memory and ~16x the time. Local refinement
-(roadmap 2) and a lower-memory flux loop are how finer grids will fit.
+Warp kernels: about 115 B per cell inviscid explicit, +25 B implicit, ~200 B with SST (`--dry-run`
+prints the estimate), so a 6 GB card holds ~40 M inviscid cells. The inviscid booster setup with
+6 cm patches is 5.5 M cells (~0.7 GB); with a 3 cm boundary-layer shell for RANS, 22 M (~4 GB).
+`--profile 20` times explicit steps, implicit iterations and the load integration on your GPU
+with a per-kernel breakdown.
 
 
 ## Desktop app
@@ -427,7 +428,32 @@ Styles: `lava` (vortex surfaces coloured by Mach over a greyscale schlieren plan
 background), `schlieren`, `mach`, `pressure`. `evolve` needs a run with `--snapshots N
 --snap-volume 1` (or 2 for half the resolution and an eighth of the disk space).
 
+## Engine plumes
+
+`--engines centre|inner|all` fires 3, 13 or 33 engines (landing / boostback burns, supersonic
+retropropulsion, plume pictures): the solid cells just inside each nozzle exit hold the exhaust
+state (`Solver(jets=[...])`), so the plume is part of the flow. Single perfect gas: the exhaust is
+"air" at `--exit-T` chosen so the exit velocity is right (Mach 3.5 at 2200 K -> ~3300 m/s, Raptor-like;
+`--exit-p` 80 kPa). The forces include the exit-plane pressure but not the momentum thrust.
+Check: `tests/underexpanded_jet.py` (Mach-disk position of a sonic jet vs the Crist-Sherman-Glass
+correlation).
+
+```bash
+python cases/super_heavy_descent.py --mach 0.4 --alt 2000 --aoa 0 --h 0.3 --fins parametric --engines centre --implicit --out results/landing_burn
+python -m rocketcfd.cinematic results/landing_burn --mode orbit --style mach
+```
+
+## Probes: time histories and spectra
+
+`--probes` records rho, u, v, w, p every step at points in the wake, beside the hull, behind the
+fins and at the engine end (`--probe-points "x,y,z; ..."` adds more) into `probes.npz`; the app's
+Plots -> Probes shows the history and its spectrum (peak frequency, Strouhal number). Use with
+`--les` for buffeting and wake-pressure fluctuations.
+
 ## Viewing results in 3-D
+
+Runs with local refinement also write `flow_patches.vtm` (every patch grid with a `covered` mask);
+the app and `rocketcfd.cinematic` draw each region from the finest grid there.
 
 ```bash
 py -m pip install pyvista imageio-ffmpeg
@@ -481,6 +507,13 @@ The viewer adds Q-criterion vortex surfaces (`v`) and friction lines (`l`).
   finishes turbulent runs with explicit local-time-step steps (`explicit_finish`, default 3x the
   implicit iterations, stopping early on the same convergence test). Inviscid and laminar implicit
   runs agree with explicit ones.
+* **LES is for unsteady pictures and trends, not yet for numbers.** Implicit LES relies on the
+  upwind scheme's dissipation; on the Taylor-Green vortex at 32^3 the dissipation peak comes early
+  (t 7.0 vs 9.0). The wall model takes the first cell's velocity (no matching point further out:
+  expect the log-layer mismatch described by Bose & Park 2018 in the wall shear). Inflow is
+  laminar (no synthetic turbulence).
+* **Plumes are one gas.** The exhaust is air with an adjusted temperature: the plume's shape and
+  shocks are right to first order, its mixing and afterburning are not.
 * **Experimental grid-fin data not yet used.** The wind-tunnel reports with isolated grid-fin normal
   force vs Mach (e.g. Washington & Miller 1993; DTIC ADA383925 / ADA388765; the Orion LAS grid-fin
   tests on NTRS) could not be downloaded from the development container. Validating the fin model
