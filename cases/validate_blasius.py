@@ -21,7 +21,8 @@ def blasius_profile(eta_max=8.0):
     return sol
 
 
-def main(out="results", Re=1e5, M=0.4, hy=0.0008, hx=0.01, tiles=True, local_dt=False):
+def main(out="results", Re=1e5, M=0.4, hy=0.0008, hx=0.01, tiles=True, local_dt=False, x_out=1.2, y_half=0.12,
+         tag_extra=""):
     os.makedirs(out, exist_ok=True)
     T, p = 288.15, 101325.0
     R, g = 287.05, 1.4
@@ -30,8 +31,8 @@ def main(out="results", Re=1e5, M=0.4, hy=0.0008, hx=0.01, tiles=True, local_dt=
     L = 1.0
     mu = rho * U * L / Re
     fs = dict(rho=rho, u=U, v=0.0, w=0.0, p=p)
-    faces = [axis_faces(-0.3, 1.2, hx, []),
-             axis_faces(-0.12, 0.12, 12 * hy, [(-0.02, 0.02, hy)], 1.08),
+    faces = [axis_faces(-0.3, x_out, 6 * hx, [(-0.05, 1.05, hx)], 1.08),
+             axis_faces(-y_half, y_half, 12 * hy * max(1.0, y_half / 0.12), [(-0.02, 0.02, hy)], 1.08),
              np.array([0.0, hx])]
     t = 1e-4
     plate = lambda X, Y, Z: np.sqrt(np.maximum(np.abs(X - 0.5) - 0.5, 0) ** 2 + np.maximum(np.abs(Y) - t / 2, 0) ** 2) \
@@ -91,7 +92,7 @@ def main(out="results", Re=1e5, M=0.4, hy=0.0008, hx=0.01, tiles=True, local_dt=
     ax[1].legend()
     ax[1].set_title(f"profile: max |error| {prof_err:.3f}")
     fig.suptitle(f"Laminar flat plate, Mach {M}, Re_L = {Re:.0e}, {int(0.04/hy)} cells across +/-2 cm")
-    tag = ("" if tiles else "_notiles") + ("_localdt" if local_dt else "")
+    tag = ("" if tiles else "_notiles") + ("_localdt" if local_dt else "") + tag_extra
     fig.savefig(f"{out}/validate_blasius{tag}.png", dpi=120)
     print(f"Blasius: Cf mean deviation {100*err:+.2f} % (0.2 < x < 0.8); profile max |u/U error| {prof_err:.3f}; "
           f"{s.step_count} steps, {wall/60:.1f} min ({'tiles' if tiles else 'no tiles'}, "
@@ -100,4 +101,14 @@ def main(out="results", Re=1e5, M=0.4, hy=0.0008, hx=0.01, tiles=True, local_dt=
 
 
 if __name__ == "__main__":
-    main(tiles="--no-tiles" not in sys.argv, local_dt="--local-dt" in sys.argv)
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--no-tiles", action="store_true")
+    ap.add_argument("--local-dt", action="store_true")
+    ap.add_argument("--x-out", type=float, default=1.2, help="outflow boundary position [m] (plate ends at 1.0)")
+    ap.add_argument("--y-half", type=float, default=0.12, help="half-height of the domain [m]")
+    ap.add_argument("--coarse", action="store_true", help="2x coarser (quick check)")
+    a = ap.parse_args()
+    k = 2.0 if a.coarse else 1.0
+    main(tiles=not a.no_tiles, local_dt=a.local_dt, x_out=a.x_out, y_half=a.y_half, hy=0.0008 * k, hx=0.01 * k,
+         tag_extra=("_coarse" if a.coarse else "") + (f"_x{a.x_out:g}_y{a.y_half:g}" if (a.x_out, a.y_half) != (1.2, 0.12) else ""))
