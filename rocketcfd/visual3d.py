@@ -57,9 +57,30 @@ def plot_stations(f, path, stations, p_inf, q_inf, title="", half=11.0, crossflo
     plt.close(fig)
 
 
-def surface_pressure(solver, q_inf, region, stride=1):
+def sample_finest(grids, pts, comps=(4,)):
+    """Primitive variables `comps` at points pts (N, 3), each from the finest grid whose interior
+    contains it (local refinement patches before the base grid). Returns (len(comps), N)."""
+    from scipy.ndimage import map_coordinates
+    order = sorted(range(len(grids)), key=lambda g: float(np.prod(grids[g].h)))
+    out = np.full((len(comps), len(pts)), np.nan)
+    todo = np.ones(len(pts), bool)
+    for gi in order:
+        g = grids[gi]
+        inside = todo & np.all([(pts[:, d] >= g.lo[d]) & (pts[:, d] <= g.hi[d]) for d in range(3)], axis=0)
+        if not inside.any():
+            continue
+        W = g.primitive()
+        idx = np.stack([np.interp(pts[inside, d], g.axes[d], np.arange(len(g.axes[d]))) for d in range(3)])
+        for k, c in enumerate(comps):
+            out[k, inside] = map_coordinates(W[c], idx, order=1)
+        todo &= ~inside
+    return out
+
+
+def surface_pressure(solver, q_inf, region, stride=1, grids=None):
     """Body surface (phi = 0 of the hull) with Cp at each vertex.
-    region: ((x0, y0, z0), (x1, y1, z1)) to triangulate. Returns (vertices, faces, cp)."""
+    region: ((x0, y0, z0), (x1, y1, z1)) to triangulate. grids: all grids of a PatchGrid, to take
+    the pressure from the finest one at each vertex. Returns (vertices, faces, cp)."""
     from skimage.measure import marching_cubes
     from scipy.ndimage import map_coordinates
     ax = solver.axes
@@ -68,9 +89,12 @@ def surface_pressure(solver, q_inf, region, stride=1):
     phi = solver.phi[sl]
     v, fcs, _, _ = marching_cubes(phi, 0.0)
     idx = v * stride + np.array([r[0] for r in rng])            # fractional padded indices
-    W = solver.primitive()
-    p = map_coordinates(W[4], idx.T, order=1)
     xyz = np.stack([np.interp(idx[:, d], np.arange(len(ax[d])), ax[d]) for d in range(3)], 1)
+    if grids is not None and len(grids) > 1:
+        p = sample_finest(grids, xyz)[0]
+    else:
+        W = solver.primitive()
+        p = map_coordinates(W[4], idx.T, order=1)
     cp = (p - solver.W_inf[4]) / q_inf
     return xyz, fcs, cp
 
@@ -102,7 +126,7 @@ def vertex_normals(xyz, faces):
     return vn / (np.linalg.norm(vn, axis=1, keepdims=True) + 1e-30)
 
 
-def surface_friction(solver, xyz, faces, q_inf, offset):
+def surface_friction(solver, xyz, faces, q_inf, offset, grids=None):
     """Wall shear on the body surface from the law of the wall (same as the solver's wall
     function): velocity sampled `offset` metres out along the surface normal. Returns
     (Cf magnitude, wall-shear vector [Pa]) per vertex."""
@@ -111,12 +135,16 @@ def surface_friction(solver, xyz, faces, q_inf, offset):
     n = vertex_normals(xyz, faces)
     # marching cubes on phi gives normals pointing toward increasing phi (into the fluid)
     pts = xyz + offset * n
-    ax = solver.axes
-    idx = np.stack([np.interp(pts[:, d], ax[d], np.arange(len(ax[d]))) for d in range(3)])
-    W = solver.primitive()
-    rho = map_coordinates(W[0], idx, order=1)
-    vel = np.stack([map_coordinates(W[1 + c], idx, order=1) for c in range(3)], 1)
-    p = map_coordinates(W[4], idx, order=1)
+    if grids is not None and len(grids) > 1:
+        Wp = sample_finest(grids, pts, comps=(0, 1, 2, 3, 4))
+        rho, vel, p = Wp[0], Wp[1:4].T, Wp[4]
+    else:
+        ax = solver.axes
+        idx = np.stack([np.interp(pts[:, d], ax[d], np.arange(len(ax[d]))) for d in range(3)])
+        W = solver.primitive()
+        rho = map_coordinates(W[0], idx, order=1)
+        vel = np.stack([map_coordinates(W[1 + c], idx, order=1) for c in range(3)], 1)
+        p = map_coordinates(W[4], idx, order=1)
     v = solver.viscous
     T = p / (rho * v["R"])
     mu = v["mu"] if v["model"] == "constant" else v["mu"] * (T / v["T0"]) ** 1.5 * (v["T0"] + v["S"]) / (T + v["S"])

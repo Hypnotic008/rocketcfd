@@ -305,13 +305,15 @@ def main(argv=None):
                   title=title + "\nCp and Mach around the booster (looking from the engines toward the top)",
                   crossflow=(fs["v"], fs["w"]), fin_sdf=thin_sdf)
     region = ((-1.5, -6.6, -6.6), (L + 0.6, 6.6, 6.6))
-    xyz, tris, cp_s = surface_pressure(s, q, region)
+    grids = runner.grids if patches else None
+    xyz, tris, cp_s = surface_pressure(s, q, region, grids=grids)
     if len(tris) > 400_000:
-        xyz, tris, cp_s = surface_pressure(s, q, region, stride=2)
+        xyz, tris, cp_s = surface_pressure(s, q, region, stride=2, grids=grids)
     extra_s, extra_v = {}, {}
     if a.turbulent:
         from rocketcfd.visual3d import surface_friction
-        cf_s, shear = surface_friction(s, xyz, tris, q, offset=a.h)
+        hw = min(float(np.min(g.h)) for g in runner.grids) if patches else a.h
+        cf_s, shear = surface_friction(s, xyz, tris, q, offset=1.5 * hw if patches else a.h, grids=grids)
         extra_s["Cf"], extra_v["wall_shear"] = cf_s, shear
     write_vtk_surface(f"{a.out}/surface_cp.vtk", xyz, tris, cp_s, scalars=extra_s, vectors=extra_v)
     fin_polys = []
