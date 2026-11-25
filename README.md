@@ -238,7 +238,13 @@ The viewer adds Q-criterion vortex surfaces (`v`) and friction lines (`l`).
 
 ## Limits of this milestone (read before using numbers)
 
-* **Inviscid.** No boundary layers or skin friction. Pressure loads on the forebody, fins
+* **Turbulence needs a resolved boundary layer for smooth-body separation.** SST + wall function
+  gets skin friction right (flat plate within 3 % at Re 1e9) but a cylinder at Re 1e7 with
+  1-2 cells across its ~1 cm boundary layer stays attached (Cd 0.05 instead of 0.5-0.75, no
+  shedding). Separation from smooth surfaces needs ~10+ cells across the boundary layer, i.e.
+  near-wall refinement and implicit time stepping (roadmap); separation at sharp edges (chines,
+  fin plates) is fixed by the geometry and is captured.
+* **Inviscid by default.** No boundary layers or skin friction unless `--turbulent`. Pressure loads on the forebody, fins
   and engine end are what Euler does well. The wake and base region behind the
   vehicle (the top, in descent) separate in reality, so base pressure here is unreliable.
 * **Grid fin lattice.** The scaled lattice plates are a few cm thick and need ~2 cm cells to resolve. Until local
