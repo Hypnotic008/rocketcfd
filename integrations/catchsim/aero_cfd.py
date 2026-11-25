@@ -71,6 +71,18 @@ class CFDAeroDatabase:
         self.x_ref = d["reference"]["x_ref"][0]
         self.sign = d["mirror_sign"]
         self.swap = d["fins"]["mirror_swap"]
+        cq = d.get("cm_q_quasi_steady")
+        self.cm_q_table = None if cq is None else np.asarray([[np.nan if v is None else v for v in r] for r in cq], float)
+
+    def cm_q(self, mach, roll_deg=0.0, default=12.0):
+        """Quasi-steady pitch damping (CatchSim normalisation, positive = damping) at this Mach,
+        averaged over the computed roll angles; `default` where the table has none."""
+        if self.cm_q_table is None:
+            return default
+        im = _interp_axis(self.mach, mach)
+        col = (1 - im[2]) * self.cm_q_table[im[0]] + im[2] * self.cm_q_table[im[1]]
+        col = col[np.isfinite(col)]
+        return float(col.mean()) if col.size else default
 
     def coefficients(self, mach, aoa_deg, roll_deg):
         """Crossflow-frame coefficients at a flight condition (dict). roll in degrees, any value."""
@@ -175,10 +187,11 @@ class CFDAeroModel(AeroModel):
         return F - self.drag_force(velocity, altitude)
 
 
-def cfd_restoring_moment(db: CFDAeroDatabase, q, velocity, altitude, omega=None, cm_q=12.0,
+def cfd_restoring_moment(db: CFDAeroDatabase, q, velocity, altitude, omega=None, cm_q=None,
                          x_cg=None, roll_offset_deg=0.0, density_scale=1.0):
-    """Body-frame aerodynamic moment about the centre of mass from the CFD table, plus
-    CatchSim's pitch damping (same form and default as quatsim.aero.restoring_moment)."""
+    """Body-frame aerodynamic moment about the centre of mass from the CFD table, plus pitch
+    damping in CatchSim's form; cm_q None = the table's quasi-steady estimate at this Mach
+    (CatchSim's 12.0 if the table has none)."""
     v = np.asarray(velocity, dtype=float)
     speed = float(np.linalg.norm(v))
     if speed < 1.0:
@@ -187,6 +200,8 @@ def cfd_restoring_moment(db: CFDAeroDatabase, q, velocity, altitude, omega=None,
     mach = ENV.mach(v, altitude)
     _, M = body_loads(db, Q.rotate_inverse(q, -v), mach, q_dyn, x_cg=x_cg, roll_offset_deg=roll_offset_deg)
     if omega is not None:
+        if cm_q is None:
+            cm_q = db.cm_q(mach)
         w = np.asarray(omega, dtype=float)
         M = M - (cm_q * q_dyn * db.S * db.L * db.L / (2.0 * speed)) * np.array([0.0, w[1], w[2]])
     return M

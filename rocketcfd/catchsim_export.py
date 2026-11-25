@@ -79,7 +79,33 @@ def build_database(csv_path, reference, fin_names=("rudder fin", "catch fin 90",
                 ok = np.isfinite(col)
                 if ok.any() and not ok.all():
                     T[i, :, k] = np.interp(aoa, np.array(aoa)[ok], col[ok])
+    # quasi-steady pitch damping (CatchSim's cm_q, positive = damping) from the region breakdown:
+    # pitching at rate q changes the incidence of a region at lever arm l (from x_ref) by q l / V,
+    # so with that region's normal-force slope CN_a: dM = -CN_a (q l / V) l q_inf S, i.e.
+    # cm_q = 2 sum CN_a (l / L)^2 with CatchSim's normalisation (moment / (q_inf S L) per q L / 2V).
+    # l = L C_restore / CN of the region (its centre of pressure). Lag (alpha-dot) terms are not
+    # included: a first estimate to replace the guessed value, not a dynamic-derivative computation.
+    parts = sorted({k[3:-1] for r in rows for k in r if k.startswith("CN[")})
+    cmq = np.full((len(mach), len(roll)), np.nan)
+    for i, m in enumerate(mach):
+        for k, rr in enumerate(roll):
+            cand = [r for r in rows if r["mach"] == m and r["aoa"] > 0 and r["roll"] == rr]
+            if not cand:
+                continue
+            r = min(cand, key=lambda r_: r_["aoa"])          # smallest incidence: linear range
+            sa = np.sin(np.radians(r["aoa"]))
+            tot = 0.0
+            for pn in parts:
+                cn, cr = r.get(f"CN[{pn}]"), r.get(f"C_restore[{pn}]")
+                if cn in (None, "") or cr in (None, "") or abs(cn) < 1e-4:
+                    continue
+                if pn.startswith(("rudder", "catch")):
+                    continue                                 # the fins are inside "fin band"
+                lever = cr / cn                              # l / L
+                tot += 2.0 * (cn / sa) * lever ** 2
+            cmq[i, k] = tot
     return dict(
+        cm_q_quasi_steady=np.where(np.isfinite(cmq), cmq, None).tolist(),
         description="Super Heavy V3 aerodynamic coefficients from rocketcfd (see rocketcfd/catchsim_export.py "
                     "for axes and signs). Inviscid unless noted.",
         reference=dict(S_ref=reference["S_ref"], L_ref=reference["L_ref"], x_ref=list(reference["x_ref"]),
