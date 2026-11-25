@@ -80,6 +80,9 @@ class Solver:
         self._alloc = alloc or (lambda name, shape: torch.empty(shape, dtype=dtype, device=self.device))
         self.thin_normals = thin_normals
         self.low_mach = low_mach
+        # implicit relaxation of the mean flow: 'rb' red-black Gauss-Seidel (default: same
+        # convergence as 8 Jacobi sweeps at about half the cost, tests/steady_accel.py) or 'jacobi'
+        self.relax = "rb"
         self._iface = None          # interface ghost-cell fill (rocketcfd.patches)
         self.owned = None           # cells whose surface loads this grid reports (rocketcfd.patches)
         self.gamma, self.cfl, self.limiter = gamma, cfl, limiter
@@ -642,8 +645,10 @@ class Solver:
         """Warp launch through a cache of recorded launches: the argument packing (tens of us
         per launch in Python, which dominates many small patches) is done once per distinct set
         of arrays; later calls only refresh the scalar arguments and replay."""
-        key = (id(kernel), tuple(dim) if isinstance(dim, tuple) else dim,
-               tuple(id(x) for x in inputs if not isinstance(x, (int, float, bool))))
+        scalar = (int, float, bool, np.number)
+        inputs = [x.item() if isinstance(x, np.number) else x for x in inputs]
+        key = (id(kernel), tuple(int(v) for v in dim) if isinstance(dim, (tuple, list)) else int(dim),
+               tuple(id(x) for x in inputs if not isinstance(x, scalar)))
         cache = self.__dict__.setdefault("_lcache", {})
         c = cache.get(key)
         if c is None:
@@ -652,7 +657,7 @@ class Solver:
             cache[key] = c
         else:
             for i, x in enumerate(inputs):
-                if isinstance(x, (int, float, bool)):
+                if isinstance(x, scalar):
                     c.set_param_at_index(i, x)
         c.launch(stream=self._wp_stream)
 
@@ -774,12 +779,23 @@ class Solver:
             self._L(K.turb_apply_kernel, self.n, [w["K"], w["O"], w[kl], w[ol], w["W"], self._vp, w["utau"],
                               1e-6 * self.k_inf, 1e-3 * self.omega_inf])
         bufs = ("U1", "dU2")
-        for it in range(sweeps):
-            src, dst = w[bufs[(it + 1) % 2]], w[bufs[it % 2]]
-            self._L(K.implicit_sweep_kernel, self.n, [w["U"], w["W"], w["R"], w["ix"], w["iy"], w["iz"], self._active_flux, w["blk"],
-                              w["mask"], self._vp, self.gamma, float(cfl),
-                              0.0 if dual is None else dual[0] * dual[3], int(it == 0), src, dst])
-        self._L(K.implicit_apply_kernel, self.n, [w["U"], w[bufs[(sweeps - 1) % 2]], w["mask"], self.gamma, maxrel])
+        dd = 0.0 if dual is None else dual[0] * dual[3]
+        common = [w["U"], w["W"], w["R"], w["ix"], w["iy"], w["iz"], self._active_flux, w["blk"], w["mask"],
+                  self._vp, self.gamma, float(cfl), dd]
+        if self.relax == "rb":
+            # red-black Gauss-Seidel: a Jacobi start, then in-place half sweeps by colour; converges
+            # per sweep about twice as fast as Jacobi, so `sweeps` Jacobi-equivalents -> sweeps / 2
+            self._L(K.implicit_sweep_kernel, self.n, common + [1, -1, w["U1"], w["U1"]])
+            for it in range(max(1, (sweeps + 1) // 2) - 1):
+                for col in (0, 1):
+                    self._L(K.implicit_sweep_kernel, self.n, common + [0, col, w["U1"], w["U1"]])
+            last = "U1"
+        else:
+            for it in range(sweeps):
+                src, dst = w[bufs[(it + 1) % 2]], w[bufs[it % 2]]
+                self._L(K.implicit_sweep_kernel, self.n, common + [int(it == 0), -1, src, dst])
+            last = bufs[(sweeps - 1) % 2]
+        self._L(K.implicit_apply_kernel, self.n, [w["U"], w[last], w["mask"], self.gamma, maxrel])
         return res
 
     def _refresh_tiles(self, frac):

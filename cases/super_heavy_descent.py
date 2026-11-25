@@ -74,6 +74,10 @@ def main(argv=None):
                     help="local refinement: patches of this cell size [m] around the grid fins only, "
                          "e.g. 0.03 (replaces --h-fins slab refinement). Implies --implicit")
     ap.add_argument("--fin-shell", type=float, default=0.3, help="refined distance around the fins [m]")
+    ap.add_argument("--engine-h", type=float, default=0.0,
+                    help="local refinement of the engine end (bells, thrust plate, skirt) to this cell size [m], "
+                         "e.g. 0.06: resolves the ~4 cm gaps between the outer nozzles that make drag grid-sensitive")
+    ap.add_argument("--engine-shell", type=float, default=0.5, help="refined distance around the engine end [m]")
     ap.add_argument("--patch-box", default="32,96,96", help="max patch size in cells (x,y,z)")
     ap.add_argument("--iters", type=int, default=4000, help="implicit solver: maximum iterations")
     ap.add_argument("--flowthroughs", type=float, default=4.0, help="maximum run length")
@@ -135,7 +139,7 @@ def main(argv=None):
         h3 = np.broadcast_to(np.asarray(a.h, float), (3,))
         faces = [lo[d] + h3[d] * np.arange(int(round((hi[d] - lo[d]) / h3[d])) + 1) for d in range(3)]
     patches = []
-    if a.wall_h or a.fin_h:
+    if a.wall_h or a.fin_h or a.engine_h:
         from rocketcfd.patches import wall_patches
         a.implicit = True
         pbox = tuple(int(v) for v in a.patch_box.split(","))
@@ -144,6 +148,11 @@ def main(argv=None):
             hw = hw * 3 if len(hw) == 1 else hw
             print(f"hull shell patches ({hw} m cells within {a.wall_shell} m of the hull):")
             patches += wall_patches(faces, hw, a.wall_shell, sdf=sdf, box=pbox)
+        if a.engine_h:
+            R_eng = P.radius + 1.0
+            reg = ((-2.0, -R_eng, -R_eng), (P.skirt_bottom_x + 1.0, R_eng, R_eng))
+            print(f"engine-end patches ({a.engine_h} m cells within {a.engine_shell} m of the walls, x < {reg[1][0]:.1f} m):")
+            patches += wall_patches(faces, a.engine_h, a.engine_shell, sdf=sdf, region=reg, box=(64, 64, 64))
         if a.fin_h:
             if thin_sdf is None:
                 raise SystemExit("--fin-h needs --fins parametric")

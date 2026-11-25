@@ -33,6 +33,7 @@ def run(mode, faces, tol=2e-4, max_steps=6000):
     t0 = time.time()
     if mode.startswith("implicit"):
         cfl_max = float(mode.split(":")[1]) if ":" in mode else 20.0
+        s.relax = "rb" if mode.startswith("implicit-rb") else "jacobi"
         s.run(max_steps, chunk=20, first_order_steps=100, report=report, steady=True, implicit=True,
               cfl_max=cfl_max, cfl_ramp=100)
     else:

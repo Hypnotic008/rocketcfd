@@ -39,7 +39,7 @@ def _lattice(lo, hi, h):
 
 
 def wall_patches(base_faces, h, shell, sdf=None, thin_sdf=None, box=(32, 64, 64), margin=2,
-                 sample=2, inner=None, thin_box=None, verbose=True):
+                 sample=2, inner=None, thin_box=None, region=None, verbose=True):
     """Patches of cells of size h = (hx, hy, hz) covering the fluid within `shell` metres of
     the walls of `sdf` (and of `thin_sdf`, for thin parts such as grid fins).
 
@@ -49,7 +49,8 @@ def wall_patches(base_faces, h, shell, sdf=None, thin_sdf=None, box=(32, 64, 64)
     `inner` (default: three patch cells) also keeps cells this far inside thick walls, so the
     patch's immersed-boundary ghost cells and their interpolation stencils are in the patch.
     thin_sdf may be large (not a distance) away from the thin parts if `thin_box` -- their
-    bounding box -- is given. Returns a list of [xf, yf, zf] face arrays.
+    bounding box -- is given. `region` = ((x0, y0, z0), (x1, y1, z1)) limits the patches to a box
+    (e.g. the engine end). Returns a list of [xf, yf, zf] face arrays.
     """
     base_faces = [np.asarray(f, float) for f in base_faces]
     lo = np.array([f[0] for f in base_faces])
@@ -70,6 +71,8 @@ def wall_patches(base_faces, h, shell, sdf=None, thin_sdf=None, box=(32, 64, 64)
                 i1, j1, k1 = min(i0 + box[0], nf[0]), min(j0 + box[1], nf[1]), min(k0 + box[2], nf[2])
                 b0 = np.array([fine[0][i0], fine[1][j0], fine[2][k0]])
                 b1 = np.array([fine[0][i1], fine[1][j1], fine[2][k1]])
+                if region is not None and (np.any(b1 < np.asarray(region[0])) or np.any(b0 > np.asarray(region[1]))):
+                    continue
                 c = 0.5 * (b0 + b1)
                 rad = 0.5 * np.linalg.norm(b1 - b0)
                 near = False
@@ -103,6 +106,9 @@ def wall_patches(base_faces, h, shell, sdf=None, thin_sdf=None, box=(32, 64, 64)
                 if thin_sdf is not None:
                     ph = thin_sdf(X, Y, Z)
                     flag |= np.abs(ph) < shell
+                if region is not None:
+                    r0, r1 = np.asarray(region[0]), np.asarray(region[1])
+                    flag &= (X >= r0[0]) & (X <= r1[0]) & (Y >= r0[1]) & (Y <= r1[1]) & (Z >= r0[2]) & (Z <= r1[2])
                 if not flag.any():
                     continue
                 rng = []
@@ -121,31 +127,36 @@ def wall_patches(base_faces, h, shell, sdf=None, thin_sdf=None, box=(32, 64, 64)
 
 
 # ---------------------------------------------------------------- composite grid
+import warp as wp
+
+
+@wp.kernel
+def gather_kernel(F: wp.array(dtype=wp.float32), ncomp: int, dst: wp.array(dtype=wp.int32),
+                  dstr: int, src: wp.array2d(dtype=wp.int32), sstr: wp.array(dtype=wp.int32),
+                  w: wp.array2d(dtype=wp.float32)):
+    """Interface ghost cells: trilinear interpolation from another grid in the shared buffer."""
+    t = wp.tid()
+    for c in range(ncomp):
+        acc = float(0.0)
+        for k in range(8):
+            acc = acc + w[t, k] * F[src[t, k] + c * sstr[t]]
+        F[dst[t] + c * dstr] = acc
+
+
+@wp.kernel
+def restrict_kernel(F: wp.array(dtype=wp.float32), ncomp: int, dst: wp.array(dtype=wp.int32), dstr: int,
+                    start: wp.array(dtype=wp.int32), src: wp.array(dtype=wp.int32), sstr: int,
+                    w: wp.array(dtype=wp.float32)):
+    """Covered coarse cells: volume average of the fine cells inside them (CSR lists)."""
+    t = wp.tid()
+    for c in range(ncomp):
+        acc = float(0.0)
+        for e in range(start[t], start[t + 1]):
+            acc = acc + w[e] * F[src[e] + c * sstr]
+        F[dst[t] + c * dstr] = acc
+
+
 def _gather_kernels():
-    import warp as wp
-
-    @wp.kernel
-    def gather_kernel(F: wp.array(dtype=wp.float32), ncomp: int, dst: wp.array(dtype=wp.int32),
-                      dstr: int, src: wp.array2d(dtype=wp.int32), sstr: wp.array(dtype=wp.int32),
-                      w: wp.array2d(dtype=wp.float32)):
-        t = wp.tid()
-        for c in range(ncomp):
-            acc = float(0.0)
-            for k in range(8):
-                acc = acc + w[t, k] * F[src[t, k] + c * sstr[t]]
-            F[dst[t] + c * dstr] = acc
-
-    @wp.kernel
-    def restrict_kernel(F: wp.array(dtype=wp.float32), ncomp: int, dst: wp.array(dtype=wp.int32), dstr: int,
-                        start: wp.array(dtype=wp.int32), src: wp.array(dtype=wp.int32), sstr: int,
-                        w: wp.array(dtype=wp.float32)):
-        t = wp.tid()
-        for c in range(ncomp):
-            acc = float(0.0)
-            for e in range(start[t], start[t + 1]):
-                acc = acc + w[e] * F[src[e] + c * sstr]
-            F[dst[t] + c * dstr] = acc
-
     return gather_kernel, restrict_kernel
 
 

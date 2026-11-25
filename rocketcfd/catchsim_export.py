@@ -91,3 +91,57 @@ def build_database(csv_path, reference, fin_names=("rudder fin", "catch fin 90",
         converged=conv.tolist(),
         mirror_sign=MIRROR_SIGN,
     )
+
+
+# ---------------------------------------------------------------- fin control derivatives
+R_MIRROR = np.diag([1.0, -1.0, 1.0])            # mirror through the rudder / raceway plane (y -> -y)
+
+
+def _read(csv_path):
+    out = {}
+    with open(csv_path) as fh:
+        for r in csv.DictReader(fh):
+            out[(float(r["mach"]), float(r["aoa"]), float(r["roll"]))] = {
+                k: (float(v) if v not in ("", None) and k != "converged" else v) for k, v in r.items()}
+    return out
+
+
+def build_fin_control(base_csv, deflected, fin_names=("rudder fin", "catch fin 90", "catch fin 270")):
+    """Per-fin control derivatives from deflected sweeps.
+
+    deflected: {fin name: (csv_path, delta_deg)} -- sweeps run with only that fin deflected by
+    delta_deg (cases/aero_database.py --fin-deflection, order rudder, catch 90, catch 270).
+    Derivatives are finite differences against `base_csv` at the conditions both contain, per
+    radian, for the six body-axis coefficients (CX, CY, CZ, Cl, Cm, Cn) and the fin's own hinge
+    coefficient. If only "catch fin 90" was run, "catch fin 270" follows from the mirror symmetry
+    (valid at roll 0 and 180, where the flow is mirror-symmetric too):
+        dF_270 / d delta = -R dF_90 / d delta,  dM_270 / d delta = R dM_90 / d delta,
+        dC_h,270 / d delta = dC_h,90 / d delta.
+    """
+    base = _read(base_csv)
+    out = {}
+    for fin, (path, ddeg) in deflected.items():
+        runs = _read(path)
+        rows = []
+        for key, r in runs.items():
+            if key not in base:
+                continue
+            b = base[key]
+            d = np.radians(ddeg)
+            F = np.array([(r[k] - b[k]) / d for k in ("CX", "CY", "CZ")])
+            M = np.array([(r[k] - b[k]) / d for k in ("Cl", "Cm", "Cn")])
+            hk = f"C_hinge[{fin}]"
+            rows.append(dict(mach=key[0], aoa=key[1], roll=key[2], dF=F.tolist(), dM=M.tolist(),
+                             dC_h=(r[hk] - b[hk]) / d if hk in r and hk in b else None))
+        out[fin] = rows
+    if "catch fin 90" in out and "catch fin 270" not in out:
+        mirrored = []
+        for row in out["catch fin 90"]:
+            if row["roll"] % 180.0 != 0.0 and row["aoa"] != 0.0:
+                continue
+            mirrored.append(dict(row, dF=(-R_MIRROR @ np.array(row["dF"])).tolist(),
+                                 dM=(R_MIRROR @ np.array(row["dM"])).tolist(), mirrored_from="catch fin 90"))
+        out["catch fin 270"] = mirrored
+    return dict(description="d(coefficient)/d(deflection) per radian, body axes (CX, CY, CZ) and moments about "
+                            "x_ref (Cl, Cm, Cn); deflection = rotation about the fin's outward radial axis",
+                fins=out)

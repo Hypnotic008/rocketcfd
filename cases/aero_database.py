@@ -52,6 +52,10 @@ def build(a):
     patches = []
     if a.fin_h and thin_sdf is not None:
         patches += wall_patches(faces, a.fin_h, a.fin_shell, thin_sdf=thin_sdf, thin_box=thin_box, box=(64, 64, 64))
+    if a.engine_h:
+        R_eng = P.radius + 1.0
+        reg = ((-2.0, -R_eng, -R_eng), (P.skirt_bottom_x + 1.0, R_eng, R_eng))
+        patches += wall_patches(faces, a.engine_h, a.engine_shell, sdf=sdf, region=reg, box=(64, 64, 64))
     if a.wall_h:
         hw = tuple(float(v) for v in a.wall_h.split(","))
         patches += wall_patches(faces, hw * 3 if len(hw) == 1 else hw, a.wall_shell, sdf=sdf,
@@ -142,6 +146,10 @@ def main(argv=None):
     ap.add_argument("--fins", default="parametric", choices=["none", "parametric"])
     ap.add_argument("--fin-h", type=float, default=0.06, help="fin patch cell size [m] (0 = no patches)")
     ap.add_argument("--fin-shell", type=float, default=0.3)
+    ap.add_argument("--engine-h", type=float, default=0.06,
+                    help="local refinement of the engine end (bells, thrust plate, skirt) to this cell size [m], "
+                         "e.g. 0.06: resolves the ~4 cm gaps between the outer nozzles that make drag grid-sensitive")
+    ap.add_argument("--engine-shell", type=float, default=0.5, help="refined distance around the engine end [m]")
     ap.add_argument("--fin-deflection", type=float, nargs=3, default=(0.0, 0.0, 0.0))
     ap.add_argument("--wall-h", default="", help="hull shell patches hx,hy,hz (viscous runs)")
     ap.add_argument("--wall-shell", type=float, default=0.4)

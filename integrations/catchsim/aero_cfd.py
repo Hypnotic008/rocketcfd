@@ -190,3 +190,63 @@ def cfd_restoring_moment(db: CFDAeroDatabase, q, velocity, altitude, omega=None,
         w = np.asarray(omega, dtype=float)
         M = M - (cm_q * q_dyn * db.S * db.L * db.L / (2.0 * speed)) * np.array([0.0, w[1], w[2]])
     return M
+
+
+class CFDFinControl:
+    """Fin control derivatives (rocketcfd.catchsim_export.build_fin_control -> fin_control.json).
+
+    control_loads(mach, aoa_deg, deflections_rad, q_dyn) -> (force N, moment N m about x_ref,
+    hinge moments N m) in body axes, by linear superposition of each fin's derivatives:
+    deflections are (rudder fin, catch fin 90, catch fin 270), positive about each fin's
+    outward radial axis. Derivatives were computed at roll 0 / 180 and are used at any roll
+    (the fins' own effect depends mainly on Mach and incidence).
+    """
+
+    def __init__(self, path, db: CFDAeroDatabase):
+        with open(path) as fh:
+            d = json.load(fh)
+        self.db = db
+        self.fins = []
+        for name in ("rudder fin", "catch fin 90", "catch fin 270"):
+            rows = d["fins"].get(name, [])
+            mach = sorted({r["mach"] for r in rows})
+            aoa = sorted({r["aoa"] for r in rows})
+            dF = np.zeros((len(mach), len(aoa), 3))
+            dM = np.zeros((len(mach), len(aoa), 3))
+            dH = np.zeros((len(mach), len(aoa)))
+            seen = np.zeros((len(mach), len(aoa)), bool)
+            for r in rows:
+                i, j = mach.index(r["mach"]), aoa.index(r["aoa"])
+                if seen[i, j]:
+                    continue
+                dF[i, j], dM[i, j] = r["dF"], r["dM"]
+                dH[i, j] = r["dC_h"] or 0.0
+                seen[i, j] = True
+            self.fins.append(dict(name=name, mach=mach, aoa=aoa, dF=dF, dM=dM, dH=dH))
+        self.S_fin = 11.26
+        self.c_fin = 0.5
+
+    def _lookup(self, f, mach, aoa):
+        if not f["mach"]:
+            return np.zeros(3), np.zeros(3), 0.0
+        im = _interp_axis(f["mach"], mach)
+        ia = _interp_axis(f["aoa"], aoa)
+        out = [0.0, 0.0, 0.0]
+        for (i, wi) in ((im[0], 1 - im[2]), (im[1], im[2])):
+            for (j, wj) in ((ia[0], 1 - ia[2]), (ia[1], ia[2])):
+                w = wi * wj
+                out[0] = out[0] + w * f["dF"][i, j]
+                out[1] = out[1] + w * f["dM"][i, j]
+                out[2] = out[2] + w * f["dH"][i, j]
+        return out
+
+    def control_loads(self, mach, aoa_deg, deflections_rad, q_dyn):
+        F = np.zeros(3)
+        M = np.zeros(3)
+        H = np.zeros(3)
+        for k, (f, dl) in enumerate(zip(self.fins, deflections_rad)):
+            dF, dM, dH = self._lookup(f, mach, aoa_deg)
+            F += q_dyn * self.db.S * np.asarray(dF) * dl
+            M += q_dyn * self.db.S * self.db.L * np.asarray(dM) * dl
+            H[k] = q_dyn * self.S_fin * self.c_fin * dH * dl
+        return F, M, H

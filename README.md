@@ -26,6 +26,23 @@ guessed aero coefficients in CatchSim (`quatsim/aero.py`).
 | Dual time stepping (BDF2 outer steps, implicit inner iterations) for unsteady flows: the time step follows the physics, not the smallest cell | done |
 | Local refinement: patches of finer cells (anisotropic allowed) coupled to a coarse base grid; generator for shells around walls and boxes around the grid fins (`--wall-h`, `--fin-h`) | done |
 
+### Next runs on the GPU (in this order)
+
+```bash
+git pull
+python tests/run_checks.py                                   # ~minutes: confirms this machine matches
+# 1. inviscid glide case with local refinement, to compare with the slab-refined result
+#    (CD 3.532, CN 1.616, C_restore +0.011 at 34 M cells)
+python cases/super_heavy_descent.py --h 0.3 --fins parametric --fin-h 0.06 --engine-h 0.06 --aoa 15 --windward 0 --out results/glide_patch
+# 2. the same, finer (grid convergence of the patch setup)
+python cases/super_heavy_descent.py --h 0.25 --fins parametric --fin-h 0.04 --engine-h 0.04 --aoa 15 --windward 0 --out results/glide_patch_fine
+# 3. a quick aero database, then the full one (overnight) -> aero_db.json for CatchSim
+python cases/aero_database.py --mach 2.8 2.0 1.3 0.9 --aoa 0 8 16 --roll 0 180 --out results/db_quick
+python cases/aero_database.py --out results/aero_db
+# 4. viscous: does SST separate from a smooth cylinder once the boundary layer is resolved?
+python cases/validate_cylinder_turbulent.py --dual --patch-h 0.001 --shell 0.06
+```
+
 ### Validation
 
 | case | reference | result |
@@ -220,6 +237,10 @@ wall but 25 cm along the booster resolve the boundary layer at a fraction of the
 Patches imply the implicit solver:
 
 ```bash
+# inviscid production setting: 0.3 m body grid, 6 cm patches on the engine end and the fins
+# (4.75 M cells, ~0.6 GB): the engine-end patches resolve the ~4 cm gaps between the outer
+# nozzles that made drag scatter +/- 5 % between grids
+python cases/super_heavy_descent.py --h 0.3 --fins parametric --fin-h 0.06 --engine-h 0.06 --aoa 15 --windward 0
 # grid fins resolved by 3 cm patches around each fin (no fin slab), coarse base grid
 python cases/super_heavy_descent.py --h 0.3 --fins parametric --fin-h 0.03 --aoa 15 --windward 0
 # plus a boundary-layer shell around the hull, viscous
@@ -235,6 +256,11 @@ the cylinder with its boundary layer resolved by a 1 mm patch shell:
 python cases/validate_cylinder_turbulent.py --dual --patch-h 0.001 --shell 0.06
 python cases/validate_cylinder_turbulent.py --laminar --re 100 --mach 0.2 --h 0.02 --dual   # laminar shedding check
 ```
+
+Numerics defaults (changed in this round, see the validation table): Koren (kappa = 1/3) MUSCL
+reconstruction instead of van Leer; Thornber low-Mach correction on for subsonic freestreams;
+thin walls use the real plate normal. Older results in this README used van Leer and the axis-
+mirror thin walls, so reruns will differ by about the size of their stated uncertainty.
 
 ### Aero database for CatchSim
 
