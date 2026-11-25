@@ -215,8 +215,15 @@ class Solver:
             for side in (0, 1):
                 kind = "auto" if bcs == "auto" else bcs.get((d, side), "auto")
                 if kind == "auto":
-                    into = vel[d] > 1e-9 if side == 0 else vel[d] < -1e-9
-                    kind = "freestream" if into else "extrapolate"
+                    c_inf = np.sqrt(self.gamma * self.W_inf[4] / self.W_inf[0])
+                    if np.linalg.norm(vel) < c_inf:
+                        # subsonic: waves run both ways, so fixing everything at the inflow and
+                        # copying everything at the outflow lets the pressure level drift and slows
+                        # the whole domain down; use characteristic (Riemann-invariant) farfield
+                        kind = "farfield"
+                    else:
+                        into = vel[d] > 1e-9 if side == 0 else vel[d] < -1e-9
+                        kind = "freestream" if into else "extrapolate"
                 self.bcs[(d, side)] = kind
 
     def _setup_thin(self, thin_sdf, thin_box):
@@ -389,6 +396,9 @@ class Solver:
                 dst = _sl(W, ax, 0, NG) if side == 0 else _sl(W, ax, N + NG, N + 2 * NG)
                 if kind == "periodic":
                     dst.copy_(_sl(W, ax, N, N + NG) if side == 0 else _sl(W, ax, NG, 2 * NG))
+                elif kind == "farfield":
+                    edge = _sl(W, ax, NG, NG + 1) if side == 0 else _sl(W, ax, N + NG - 1, N + NG)
+                    dst.copy_(self._farfield(edge, d, -1.0 if side == 0 else 1.0).expand_as(dst))
                 elif kind in ("wall", "slipwall"):
                     # mirror the first NG interior layers; no-slip negates all velocity
                     # components (zero velocity on the boundary face), slip only the normal one
@@ -405,6 +415,38 @@ class Solver:
                 else:  # freestream
                     dst.copy_(self.W_inf_t.reshape(5, 1, 1, 1).expand_as(dst))
         return W
+
+    def _farfield(self, Wi, d, sgn):
+        """Characteristic farfield state from the edge cells Wi (5, ...) and the freestream,
+        for a boundary with outward normal sgn * e_d (Riemann invariants of the normal flow)."""
+        g = self.gamma
+        Wf = self.W_inf_t.reshape(5, *([1] * (Wi.dim() - 1)))
+        rho_i, p_i = Wi[0], Wi[4]
+        c_i = torch.sqrt(g * p_i / rho_i)
+        c_f = torch.sqrt(g * Wf[4] / Wf[0])
+        un_i = sgn * Wi[1 + d]
+        un_f = sgn * Wf[1 + d]
+        Rp = un_i + 2.0 * c_i / (g - 1.0)              # leaves the domain: from the interior
+        Rm = un_f - 2.0 * c_f / (g - 1.0)              # enters the domain: from the freestream
+        un_b = 0.5 * (Rp + Rm)
+        c_b = 0.25 * (g - 1.0) * (Rp - Rm)
+        inflow = un_b < 0
+        ent = torch.where(inflow, Wf[4] / Wf[0] ** g, p_i / rho_i ** g)
+        rho_b = (c_b * c_b / (g * ent)) ** (1.0 / (g - 1.0))
+        p_b = rho_b * c_b * c_b / g
+        out = torch.empty_like(Wi)
+        out[0], out[4] = rho_b, p_b
+        for k in range(3):
+            if k == d:
+                out[1 + k] = sgn * un_b
+            else:
+                out[1 + k] = torch.where(inflow, Wf[1 + k].expand_as(Wi[1 + k]), Wi[1 + k])
+        # supersonic normal flow: everything from upstream
+        sup_in = un_f < -c_f
+        sup_out = un_i > c_i
+        out = torch.where(sup_out, Wi, out)
+        out = torch.where(sup_in, Wf.expand_as(Wi), out)
+        return out
 
     def _fill_ib(self, W):
         """Set immersed-boundary ghost cells in place (mirror state, normal velocity reflected)."""
