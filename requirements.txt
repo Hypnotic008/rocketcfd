@@ -6,3 +6,5 @@ numpy>=1.26
 scipy>=1.11
 matplotlib>=3.8
 scikit-image>=0.22
+pyvista>=0.44           # 3-D viewer / animations (py -m rocketcfd.viewer)
+imageio-ffmpeg>=0.5    # MP4 export from the viewer

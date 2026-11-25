@@ -178,6 +178,21 @@ On a 6 GB laptop RTX 4050, that's about 7 M cells, or h ~ 0.3 m for the full Sup
 (roadmap 2) and a lower-memory flux loop are how finer grids will fit.
 
 
+## Viewing results in 3-D
+
+```bash
+py -m pip install pyvista imageio-ffmpeg
+py -m rocketcfd.viewer results\glide_rudder                  # interactive window
+py -m rocketcfd.viewer results\glide_rudder --movie orbit    # MP4: orbit with flowing particles
+py -m rocketcfd.viewer results\glide_rudder --movie sweep    # MP4: slice sweeping engines -> top
+py -m rocketcfd.viewer results\glide_rudder --stride 2       # quarter of the memory, faster to load
+```
+
+The real geometry is always shown: the hull coloured by surface pressure and the toothed grid
+fins as solid parts. Streamlines are coloured by Mach with particles moving at the local flow
+speed; a slider (or `k`) moves a Mach slice along the booster. Keys: space pause, `o` orbit,
+`k` sweep, `s` streamlines, `f` fins, `h` see-through hull, `r` reset view.
+
 ## Limits of this milestone (read before using numbers)
 
 * **Inviscid.** No boundary layers or skin friction. Pressure loads on the forebody, fins
