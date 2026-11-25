@@ -26,6 +26,25 @@ guessed aero coefficients in CatchSim (`quatsim/aero.py`).
 | Dual time stepping (BDF2 outer steps, implicit inner iterations) for unsteady flows: the time step follows the physics, not the smallest cell | done |
 | Local refinement: patches of finer cells (anisotropic allowed) coupled to a coarse base grid; generator for shells around walls and boxes around the grid fins (`--wall-h`, `--fin-h`) | done |
 
+### What changed in the latest round (solver work, Nov 25)
+
+* **Implicit steady solver** (backward Euler in pseudo time, matrix-free Jacobian, red-black
+  Gauss-Seidel relaxation): same answers as the explicit solver in far fewer iterations
+  (sphere 2.5-4x less wall time on CPU; most gain on thin near-wall cells). Turbulent runs finish
+  with explicit steps (see limits).
+* **Dual time stepping** for unsteady flow (vortex shedding): the time step follows the physics.
+* **Local refinement patches**: fine cells only where needed (engine end, grid fins, boundary-
+  layer shells, shocks), snapped to the base grid; forebody loads within 0.03 % of an all-fine grid.
+  The inviscid booster setup with 6 cm engine end and fins is 6.1 M cells instead of 34 M.
+* **Numerics**: Koren (kappa = 1/3) reconstruction (third order where smooth), low-Mach correction
+  for subsonic freestreams, plate normals on thin walls, true-normal wall function.
+* **Robustness / memory**: thin-wall setup 13 GB -> 0.3 GB for a grid fin; NaN in viscous patch runs
+  fixed; launches cached; divergence retry in the database sweep.
+* **CatchSim**: `cases/aero_database.py` (Mach x aoa x roll sweep with warm starts) ->
+  `aero_db.json` -> `integrations/catchsim/aero_cfd.py` (force/moment tables with the mirror rule,
+  quasi-steady pitch damping, fin control derivatives and hinge moments).
+* **Checks**: `tests/run_checks.py` runs the verification cases with PASS / FAIL.
+
 ### Next runs on the GPU (in this order)
 
 ```bash
@@ -53,7 +72,7 @@ python cases/validate_cylinder_turbulent.py --dual --patch-h 0.001 --shell 0.06
 | Cylinder, Mach 4: surface pressure | modified Newtonian | matches near stagnation, above it further round (expected) |
 | Cylinder, Mach 4, stretched grid (2.8x fewer cells) | uniform-grid result | standoff within 1 %, stagnation pressure -0.5 % |
 | 1 mm flat plate, Mach 2, 5 deg, plate along the grid (thin walls) | shock-expansion theory | face pressures exact to 4 digits; CN -1.7 % |
-| Same plate tilted across the grid (staircase of blocked faces) | shock-expansion theory | converged, CN averaged over the end of the run: with the plate normal in the wall flux (default) -3.6 % at 100 cells/chord; axis-mirror staircase (old) +7.7 %. The normal is used where it is within ~70 deg of the face axis (not at plate edges, where it points along the flow and made the grid fin diverge) |
+| Same plate tilted across the grid (staircase of blocked faces) | shock-expansion theory | converged, CN averaged over the end of the run. Plate normal in the wall flux (default; used where within ~70 deg of the face axis): -3.6 % / -5.4 % at 100 / 200 cells per chord; axis-mirror staircase (old): +7.7 % / -2.6 %. The normals help on coarse grids only; both end a few per cent low |
 | NACA 0012, Mach 0.8, 1.25 deg (`tests/naca0012.py`) | Euler references (AGARD AR-211) CL 0.35-0.36, CD 0.022-0.023 | shock at x/c 0.63 (ref ~0.62); CL 0.288, CD 0.018 at 250 cells/chord: thin sharp trailing edges lose lift with ghost-cell walls (both surfaces share the ghost cells there) |
 | Warp kernels vs PyTorch reference (Sod, cylinder, 3-D sphere) | identical numerics | max difference 2e-4 (float32) |
 | Viscous shear wave, periodic box (`tests/viscous_shearwave.py`) | exact decay exp(-nu k^2 t) | effective / set viscosity 0.999 (64 cells), 0.987 (16) |
@@ -73,7 +92,8 @@ python cases/validate_cylinder_turbulent.py --dual --patch-h 0.001 --shell 0.06
 | Wall patches, Mach 4 cylinder forebody drag (4x finer cells within 0.1 / 0.4 of the wall) | one fine grid (1.2355) | 1.2231 (-1.0 %) / 1.2467 (+0.9 %); with patch edges snapped to base-grid faces (default): 1.2351 (-0.03 %); coarse alone 1.1526 (-6.7 %). The inviscid wake behind the body stays grid-dependent |
 | Local refinement, laminar plate (`tests/patch_blasius.py`) | one fine grid | friction drag 0.00899 vs 0.00896 (coarse grid alone 0.00967), 68 % of the cells |
 | Local refinement, Mach 3 sphere (`tests/patch_sphere.py`) | one fine grid | CD 0.9666 vs 0.9569 (coarse alone 1.0114), 45 % of the cells |
-| Laminar cylinder Re 100, dual time stepping | St 0.164 | St 0.160 (25 cells/D, 50 steps per period) |
+| Laminar cylinder Re 100, dual time stepping | St 0.164, Cd 1.33 | St 0.160 (25 cells/D, 50 steps per period, 15 inner iterations); with 40 steps and 12 inner iterations St 0.137 and Cd 1.336, the same with a refinement patch: use the defaults (80 / 20) |
+| Laminar cylinder Re 40, steady (immersed no-slip wall) | Dennis & Chang: Cd 1.52 | Cd 1.585 / 1.527 at D/25 / D/50 (before the ghost-cell fix: 1.464 / 1.372, moving away) |
 | Turbulent plate Re 1e7, implicit (`--implicit`) | White Cf | +2.6 % (explicit, converged: -6.2 %): two different converged SST states, see limits |
 | CatchSim drop-in vs the sweep it reads (`tests/catchsim_dropin_check.py`) | the computed cases | identical to 1e-15; mirror rule and centre-of-mass transfer exact |
 
@@ -360,8 +380,8 @@ The viewer adds Q-criterion vortex surfaces (`v`) and friction lines (`l`).
 * **Patch coupling is not conservative** (overlapping-grid style: interpolated ghost layers,
   averaged covered cells). Forebody loads match a single fine grid to ~1 % when the patch shell is
   at least a few fine cells thick; keep patch edges out of shocks where possible. Laminar skin
-  friction on curved immersed walls (Re 40 cylinder) is not yet grid-converged (0.44 / 0.33 at
-  h = D/25 / D/50, reference ~0.5); pressure drag is (1.02 / 1.04 vs ~1.0).
+  friction on curved immersed walls: total drag now converges (Re 40 cylinder 1.585 / 1.527 vs 1.52),
+  but the split between friction (0.56 / 0.44) and pressure (1.03 / 1.09) still moves with the grid.
 * **Turbulent runs: the implicit k-omega path does not land on the steady state.** On the flat
   plate the implicit solver settles at Cf -1 % (Koren; +2.6 % with van Leer) from White, and the
   explicit solver continued from that state moves it to -6.3 %, where explicit runs from scratch

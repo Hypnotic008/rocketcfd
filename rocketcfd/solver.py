@@ -227,7 +227,9 @@ class Solver:
                 weight=wp.array(self.ib["w"].cpu().numpy().astype(np.float32), dtype=wp.float32,
                                 device=self._wdev),
                 normal=wp.array(self.ib["n"].cpu().numpy().T.astype(np.float32), dtype=wp.vec3,
-                                device=self._wdev))
+                                device=self._wdev),
+                ratio=wp.array(self.ib["r"].cpu().numpy().astype(np.float32), dtype=wp.float32,
+                               device=self._wdev))
         self._wp_stream = wp.stream_from_torch(torch.cuda.current_stream(dev)) if dev.type == "cuda" else None
         vp = K.Visc()
         v = self.viscous or {}
@@ -502,6 +504,7 @@ class Solver:
         cidx = np.zeros((gi.size, 8), np.int64)
         cw = np.zeros((gi.size, 8))
         todo = np.ones(gi.size, bool)
+        d_img = dist0.copy()                    # ghost-to-image distance actually used
         for extra in (0.0, 1.0, 2.0, 3.0):
             if not todo.any():
                 break
@@ -529,6 +532,7 @@ class Solver:
             s = cw[sel].sum(1)
             ok = s > 1e-3
             cw[sel[ok]] /= s[ok, None]
+            d_img[sel[ok]] = dist0[sel[ok]] + extra * hloc[sel[ok]]
             todo[sel[ok]] = False
         if todo.any():  # fall back to nearest fluid cell
             _, inds = ndimage.distance_transform_edt(~self.fluid, return_indices=True)
@@ -538,10 +542,18 @@ class Solver:
             cw[sel] = 0.0
             cw[sel, 0] = 1.0
         self.n_ib_fallback = int(todo.sum())
+        # wall-normal velocity (and, no-slip, all velocity) goes linearly through zero at the wall:
+        # ghost value = -(d_ghost / d_image) x image value, distances from the wall. The image is the
+        # ghost's mirror point (ratio 1) unless it had to move further out (ghost almost on the
+        # wall, or the mirror stencil not in the fluid); then plain reflection overstates it.
+        dg = np.maximum(-phi.ravel()[gi], 0.0)
+        ratio = np.clip(dg / np.maximum(d_img - dg, 1e-12), 0.0, 1.0)
+        ratio[todo] = 1.0
         dev = self.device
         self.ib = dict(g=torch.as_tensor(gi, device=dev), c=torch.as_tensor(cidx, device=dev),
                        w=torch.as_tensor(cw, dtype=self.dtype, device=dev),
-                       n=torch.as_tensor(nrm, dtype=self.dtype, device=dev))
+                       n=torch.as_tensor(nrm, dtype=self.dtype, device=dev),
+                       r=torch.as_tensor(ratio, dtype=self.dtype, device=dev))
 
     # ---------------------------------------------------------------- kernels
     def _fill_bc(self, W):
@@ -618,7 +630,7 @@ class Solver:
         qi = (Wf[:, ib["c"]] * ib["w"]).sum(-1)            # (5, Ng)
         vel = qi[1:4]
         vn = (vel * ib["n"]).sum(0)
-        vel = vel - 2.0 * vn * ib["n"]
+        vel = vel - (1.0 + ib["r"]) * vn * ib["n"]
         Wf[:, ib["g"]] = torch.cat([qi[:1], vel, qi[4:]], 0)
         return W
 
@@ -693,7 +705,7 @@ class Solver:
         ib = self._wp_ib
         if ib is not None:
             self._L(K.ib_kernel, ib["n"], [w["W"], ib["ghost"], ib["corner"], ib["weight"],
-                                                       ib["normal"], int(self.wall == "noslip")])
+                                                       ib["normal"], ib["ratio"], int(self.wall == "noslip")])
         self._L(K.shock_kernel, shape, [w["W"], self._active_sensor, self.shock_threshold, w["S"]])
         if self.turbulence:
             kk, oo = (("K", "O") if tkey in (None, "") else (tkey, "O1"))
