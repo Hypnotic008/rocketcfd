@@ -827,3 +827,161 @@ def turb_update_kernel(K0: wp.array3d(dtype=wp.float32), O0: wp.array3d(dtype=wp
             kn = rho * ut * ut / wp.sqrt(BSTAR)
     outK[I, J, K] = kn
     outO[I, J, K] = wn
+
+
+# ---------------------------------------------------------------- implicit (DP-LUR) steady solver
+@wp.func
+def cons_at(U: wp.array4d(dtype=wp.float32), i: int, j: int, k: int):
+    return vec5(U[0, i, j, k], U[1, i, j, k], U[2, i, j, k], U[3, i, j, k], U[4, i, j, k])
+
+
+@wp.func
+def c2p(u: vec5, g: float):
+    r = wp.max(u[0], 1.0e-12)
+    vx = u[1] / r
+    vy = u[2] / r
+    vz = u[3] / r
+    p = wp.max((g - 1.0) * (u[4] - 0.5 * r * (vx * vx + vy * vy + vz * vz)), 1.0e-12)
+    return vec5(r, vx, vy, vz, p)
+
+
+@wp.func
+def flux_of_cons(u: vec5, d: int, g: float):
+    return pflux(c2p(u, g), u, d)
+
+
+@wp.func
+def lam_speed(W: wp.array4d(dtype=wp.float32), vp: Visc, g: float, I: int, J: int, K: int, d: int, inv: float):
+    """Spectral radius along d as a speed: |u_d| + c, plus 2 nu_eff max(4/3, g/Pr) / dx for
+    the viscous terms (so that lam * inv is the per-cell rate)."""
+    c = wp.sqrt(g * W[4, I, J, K] / W[0, I, J, K])
+    lam = wp.abs(W[1 + d, I, J, K]) + c
+    if vp.mode != 0:
+        mu = mu_of(vp, W[4, I, J, K] / (W[0, I, J, K] * vp.R))
+        if vp.turb != 0:
+            mu = mu + vp.mut[I, J, K]
+        lam = lam + 2.0 * mu / W[0, I, J, K] * wp.max(4.0 / 3.0, g / vp.Pr) * inv
+    return lam
+
+
+@wp.func
+def dir_info(ix: wp.array(dtype=wp.float32), iy: wp.array(dtype=wp.float32), iz: wp.array(dtype=wp.float32),
+             d: int, i: int, j: int, k: int):
+    """(di, dj, dk), 1/dx at the cell, position along d."""
+    if d == 0:
+        return wp.vec3i(1, 0, 0), ix[i], i
+    if d == 1:
+        return wp.vec3i(0, 1, 0), iy[j], j
+    return wp.vec3i(0, 0, 1), iz[k], k
+
+
+@wp.func
+def inv_at(ix: wp.array(dtype=wp.float32), iy: wp.array(dtype=wp.float32), iz: wp.array(dtype=wp.float32),
+           d: int, p: int):
+    if d == 0:
+        return ix[p]
+    if d == 1:
+        return iy[p]
+    return iz[p]
+
+
+@wp.kernel
+def implicit_sweep_kernel(U: wp.array4d(dtype=wp.float32), W: wp.array4d(dtype=wp.float32),
+                          R: wp.array4d(dtype=wp.float32), ix: wp.array(dtype=wp.float32),
+                          iy: wp.array(dtype=wp.float32), iz: wp.array(dtype=wp.float32), active: wp.vec3i,
+                          blk: wp.array3d(dtype=wp.int32), mask: wp.array3d(dtype=wp.float32), vp: Visc,
+                          g: float, cfl: float, first: int,
+                          dUo: wp.array4d(dtype=wp.float32), dUn: wp.array4d(dtype=wp.float32)):
+    """One Jacobi sweep of the backward-Euler system (1/dt + dF/dU) dU = R with a matrix-free,
+    first-order Rusanov Jacobian (data-parallel LU relaxation, Wright, Candler & Bose 1996):
+
+        D dU_i = R_i - sum_d 1/dx [ 0.5 (dF(i+1) - lam(i+1) dU(i+1)) - 0.5 (dF(i-1) + lam(i-1) dU(i-1)) ]
+
+    with D = (1 + 1/cfl) sum_d lam_d / dx_d, i.e. the local pseudo time step dt = cfl / sum(lam/dx).
+    dF(n) = F(U_n + dU_n) - F(U_n) is the exact flux change. Boundary, wall and thin-wall
+    neighbours are treated explicitly (no coupling). first = 1 starts from dU = 0."""
+    i, j, k = wp.tid()
+    I = i + 2
+    J = j + 2
+    K = k + 2
+    if mask[i, j, k] < 0.5:
+        for c in range(5):
+            dUn[c, I, J, K] = 0.0
+        return
+    s = float(0.0)
+    off = vec5()
+    for d in range(3):
+        if active[d] != 0:
+            e, inv, pos = dir_info(ix, iy, iz, d, i, j, k)
+            s = s + lam_speed(W, vp, g, I, J, K, d, inv) * inv
+            if first == 0:
+                for side in range(2):
+                    sg = 1
+                    if side == 1:
+                        sg = -1
+                    p = pos + sg
+                    if p >= 0 and p < mask.shape[d]:
+                        ni = i + sg * e[0]
+                        nj = j + sg * e[1]
+                        nk = k + sg * e[2]
+                        bi = I
+                        bj = J
+                        bk = K
+                        if sg < 0:
+                            bi = I - e[0]
+                            bj = J - e[1]
+                            bk = K - e[2]
+                        if ((blk[bi, bj, bk] >> d) & 1) == 0 and mask[ni, nj, nk] > 0.5:
+                            du = cons_at(dUo, ni + 2, nj + 2, nk + 2)
+                            un = cons_at(U, ni + 2, nj + 2, nk + 2)
+                            dF = flux_of_cons(un + du, d, g) - flux_of_cons(un, d, g)
+                            ln = lam_speed(W, vp, g, ni + 2, nj + 2, nk + 2, d, inv_at(ix, iy, iz, d, p))
+                            off = off + (float(sg) * dF - du * ln) * (0.5 * inv)
+    dg = s / cfl + s
+    for c in range(5):
+        dUn[c, I, J, K] = (R[c, i, j, k] - off[c]) / dg
+
+
+@wp.kernel
+def implicit_apply_kernel(U: wp.array4d(dtype=wp.float32), dU: wp.array4d(dtype=wp.float32),
+                          mask: wp.array3d(dtype=wp.float32), g: float, maxrel: float):
+    """U += dU on fluid cells, scaled down where density or pressure would change by more than
+    maxrel (keeps large pseudo time steps positive)."""
+    i, j, k = wp.tid()
+    if mask[i, j, k] < 0.5:
+        return
+    I = i + 2
+    J = j + 2
+    K = k + 2
+    u0 = cons_at(U, I, J, K)
+    du = cons_at(dU, I, J, K)
+    q0 = c2p(u0, g)
+    u1 = u0 + du
+    r1 = u1[0]
+    p1 = (g - 1.0) * (u1[4] - 0.5 * (u1[1] * u1[1] + u1[2] * u1[2] + u1[3] * u1[3]) / wp.max(r1, 1.0e-30))
+    m = wp.max(wp.abs(r1 - q0[0]) / q0[0], wp.abs(p1 - q0[4]) / q0[4])
+    f = float(1.0)
+    if m > maxrel or r1 <= 0.0 or p1 <= 0.0:
+        f = maxrel / wp.max(m, maxrel)
+    for c in range(5):
+        U[c, I, J, K] = u0[c] + f * du[c]
+
+
+@wp.kernel
+def turb_rate_kernel(W: wp.array4d(dtype=wp.float32), ix: wp.array(dtype=wp.float32),
+                     iy: wp.array(dtype=wp.float32), iz: wp.array(dtype=wp.float32), active: wp.vec3i,
+                     vp: Visc, cfl: float, dtl: wp.array3d(dtype=wp.float32)):
+    """Local explicit-stable step for the k / omega transport (upwind convection at |u| plus
+    diffusion with nu + nu_t), used for the turbulence update in implicit runs."""
+    i, j, k = wp.tid()
+    I = i + 2
+    J = j + 2
+    K = k + 2
+    rho = W[0, I, J, K]
+    nu = (mu_of(vp, W[4, I, J, K] / (rho * vp.R)) + vp.mut[I, J, K]) / rho
+    r = float(0.0)
+    for d in range(3):
+        if active[d] != 0:
+            e, inv, pos = dir_info(ix, iy, iz, d, i, j, k)
+            r = r + wp.abs(W[1 + d, I, J, K]) * inv + 2.0 * nu * inv * inv
+    dtl[i, j, k] = cfl / wp.max(r, 1.0e-30)
