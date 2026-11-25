@@ -443,6 +443,8 @@ state (`Solver(jets=[...])`), so the plume is part of the flow. Single perfect g
 `--exit-p` 80 kPa). The forces include the exit-plane pressure but not the momentum thrust.
 Check: `tests/underexpanded_jet.py` (Mach-disk position of a sonic jet vs the Crist-Sherman-Glass
 correlation).
+Preview from a coarse CPU test (0.6 m cells, 13 engines at Mach 0.4):
+[still](docs/media/landing_burn_test_0.6m.png).
 
 ```bash
 # 4.3 M cells: 10 cm cells at the engine end, 15 cm in a 30 m block where the plume goes

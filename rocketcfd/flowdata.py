@@ -49,6 +49,8 @@ class FlowData:
         return ([self.base] if self.base is not None else []) + self.patches
 
     def ensure(self, name):
+        if name == "schlieren" and self.patches:
+            return self._schlieren()
         ok = False
         for g in self.grids:
             if name not in g.point_data:
@@ -58,6 +60,22 @@ class FlowData:
                     self._vis = None
             ok = ok or name in g.point_data
         return ok
+
+    def _schlieren(self, k=10.0):
+        """Schlieren with one gradient scale for all grids (per-grid scaling would show the patch edges)."""
+        if all("schlieren" in g.point_data for g in self.grids):
+            return True
+        for g in self.grids:
+            if "grad_rho" not in g.point_data:
+                derived.add_to_grid(g, ["grad_rho"], freestream=self.fs)
+        allg = np.concatenate([np.asarray(g.point_data["grad_rho"]).ravel() for g in self.grids])
+        allg = allg[np.isfinite(allg) & (allg > 0)]
+        ref = float(np.percentile(allg, 99.0)) if allg.size else 1.0
+        for g in self.grids:
+            gm = np.nan_to_num(np.asarray(g.point_data["grad_rho"], float))
+            g.point_data["schlieren"] = np.exp(-k * np.minimum(gm / max(ref, 1e-30), 1.0)).astype(np.float32)
+        self._vis = None
+        return True
 
     @staticmethod
     def _faces(c):

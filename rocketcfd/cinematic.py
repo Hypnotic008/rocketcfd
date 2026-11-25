@@ -173,6 +173,30 @@ def plume_t_range(fd, T_inf):
     return max(1.5 * T_inf, float(np.percentile(Tv, 90))), float(np.percentile(Tv, 99.7))
 
 
+def focus_bounds(fd, surf, style, fs=None):
+    """Bounds the camera frames: the vehicle, plus the hot exhaust for the plume style."""
+    bb = list(surf.bounds if surf is not None else fd.bounds())
+    if style == "plume":
+        T_inf = (fs["p"] / (fs["rho"] * derived.R_AIR)) if fs else None
+        if T_inf is None:
+            fd.ensure("T")
+            T_inf = float(np.nanpercentile(fd.values("T"), 5))
+        lo_T, _ = plume_t_range(fd, T_inf)
+        pts = []
+        for v in fd.visible():
+            if "T" in v.point_data:
+                m = np.asarray(v.point_data["T"]) > lo_T
+                if m.any():
+                    pts.append(np.asarray(v.points)[m])
+        if pts:
+            P = np.concatenate(pts)
+            lo, hi = np.percentile(P, 2, axis=0), np.percentile(P, 98, axis=0)
+            for d in range(3):
+                bb[2 * d] = min(bb[2 * d], lo[d])
+                bb[2 * d + 1] = max(bb[2 * d + 1], hi[d])
+    return tuple(bb)
+
+
 def setup_plotter(width, height):
     pl = pv.Plotter(off_screen=True, window_size=(width, height))
     pl.set_background("black")
@@ -208,7 +232,7 @@ def render_still(folder, out, style="lava", width=1920, height=1080, q=None, tit
     flow, surf, fs = load_steady(folder)
     pl = setup_plotter(width, height)
     build(pl, flow, surf, style, q_level=q, fs=fs)
-    bb = surf.bounds if surf is not None else flow.bounds()
+    bb = focus_bounds(flow, surf, style, fs)
     pl.camera_position = camera or orbit_cameras(1, bb, start_deg=-35, sweep_deg=0)[0]
     title_text(pl, title)
     pl.screenshot(out)
@@ -221,7 +245,7 @@ def render_orbit(folder, out, style="lava", width=1920, height=1080, frames=240,
     pl = setup_plotter(width, height)
     build(pl, flow, surf, style, q_level=q, fs=fs)
     title_text(pl, title)
-    bb = surf.bounds if surf is not None else flow.bounds()
+    bb = focus_bounds(flow, surf, style, fs)
     pl.open_movie(out, framerate=fps, quality=8)
     for cam in orbit_cameras(frames, bb):
         pl.camera_position = cam
