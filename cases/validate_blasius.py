@@ -21,7 +21,7 @@ def blasius_profile(eta_max=8.0):
     return sol
 
 
-def main(out="results", Re=1e5, M=0.4, hy=0.0008, hx=0.01):
+def main(out="results", Re=1e5, M=0.4, hy=0.0008, hx=0.01, tiles=True, local_dt=False):
     os.makedirs(out, exist_ok=True)
     T, p = 288.15, 101325.0
     R, g = 287.05, 1.4
@@ -39,16 +39,22 @@ def main(out="results", Re=1e5, M=0.4, hy=0.0008, hx=0.01):
     s = Solver(None, None, None, fs, faces=faces, thin_sdf=plate, cfl=0.7,
                bcs={(2, 0): "periodic", (2, 1): "periodic"},
                viscous=dict(model="constant", mu=mu, R=R, Pr=0.72))
+    from rocketcfd.convergence import settled
     hist = []
 
     def report(sv):
+        # near-wall velocity (proportional to Cf) at three stations, relative to its value
         f = sv.fields()
         j = np.flatnonzero(f["y"] > 0)[0]
-        i = np.argmin(np.abs(f["x"] - 0.5))
-        hist.append(f["u"][i, j, 0])
-        return len(hist) > 6 and abs(hist[-1] - hist[-4]) < 1e-4 * U
+        vals = tuple(f["u"][np.argmin(np.abs(f["x"] - xs)), j, 0] / U for xs in (0.3, 0.6, 0.9))
+        hist.append(vals)
+        return settled(hist, 2e-4 * np.maximum(np.abs(vals), 1e-3) / 0.1, window=4, trend_window=8, horizon=10)
 
-    s.run(60000, chunk=2000, first_order_steps=500, report=report, steady=True)
+    import time
+    t0 = time.time()
+    s.run(120000, chunk=2000, first_order_steps=500, report=report, steady=tiles or local_dt,
+          active_tiles=tiles, local_dt=local_dt)
+    wall = time.time() - t0
     f = s.fields()
     x, y = f["x"], f["y"]
     ju = np.flatnonzero(y > 0)[0]
@@ -85,11 +91,13 @@ def main(out="results", Re=1e5, M=0.4, hy=0.0008, hx=0.01):
     ax[1].legend()
     ax[1].set_title(f"profile: max |error| {prof_err:.3f}")
     fig.suptitle(f"Laminar flat plate, Mach {M}, Re_L = {Re:.0e}, {int(0.04/hy)} cells across +/-2 cm")
-    fig.savefig(f"{out}/validate_blasius.png", dpi=120)
+    tag = ("" if tiles else "_notiles") + ("_localdt" if local_dt else "")
+    fig.savefig(f"{out}/validate_blasius{tag}.png", dpi=120)
     print(f"Blasius: Cf mean deviation {100*err:+.2f} % (0.2 < x < 0.8); profile max |u/U error| {prof_err:.3f}; "
-          f"{s.step_count} steps")
+          f"{s.step_count} steps, {wall/60:.1f} min ({'tiles' if tiles else 'no tiles'}, "
+          f"{'local' if local_dt else 'global'} time step)")
     return err, prof_err
 
 
 if __name__ == "__main__":
-    main()
+    main(tiles="--no-tiles" not in sys.argv, local_dt="--local-dt" in sys.argv)
