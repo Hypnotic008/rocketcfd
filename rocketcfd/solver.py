@@ -411,6 +411,13 @@ class Solver:
                 half = 0.5 * (tb - ta) * stepf[fid]
                 c1 = (~hit) & (pa + pm < half)
                 c2 = (~hit) & (pm + pb < half)
+                # a segment hugging a plate surface stays ambiguous at every level and the
+                # candidates double each time (2^18 per face: tens of GB); below 1 % of the
+                # cell spacing it passes within that distance of the plate: block it
+                tiny = half < 0.01 * np.abs(stepf[fid])
+                flat_b[fid[tiny & (c1 | c2)]] = True
+                c1 &= ~tiny
+                c2 &= ~tiny
                 fid = np.concatenate([fid[c1], fid[c2]])
                 ta, tb = np.concatenate([ta[c1], tm[c2]]), np.concatenate([tm[c1], tb[c2]])
                 pa, pb = np.concatenate([pa[c1], pm[c2]]), np.concatenate([pm[c1], pb[c2]])

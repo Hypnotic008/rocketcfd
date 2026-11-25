@@ -49,6 +49,8 @@ def main():
     ap.add_argument("--out", default="results/grid_fin")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--implicit", action="store_true", help="implicit steady solver (much faster)")
+    ap.add_argument("--axis-walls", action="store_true", help="old staircase thin-wall flux (no plate normals)")
+    ap.add_argument("--limiter", default="koren", choices=["koren", "vanleer", "minmod"])
     ap.add_argument("--time-accurate", action="store_true",
                     help="global time step, all cells every step (off: local time steps + active tiles)")
     a = ap.parse_args()
@@ -103,7 +105,8 @@ def main():
     alphas = sorted(a.alpha)
     fs0, _, _ = freestream(machs[0], alphas[0])
     t0 = time.time()
-    s = Solver(None, None, None, fs0, faces=faces, thin_sdf=fin_sdf, thin_box=box, cfl=0.7)
+    s = Solver(None, None, None, fs0, faces=faces, thin_sdf=fin_sdf, thin_box=box, cfl=0.7,
+               thin_normals=not a.axis_walls, limiter=a.limiter)
     print(f"setup {time.time()-t0:.1f} s")
     rows = []
     zmid = 0.5 * (box[0][2] + box[1][2]) + 0.11      # a mid-span plane, off the lattice nodes
