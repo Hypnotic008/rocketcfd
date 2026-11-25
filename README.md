@@ -28,6 +28,8 @@ guessed aero coefficients in CatchSim (`quatsim/aero.py`).
 | Large-eddy simulation: implicit LES (default) or Vreman subgrid model, equilibrium wall model or wall-resolved (`--les`) | done, Taylor-Green vortex checked |
 | Desktop app: set up, queue and watch runs, 3-D results, plots, animations (`python -m rocketcfd.app`) | done |
 | Cinematic renders and movies (vortex surfaces coloured by Mach, schlieren, LAVA-style) (`python -m rocketcfd.cinematic`) | done |
+| Engine plumes (nozzle-exit inflow), landing burns (`--engines`), hot staging (`cases/hot_staging.py`) | done, underexpanded-jet check |
+| Probes (time histories, spectra), restarts across grids / physics | done |
 
 ### What changed in the latest round (Nov 25, evening)
 
@@ -447,6 +449,29 @@ correlation).
 python cases/super_heavy_descent.py --mach 0.4 --alt 2000 --aoa 0 --h 0.3 --fins parametric --engines centre --engine-h 0.1 --plume-h 0.15 --upstream 45 --out results/landing_burn
 python -m rocketcfd.cinematic results/landing_burn --mode orbit --style plume
 ```
+
+## Hot staging
+
+`cases/hot_staging.py`: Starship (approximate public dimensions: 9 m, ~52 m, ogive nose, flaps,
+3 sea-level + 3 vacuum Raptors) sits on the booster's vented hot-stage ring; its engines ramp up
+(`--ignition` seconds) while the booster's centre engines keep running, and the plumes hit the
+booster's dome and blow out through the vents. Ascent flow from the ship's nose, time-accurate
+explicit steps, ship and booster axial forces over time.
+
+```bash
+python cases/hot_staging.py --dry-run                         # 0.95 M cells at the default 0.5 m
+# movie: 4.8 M cells, 10 cm cells around the interstage, 0.25 s of flow
+python cases/hot_staging.py --h 0.4 --ring-h 0.1 --time 0.25 --snapshots 150 --snap-volume 1 --probes --out results/hot_staging
+python -m rocketcfd.cinematic results/hot_staging --mode evolve --style plume
+```
+
+Preview from a coarse CPU test (1 m cells, 55 ms): [movie](docs/media/hot_staging_test_1m.mp4),
+[still](docs/media/hot_staging_test_1m.png): the ship's exhaust blows out of the interstage vents as
+the engines light; the booster's centre-engine plumes at the far end.
+
+The plume-to-ambient pressure ratio at staging altitude is ~10^4: the density / pressure floors keep
+the run going and the near-field (interstage, dome, vents) is the meaningful part; the outer plume
+expanding into near vacuum is qualitative. One gas (see Engine plumes).
 
 ## Restarts
 

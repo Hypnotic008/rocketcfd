@@ -83,7 +83,7 @@ def auto_q(g, frac=0.985):
 
 
 def build(pl, flow, surf, style, q_level=None, plane_y=None, mach_range=None, cp_range=(-1.0, 1.0), fs=None,
-          plane_axis=1):
+          plane_axis=1, t_range=None):
     """Add the actors for one frame. Returns the Q level used. flow: a FlowData or one grid."""
     fd = flow if isinstance(flow, FlowData) else FlowData.from_grid(flow, fs)
     for n in (["schlieren", "Q"] if style != "pressure" else ["schlieren"]):
@@ -128,11 +128,8 @@ def build(pl, flow, surf, style, q_level=None, plane_y=None, mach_range=None, cp
         # hot exhaust: glowing temperature volume, and a hot-gas surface coloured by Mach
         fd.ensure("T")
         T_inf = (fs["p"] / (fs["rho"] * derived.R_AIR)) if fs else float(np.nanpercentile(fd.values("T"), 5))
-        Tv = fd.values("T")
-        T_hi = float(np.nanpercentile(Tv[np.isfinite(Tv)], 99.9))
-        if T_hi > 1.5 * T_inf:
-            bb = surf.bounds if surf is not None else b
-            Lb = max(bb[1] - bb[0], 1.0)
+        T_lo, T_hi = t_range if t_range is not None else plume_t_range(fd, T_inf)
+        if T_hi > 1.5 * T_inf and T_hi > T_lo:
             box = [b[0], b[1], b[2], b[3], b[4], b[5]]
             n = 170
             ext = np.array([box[1] - box[0], box[3] - box[2], box[5] - box[4]])
@@ -140,20 +137,23 @@ def build(pl, flow, surf, style, q_level=None, plane_y=None, mach_range=None, cp
             dims = np.maximum((ext / h).astype(int) + 1, 2)
             img = pv.ImageData(dimensions=dims, spacing=(h, h, h), origin=(box[0], box[2], box[4]))
             img = fd.sample_onto(img)
-            a = np.asarray(img.point_data["T"], float)
-            a[~np.isfinite(a)] = T_inf
-            img.point_data["T"] = np.clip(a, T_inf, None)
-            opac = [0.0, 0.0, 0.02, 0.08, 0.2, 0.4, 0.6]
-            pl.add_volume(img, scalars="T", cmap="inferno", clim=[1.3 * T_inf, T_hi], opacity=opac,
-                          show_scalar_bar=False)
-            hot = fd.contour(T_inf + 0.35 * (T_hi - T_inf), "T")
-            if hot.n_points:
-                if "mach" not in hot.point_data:
-                    hot = fd.sample_onto(hot)
-                pl.add_mesh(hot, scalars="mach", cmap="turbo", clim=mrange, opacity=0.35, smooth_shading=True,
-                            show_scalar_bar=True, scalar_bar_args=dict(title="Mach", color="white", vertical=True,
-                                                                         position_x=0.92, position_y=0.2,
-                                                                         height=0.6, width=0.03, fmt="%.2f"))
+            a_ = np.asarray(img.point_data["T"], float)
+            a_[~np.isfinite(a_)] = T_inf
+            img.point_data["T"] = np.clip(a_, T_inf, None)
+            # glowing exhaust: transparent below T_lo, brighter and more opaque toward T_hi
+            pl.add_volume(img, scalars="T", cmap="inferno", clim=[T_lo, T_hi],
+                          opacity=[0.0, 0.03, 0.08, 0.16, 0.28, 0.45, 0.65], show_scalar_bar=False)
+            # two nested hot-gas surfaces: a translucent outer flame and a bright core
+            for frac, op in ((0.2, 0.3), (0.65, 0.85)):
+                hot = fd.contour(T_lo + frac * (T_hi - T_lo), "T")
+                if hot.n_points:
+                    if "T" not in hot.point_data:
+                        hot = fd.sample_onto(hot)
+                    pl.add_mesh(hot, scalars="T", cmap="inferno", clim=[T_lo - 0.3 * (T_hi - T_lo), T_hi],
+                                opacity=op, smooth_shading=True, ambient=0.45, specular=0.2,
+                                show_scalar_bar=(frac > 0.5),
+                                scalar_bar_args=dict(title="T [K]", color="white", vertical=True, position_x=0.92,
+                                                     position_y=0.2, height=0.6, width=0.03, fmt="%.0f"))
     if surf is not None and surf.n_points:
         if style == "pressure" and "Cp" in surf.point_data:
             pl.add_mesh(surf, scalars="Cp", cmap="coolwarm", clim=list(cp_range), smooth_shading=True,
@@ -163,6 +163,14 @@ def build(pl, flow, surf, style, q_level=None, plane_y=None, mach_range=None, cp
             pl.add_mesh(surf, color="#d6dae0", ambient=0.22, diffuse=0.75, specular=0.55, specular_power=30,
                         smooth_shading=True)
     return ql
+
+
+def plume_t_range(fd, T_inf):
+    """Temperature range for the plume style: from the hot exhaust's upper end."""
+    fd.ensure("T")
+    Tv = fd.values("T")
+    Tv = Tv[np.isfinite(Tv)]
+    return max(1.5 * T_inf, float(np.percentile(Tv, 90))), float(np.percentile(Tv, 99.7))
 
 
 def setup_plotter(width, height):
@@ -235,6 +243,11 @@ def render_evolve(folder, out, style="lava", width=1920, height=1080, fps=30, q=
     derived.add_to_grid(last, ["Q"])
     ql = q if q is not None else auto_q(last)               # one level for the whole movie
     mrange = [0.0, float(np.nanpercentile(np.asarray(last.point_data["mach"]), 99.5))]
+    trange = None
+    if style == "plume":                                     # one temperature range for the whole movie
+        fd_last = FlowData.from_grid(last)
+        T_inf = float(mesh["p_inf"]) / (float(mesh.get("rho_inf", 1.0)) * derived.R_AIR)
+        trange = plume_t_range(fd_last, T_inf)
     pl = setup_plotter(width, height)
     bb = (float(mesh["xyz"][:, 0].min()), float(mesh["xyz"][:, 0].max()), float(mesh["xyz"][:, 1].min()),
           float(mesh["xyz"][:, 1].max()), float(mesh["xyz"][:, 2].min()), float(mesh["xyz"][:, 2].max()))
@@ -245,7 +258,7 @@ def render_evolve(folder, out, style="lava", width=1920, height=1080, fps=30, q=
         g = _snap_grid(mesh, snap)
         surf = _surface_from_mesh(mesh, snap["cp"].astype(np.float32) if "cp" in snap else None)
         pl.clear_actors()
-        build(pl, g, surf, style, q_level=ql, mach_range=mrange)
+        build(pl, g, surf, style, q_level=ql, mach_range=mrange, t_range=trange)
         title_text(pl, (title or "") + f"   t = {float(snap['t']):.3f} s")
         pl.camera_position = cams[i]
         pl.write_frame()
