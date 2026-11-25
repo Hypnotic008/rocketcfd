@@ -189,15 +189,16 @@ class PatchGrid:
                            verbose=verbose, device=self.device, bcs=base_bcs, **kw)
         self.grids = [self.base]
         lo, hi = self.base.lo, self.base.hi
+        self._on_bnd = [None]
         for g, fc in enumerate(faces_all[1:], start=1):
-            bcs = {}
+            on = {}
             for d in range(3):
                 for side in (0, 1):
                     edge = fc[d][0] if side == 0 else fc[d][-1]
-                    on_bnd = abs(edge - (lo[d] if side == 0 else hi[d])) < 1e-9 * max(1.0, abs(edge))
-                    bcs[(d, side)] = self.base.bcs[(d, side)] if on_bnd else "interface"
+                    on[(d, side)] = abs(edge - (lo[d] if side == 0 else hi[d])) < 1e-9 * max(1.0, abs(edge))
+            self._on_bnd.append(on)
             self.grids.append(Solver(None, None, None, freestream, faces=fc, alloc=make_alloc(g),
-                                     verbose=False, device=self.device, bcs=bcs, **kw))
+                                     verbose=False, device=self.device, bcs=self._patch_bcs(g), **kw))
         # fineness: cell volume of each grid's smallest cells
         self.vol = np.array([float(np.prod(s.h)) for s in self.grids])
         # fineness rank (0 = finest); equal cell sizes are ordered by grid index (later = finer),
@@ -211,6 +212,30 @@ class PatchGrid:
             print(f"PatchGrid: base {cells[0]/1e6:.2f} M cells + {len(cells)-1} patches "
                   f"{sum(cells[1:])/1e6:.2f} M cells; {self.n_covered} covered coarse cells; "
                   f"setup {time.time()-t0:.1f} s")
+
+    def _patch_bcs(self, g):
+        """Patch sides on the domain boundary take the base grid's condition, the rest are interfaces."""
+        return {k: (self.base.bcs[k] if on else "interface") for k, on in self._on_bnd[g].items()}
+
+    def set_freestream(self, freestream, keep_state=False):
+        """New flight condition on all grids (same grid and geometry); keep_state warm-starts."""
+        self.base.set_freestream(freestream, keep_state)
+        for g in range(1, self.n_grids):
+            s = self.grids[g]
+            s._bcs_arg = self._patch_bcs(g)
+            s.set_freestream(freestream, keep_state)
+        self.history.clear()
+
+    def state(self):
+        """Copy of the solution (all grids), for set_state."""
+        return {k: v.clone() for k, v in self.bufs.items() if k in ("U", "K", "O")}
+
+    def set_state(self, st):
+        for k, v in st.items():
+            self.bufs[k].copy_(v)
+        for s in self.grids:
+            if s.backend == "warp":
+                s.U1.copy_(s.U)
 
     # ------------------------------------------------------------ coupling data
     def _local_vol(self, s, X):

@@ -185,7 +185,7 @@ def super_heavy_fins_box(P: SuperHeavyParams = SuperHeavyParams(), fin=None, mar
 def fin_selectors(P: SuperHeavyParams = SuperHeavyParams()):
     """Load-breakdown selectors (pos -> mask) for each fin, by azimuth and radius."""
     out = {}
-    names = {0.0: "rudder fin", 90.0: "catch fin 90", 270.0: "catch fin 270"}
+    names = FIN_NAMES
     for az in P.fin_azimuths:
         th = _az(az)
 
@@ -194,6 +194,34 @@ def fin_selectors(P: SuperHeavyParams = SuperHeavyParams()):
             ang = np.angle(np.exp(1j * (np.arctan2(pos[2], pos[1]) - th)))
             return (np.abs(pos[0] - P.fin_x_center) < 1.0) & (r > P.radius + 0.3) & (np.abs(ang) < np.radians(40))
         out[names.get(az, f"fin {az:g}")] = sel
+    return out
+
+
+FIN_NAMES = {0.0: "rudder fin", 90.0: "catch fin 90", 270.0: "catch fin 270"}
+
+
+def fin_hinge_moments(ld, P: SuperHeavyParams = SuperHeavyParams(), x_ref=None, S_fin=11.26, c_fin=0.5):
+    """Hinge moments of the fins from Solver.loads(parts=fin_selectors(P)) output `ld`.
+
+    The fins deflect about their radial axis through x = fin_x_center (see super_heavy_fins_sdf).
+    Returns {fin name: dict(M=hinge moment [N m], C_h=M / (q S_fin c_fin))}; positive about +e_r
+    (outward radial axis). S_fin is the planform area of one fin, c_fin its depth.
+    """
+    if x_ref is None:
+        x_ref = REFERENCE["x_ref"]
+    q = ld["q_inf"]
+    out = {}
+    for az in P.fin_azimuths:
+        name = FIN_NAMES.get(az, f"fin {az:g}")
+        if name not in ld["parts"] or "F" not in ld["parts"][name]:
+            continue
+        th = _az(az)
+        er = np.array([0.0, np.cos(th), np.sin(th)])
+        ph = np.array([P.fin_x_center, P.radius * er[1], P.radius * er[2]])
+        F, M = ld["parts"][name]["F"], ld["parts"][name]["M"]
+        Mh = M - np.cross(ph - np.asarray(x_ref, float), F)
+        mh = float(Mh @ er)
+        out[name] = dict(M=mh, C_h=mh / (q * S_fin * c_fin))
     return out
 
 

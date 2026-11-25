@@ -31,8 +31,13 @@ def _sl(a, ax, start, stop):
 
 
 def _limit(a, b, kind):
+    """Limited slope; a = difference away from the face, b = across it (matters for Koren)."""
     if kind == "minmod":
         return torch.where(a * b > 0, torch.sign(a) * torch.minimum(a.abs(), b.abs()), torch.zeros_like(a))
+    if kind == "koren":
+        aa, bb = a.abs(), b.abs()
+        v = torch.sign(a) * torch.minimum(torch.minimum(2.0 * bb, (aa + 2.0 * bb) / 3.0), 2.0 * aa)
+        return torch.where(a * b > 0, v, torch.zeros_like(a))
     ab = a * b
     return torch.where(ab > 0, 2.0 * ab / (a + b + (ab <= 0).to(a.dtype)), torch.zeros_like(a))  # van Leer
 
@@ -41,7 +46,7 @@ class Solver:
     def __init__(self, lo, hi, h, freestream, sdf=None, gamma=1.4, bcs="auto", cfl=0.7,
                  limiter="vanleer", shock_threshold=0.5, dtype=torch.float32, device=None,
                  verbose=True, faces=None, backend="auto", thin_sdf=None, thin_box=None,
-                 viscous=None, wall=None, turbulence=None, alloc=None):
+                 viscous=None, wall=None, turbulence=None, alloc=None, thin_normals=True, low_mach=False):
         """
         lo, hi     : domain corners (m)
         h          : cell size, scalar or (hx, hy, hz)
@@ -62,10 +67,18 @@ class Solver:
         turbulence : None or dict(model='sst', k_inf=..., omega_inf=...): k-omega SST with a
                      Spalding wall function on immersed walls and thin walls (needs viscous).
                      Defaults: k_inf = 9e-9 a^2, omega_inf = 1e-6 rho a^2 / mu (NASA TMR).
+        limiter    : 'vanleer' (default), 'minmod', or 'koren' (kappa = 1/3 MUSCL, third-order
+                     upwind-biased in smooth regions; warp backend)
+        low_mach   : Thornber et al. (2008) low-Mach correction of the reconstructed velocities
+                     (less dissipation in slow regions; warp backend)
+        thin_normals : thin-wall faces use the real plate normal for the wall pressure (default);
+                     False = axis-aligned mirror (staircase), the earlier behaviour
         alloc      : optional callable(name, shape) -> tensor for the state arrays (U, W, K, O);
                      used by rocketcfd.patches to place several grids in one buffer
         """
         self._alloc = alloc or (lambda name, shape: torch.empty(shape, dtype=dtype, device=self.device))
+        self.thin_normals = thin_normals
+        self.low_mach = low_mach
         self._iface = None          # interface ghost-cell fill (rocketcfd.patches)
         self.owned = None           # cells whose surface loads this grid reports (rocketcfd.patches)
         self.gamma, self.cfl, self.limiter = gamma, cfl, limiter
@@ -402,9 +415,41 @@ class Solver:
             blocked = flat_b.reshape(blocked.shape)
             tgt = tuple(slice(r0[e], r1[e] + 1) if e != d else slice(r0[e], r1[e]) for e in range(3))
             self.blk[tgt] |= (blocked.astype(np.int32) << d)
+        if self.thin_normals:
+            self._pack_thin_normals(thin_sdf)
         if self.verbose:
             nb = [int(((self.blk >> d) & 1).sum()) for d in range(3)]
             print(f"thin walls: {int(ts.sum())} solid cells, blocked faces x/y/z = {nb}")
+
+    def _pack_thin_normals(self, thin_sdf):
+        """Store the plate normal of every cell that owns a blocked face in bits 8-31 of its
+        blocked-face word (3 x 8-bit components, ~0.5 deg): the wall flux then uses the velocity
+        normal to the real plate (kernels.wall_flux_n). Normal = gradient of thin_sdf at the
+        cell centre; none where the gradient is ill-defined (|grad| < 0.5, e.g. on a plate's
+        mid-plane or at junctions), which falls back to the axis mirror."""
+        cells = np.nonzero(self.blk & 7)
+        if cells[0].size == 0:
+            return
+        X = [self.axes[d][cells[d]] for d in range(3)]
+        hl = np.minimum.reduce([self.widths[d][cells[d]] for d in range(3)])
+        eps = 0.05 * hl
+        grad = []
+        for d in range(3):
+            P = list(X)
+            P[d] = X[d] + eps
+            fp = np.asarray(thin_sdf(*P), float)
+            P[d] = X[d] - eps
+            fm = np.asarray(thin_sdf(*P), float)
+            grad.append((fp - fm) / (2 * eps))
+        gv = np.stack(grad)
+        mag = np.linalg.norm(gv, axis=0)
+        ok = (mag > 0.5) & (mag < 2.0)
+        gv = gv / np.maximum(mag, 1e-30)
+        qv = np.clip(np.round(gv * 127.0).astype(np.int64) + 128, 1, 255)
+        code = (qv[0] | (qv[1] << 8) | (qv[2] << 16)) * ok
+        packed = ((code << 8) & 0xFFFFFFFF).astype(np.uint32).view(np.int32)
+        self.blk[cells] |= packed
+        self.n_thin_normals = int(ok.sum())
 
     def _setup_ib(self):
         phi = self.phi
@@ -574,7 +619,7 @@ class Solver:
             qm1, q0, qp1, qp2 = (_sl(Wc, ax, k, N + 1 + k) for k in range(4))
             dC = qp1 - q0
             WL = q0 + (0.5 * order) * _limit(q0 - qm1, dC, self.limiter)
-            WR = qp1 - (0.5 * order) * _limit(dC, qp2 - qp1, self.limiter)
+            WR = qp1 - (0.5 * order) * _limit(qp2 - qp1, dC, self.limiter)
             bad = (WL[0] <= 0) | (WL[4] <= 0) | (WR[0] <= 0) | (WR[4] <= 0)
             WL = torch.where(bad, q0, WL)
             WR = torch.where(bad, qp1, WR)
@@ -631,7 +676,7 @@ class Solver:
 
     def _wresidual(self, order, tiles=None):
         wp, K, w = self._wp, self._K, self._w
-        kind = 1 if self.limiter == "minmod" else 0
+        kind = {"vanleer": 0, "minmod": 1, "koren": 2}[self.limiter] + (4 if self.low_mach else 0)
         args = [w["W"], w["S"], w["ix"], w["iy"], w["iz"], self._active_flux, self.gamma, float(order), kind, w["blk"],
                 self._vp]
         if tiles is None:
@@ -983,6 +1028,21 @@ class Solver:
         self.step_count = 0
         self.history = []
 
+    def state(self):
+        """Copy of the solution, for set_state (warm starts in parameter sweeps)."""
+        st = dict(U=self.U.clone())
+        if self.turbulence:
+            st.update(K=self.K_buf.clone(), O=self.O_buf.clone())
+        return st
+
+    def set_state(self, st):
+        self.U.copy_(st["U"])
+        if self.turbulence and "K" in st:
+            self.K_buf.copy_(st["K"])
+            self.O_buf.copy_(st["O"])
+        if self.backend == "warp":
+            self.U1.copy_(self.U)
+
     def set_primitive(self, W):
         """Set the state from a primitive-variable array (5, nx+4, ny+4, nz+4) (numpy or tensor)."""
         W = torch.as_tensor(np.asarray(W), dtype=self.dtype, device=self.device)
@@ -1118,7 +1178,8 @@ class Solver:
         qs = q * S_ref
         parts_c = {k: dict(CD=float(v[0] @ e_d / qs), CN=float(v[0] @ cross / qs),
                            C_restore=float(v[1] @ restore_axis / (qs * L_ref)),
-                           CX=float(v[0][0] / qs), CY=float(v[0][1] / qs), CZ=float(v[0][2] / qs))
+                           CX=float(v[0][0] / qs), CY=float(v[0][1] / qs), CZ=float(v[0][2] / qs),
+                           F=np.asarray(v[0], float), M=np.asarray(v[1], float))   # N, N m about x_ref
                    for k, v in part_out.items()}
         return dict(F=F, M=M, F_thin=F_thin, M_thin=M_thin, q_inf=q, parts=parts_c,
                     F_friction=F_fric, CD_friction=float(F_fric @ e_d / qs),

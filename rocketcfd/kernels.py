@@ -90,11 +90,19 @@ def riemann(qL: vec5, qR: vec5, d: int, g: float, hlle: int):
 
 @wp.func
 def lim(a: float, b: float, kind: int):
+    """Limited slope from the two one-sided differences. kind bits 0-1: 0 van Leer, 1 minmod,
+    2 Koren (kappa = 1/3, third-order upwind-biased where smooth); for Koren, a is the
+    difference away from the face and b the one across it."""
     ab = a * b
     if ab <= 0.0:
         return 0.0
-    if kind == 1:
+    k = kind & 3
+    if k == 1:
         return wp.sign(a) * wp.min(wp.abs(a), wp.abs(b))
+    if k == 2:
+        aa = wp.abs(a)
+        bb = wp.abs(b)
+        return wp.sign(a) * wp.min(wp.min(2.0 * bb, (aa + 2.0 * bb) / 3.0), 2.0 * aa)
     return 2.0 * ab / (a + b)
 
 
@@ -109,10 +117,25 @@ def face_flux(qm: vec5, qa: vec5, qb: vec5, qp: vec5, d: int, g: float, order: f
         for c in range(5):
             dC = qb[c] - qa[c]
             qL[c] = qa[c] + 0.5 * order * zl * lim(qa[c] - qm[c], dC, kind)
-            qR[c] = qb[c] - 0.5 * order * zr * lim(dC, qp[c] - qb[c], kind)
+            qR[c] = qb[c] - 0.5 * order * zr * lim(qp[c] - qb[c], dC, kind)
         if qL[0] <= 0.0 or qL[4] <= 0.0 or qR[0] <= 0.0 or qR[4] <= 0.0:
             qL = qa
             qR = qb
+        if (kind & 4) != 0 and hlle == 0:
+            # low-Mach correction (Thornber et al., J. Comput. Phys. 227, 2008): scale the
+            # reconstructed velocity jump by the local Mach number, so the upwind dissipation
+            # falls with Mach number instead of swamping slow flow (stagnation regions, wakes).
+            # Off where the shock switch is on.
+            cL = wp.sqrt(g * qL[4] / qL[0])
+            cR = wp.sqrt(g * qR[4] / qR[0])
+            mL = wp.sqrt(qL[1] * qL[1] + qL[2] * qL[2] + qL[3] * qL[3]) / cL
+            mR = wp.sqrt(qR[1] * qR[1] + qR[2] * qR[2] + qR[3] * qR[3]) / cR
+            z = wp.min(1.0, wp.max(mL, mR))
+            for c in range(1, 4):
+                avg = 0.5 * (qL[c] + qR[c])
+                jmp = 0.5 * z * (qL[c] - qR[c])
+                qL[c] = avg + jmp
+                qR[c] = avg - jmp
     return riemann(qL, qR, d, g, hlle)
 
 
@@ -125,6 +148,39 @@ def wall_flux(q: vec5, d: int, g: float, own_left: int):
     if own_left != 0:
         return riemann(q, m, d, g, 0)
     return riemann(m, q, d, g, 0)
+
+
+@wp.func
+def blk_normal(b: int):
+    """Plate normal packed into bits 8-31 of a blocked-face word (3 x 8 bits, 128 = 0);
+    zero vector if none was stored."""
+    if ((b >> 8) & 16777215) == 0:
+        return wp.vec3(0.0, 0.0, 0.0)
+    return wp.vec3(float((b >> 8) & 255) - 128.0, float((b >> 16) & 255) - 128.0,
+                   float((b >> 24) & 255) - 128.0) / 127.0
+
+
+@wp.func
+def wall_flux_n(q: vec5, d: int, g: float, own_left: int, b: int):
+    """Blocked-face flux using the real plate normal n (from bits 8-31 of b): the wall pressure
+    comes from the velocity normal to the plate, u.n, instead of the axis component, so a
+    plate lying obliquely across the grid (a staircase of blocked faces) does not see the
+    flow sliding along it as an impact. Pressure only, along the face axis; summed over a
+    staircase of faces this gives p * A * n. Falls back to the axis mirror without a normal."""
+    n = blk_normal(b)
+    ln = wp.length(n)
+    if ln < 0.5:
+        return wall_flux(q, d, g, own_left)
+    n = n / ln
+    if (own_left != 0 and n[d] < 0.0) or (own_left == 0 and n[d] > 0.0):
+        n = -n
+    un = q[1] * n[0] + q[2] * n[1] + q[3] * n[2]       # toward the wall
+    m = vec5(q[0], 0.0, 0.0, 0.0, q[4])
+    if own_left != 0:
+        m[1 + d] = un
+    else:
+        m[1 + d] = -un
+    return wall_flux(m, d, g, own_left)
 
 
 # ---------------------------------------------------------------- viscous terms
@@ -422,12 +478,12 @@ def cell_residual(W: wp.array4d(dtype=wp.float32), S: wp.array3d(dtype=wp.int32)
             fl = vec5()
             fr = vec5()
             if bL != 0:
-                fl = wall_flux(q0, d, g, 0)
+                fl = wall_flux_n(q0, d, g, 0, blk[I - di, J - dj, K - dk])
             else:
                 fl = face_flux(qm2, qm1, q0, qp1, d, g, order, kind, hl_l,
                                float(1 - bLL), float(1 - bR))
             if bR != 0:
-                fr = wall_flux(q0, d, g, 1)
+                fr = wall_flux_n(q0, d, g, 1, blk[I, J, K])
             else:
                 fr = face_flux(qm1, q0, qp1, qp2, d, g, order, kind, hl_r,
                                float(1 - bL), float(1 - bRR))
