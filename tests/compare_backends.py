@@ -41,7 +41,7 @@ def main():
         kw, init, steps = case(name)
         out = {}
         for be in ("torch", "warp"):
-            s = Solver(**kw, backend=be, verbose=False)
+            s = Solver(**kw, backend=be, verbose=False, low_mach=False)   # the torch path has no low-Mach fix
             if init:
                 init(s)
             t0 = time.time()

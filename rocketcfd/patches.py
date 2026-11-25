@@ -465,16 +465,14 @@ class PatchGrid:
             wp = self._wp
             dev = s._wdev
             st = s._wp_stream
-            wp.launch(self._gk, dim=G["n"], inputs=[self._wbuf("W"), 5, v["d5"], int(self.sizes[p]),
-                                                    v["s5"], v["sstr"], v["w"]], device=dev, stream=st)
+            s._L(self._gk, G["n"], [self._wbuf("W"), 5, v["d5"], int(self.sizes[p]), v["s5"], v["sstr"], v["w"]])
             if s.turbulence:
                 if "zs" not in G:
                     G["zs"] = torch.zeros_like(G["sstr"])
                     G.pop("_wv", None)
                     v = self._warp_views(G)
                 for name in ("K", "O"):
-                    wp.launch(self._gk, dim=G["n"], inputs=[self._wbuf(name), 1, v["d1"], 0, v["s1"], v["zs"],
-                                                            v["w"]], device=dev, stream=st)
+                    s._L(self._gk, G["n"], [self._wbuf(name), 1, v["d1"], 0, v["s1"], v["zs"], v["w"]])
         return hook
 
     def _wbuf(self, name):
@@ -490,14 +488,11 @@ class PatchGrid:
         for r in self.restrict:
             g, c = r["g"], r["c"]
             v = self._warp_views(r)
-            wp.launch(self._rk, dim=r["n"], inputs=[self._wbuf("U"), 5, v["d5"], int(self.sizes[g]),
-                                                    v["start"], v["s5"], int(self.sizes[c]), v["w"]],
-                      device=s0._wdev, stream=s0._wp_stream)
+            s0._L(self._rk, r["n"], [self._wbuf("U"), 5, v["d5"], int(self.sizes[g]), v["start"], v["s5"],
+                                    int(self.sizes[c]), v["w"]])
             if s0.turbulence:
                 for name in ("K", "O"):
-                    wp.launch(self._rk, dim=r["n"], inputs=[self._wbuf(name), 1, v["d1"], 0,
-                                                            v["start"], v["s1"], 0, v["w"]],
-                              device=s0._wdev, stream=s0._wp_stream)
+                    s0._L(self._rk, r["n"], [self._wbuf(name), 1, v["d1"], 0, v["start"], v["s1"], 0, v["w"]])
 
     # ------------------------------------------------------------ solve
     def run(self, iters, chunk=50, first_order_steps=200, report=None, cfl_max=20.0, cfl_start=1.0,
@@ -617,3 +612,91 @@ class PatchGrid:
     def fields(self, grid=0):
         """Fields of one grid (0 = base, whose covered cells hold the averaged patch solution)."""
         return self.grids[grid].fields()
+
+
+# ---------------------------------------------------------------- solution-adaptive patches
+def feature_cells(solver, threshold=0.05, wall_shell=0.0, field="rho"):
+    """Cells of `solver` (interior) to refine: relative jump of `field` across a cell above
+    `threshold` (shocks, expansion fans, shear layers), and (optionally) fluid cells within
+    `wall_shell` metres of a wall. Returns (centres (3, N), half widths (3, N))."""
+    from .solver import NG
+    W = solver.primitive()
+    q = W[{"rho": 0, "p": 4}[field]]
+    jump = np.zeros_like(q)
+    for d in range(3):
+        if solver.n[d] < 2:
+            continue
+        g = np.gradient(q, solver.axes[d], axis=d)
+        w = solver.widths[d].reshape([-1 if e == d else 1 for e in range(3)])
+        jump = np.maximum(jump, np.abs(g) * w / np.maximum(q, 1e-30))
+    flag = (jump > threshold) & solver.fluid
+    if wall_shell > 0:
+        flag |= solver.fluid & (solver.phi < wall_shell)
+    inner = np.zeros(flag.shape, bool)
+    inner[NG:-NG, NG:-NG, NG:-NG] = True
+    idx = np.nonzero(flag & inner)
+    cen = np.stack([solver.axes[d][idx[d]] for d in range(3)])
+    half = np.stack([0.5 * solver.widths[d][idx[d]] for d in range(3)])
+    return cen, half
+
+
+def cell_patches(base_faces, h, cen, half, box=(48, 48, 48), margin=2, verbose=True):
+    """Patches of cells of size h = (hx, hy, hz) covering the boxes cen +- half (e.g. from
+    feature_cells), clustered on the same lattice and tiling as wall_patches."""
+    base_faces = [np.asarray(f, float) for f in base_faces]
+    lo = np.array([f[0] for f in base_faces])
+    hi = np.array([f[-1] for f in base_faces])
+    h = np.broadcast_to(np.asarray(h, float), (3,))
+    box = np.broadcast_to(np.asarray(box, int), (3,))
+    fine = [_lattice(lo[d], hi[d], h[d]) for d in range(3)]
+    nf = [len(f) - 1 for f in fine]
+    if cen.shape[1] == 0:
+        return []
+    # fine-cell index range of every flagged coarse cell
+    a = [np.clip(np.searchsorted(fine[d], cen[d] - half[d], side="right") - 1 - margin, 0, nf[d] - 1)
+         for d in range(3)]
+    b = [np.clip(np.searchsorted(fine[d], cen[d] + half[d], side="left") + margin, 1, nf[d]) for d in range(3)]
+    tile = [np.minimum(a[d] // box[d], (nf[d] - 1) // box[d]) for d in range(3)]
+    out = []
+    keys = np.stack(tile, 1)
+    order = np.lexsort(keys.T[::-1])
+    keys = keys[order]
+    a = [v[order] for v in a]
+    b = [v[order] for v in b]
+    starts = np.flatnonzero(np.any(np.diff(keys, axis=0) != 0, axis=1)) + 1
+    for grp in np.split(np.arange(keys.shape[0]), starts):
+        t = keys[grp[0]]
+        rng = []
+        for d in range(3):
+            t0, t1 = t[d] * box[d], min((t[d] + 1) * box[d], nf[d])
+            lo_i = max(int(a[d][grp].min()), t0)
+            hi_i = min(int(b[d][grp].max()), t1)
+            if nf[d] == 1:
+                lo_i, hi_i = 0, 1
+            rng.append((lo_i, max(hi_i, lo_i + 1)))
+        out.append([fine[d][rng[d][0]:rng[d][1] + 1].copy() for d in range(3)])
+    if verbose:
+        cells = sum(int(np.prod([len(f) - 1 for f in p])) for p in out)
+        print(f"cell_patches: {len(out)} patches, {cells/1e6:.2f} M cells, cell size {tuple(float(v) for v in h)} m")
+    return out
+
+
+def init_from(new, old):
+    """Initial state of every grid of `new` (PatchGrid or Solver) interpolated from the base
+    grid of `old` (trilinear in primitive variables; k, omega too when turbulent)."""
+    from scipy.ndimage import map_coordinates
+    src = old.base if hasattr(old, "base") else old
+    W = src.primitive()
+    Kt = Ot = None
+    if src.turbulence:
+        Kt = src.K_buf.cpu().numpy().astype(np.float64)
+        Ot = src.O_buf.cpu().numpy().astype(np.float64)
+    grids = new.grids if hasattr(new, "grids") else [new]
+    for g in grids:
+        X = np.meshgrid(*g.axes, indexing="ij")
+        idx = [np.interp(X[d], src.axes[d], np.arange(len(src.axes[d]))) for d in range(3)]
+        Wg = np.stack([map_coordinates(W[c], idx, order=1, mode="nearest") for c in range(5)])
+        g.set_primitive(Wg)
+        if Kt is not None and g.turbulence:
+            g.K_buf.copy_(torch.as_tensor(map_coordinates(Kt, idx, order=1, mode="nearest"), dtype=g.dtype))
+            g.O_buf.copy_(torch.as_tensor(map_coordinates(Ot, idx, order=1, mode="nearest"), dtype=g.dtype))

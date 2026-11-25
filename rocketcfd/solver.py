@@ -44,9 +44,9 @@ def _limit(a, b, kind):
 
 class Solver:
     def __init__(self, lo, hi, h, freestream, sdf=None, gamma=1.4, bcs="auto", cfl=0.7,
-                 limiter="vanleer", shock_threshold=0.5, dtype=torch.float32, device=None,
+                 limiter="koren", shock_threshold=0.5, dtype=torch.float32, device=None,
                  verbose=True, faces=None, backend="auto", thin_sdf=None, thin_box=None,
-                 viscous=None, wall=None, turbulence=None, alloc=None, thin_normals=True, low_mach=False):
+                 viscous=None, wall=None, turbulence=None, alloc=None, thin_normals=True, low_mach="auto"):
         """
         lo, hi     : domain corners (m)
         h          : cell size, scalar or (hx, hy, hz)
@@ -67,10 +67,11 @@ class Solver:
         turbulence : None or dict(model='sst', k_inf=..., omega_inf=...): k-omega SST with a
                      Spalding wall function on immersed walls and thin walls (needs viscous).
                      Defaults: k_inf = 9e-9 a^2, omega_inf = 1e-6 rho a^2 / mu (NASA TMR).
-        limiter    : 'vanleer' (default), 'minmod', or 'koren' (kappa = 1/3 MUSCL, third-order
-                     upwind-biased in smooth regions; warp backend)
-        low_mach   : Thornber et al. (2008) low-Mach correction of the reconstructed velocities
-                     (less dissipation in slow regions; warp backend)
+        limiter    : 'koren' (default: kappa = 1/3 MUSCL, third-order upwind-biased where smooth;
+                     tests/vortex_order.py), 'vanleer' (the earlier default) or 'minmod'
+        low_mach   : Thornber et al. (2008) low-Mach correction of the reconstructed velocities (less
+                     dissipation in slow flow; tests/low_mach_cylinder.py). 'auto' (default) = on for a
+                     subsonic freestream only: behind strong shocks it costs ~2 % stagnation pressure
         thin_normals : thin-wall faces use the real plate normal for the wall pressure (default);
                      False = axis-aligned mirror (staircase), the earlier behaviour
         alloc      : optional callable(name, shape) -> tensor for the state arrays (U, W, K, O);
@@ -637,26 +638,40 @@ class Solver:
         return A[:, NG:-NG, NG:-NG, NG:-NG]
 
     # ------------------------------------------------------------ warp path
+    def _L(self, kernel, dim, inputs):
+        """Warp launch through a cache of recorded launches: the argument packing (tens of us
+        per launch in Python, which dominates many small patches) is done once per distinct set
+        of arrays; later calls only refresh the scalar arguments and replay."""
+        key = (id(kernel), tuple(dim) if isinstance(dim, tuple) else dim,
+               tuple(id(x) for x in inputs if not isinstance(x, (int, float, bool))))
+        cache = self.__dict__.setdefault("_lcache", {})
+        c = cache.get(key)
+        if c is None:
+            c = self._wp.launch(kernel, dim=dim, inputs=inputs, device=self._wdev, stream=self._wp_stream,
+                                record_cmd=True)
+            cache[key] = c
+        else:
+            for i, x in enumerate(inputs):
+                if isinstance(x, (int, float, bool)):
+                    c.set_param_at_index(i, x)
+        c.launch(stream=self._wp_stream)
+
     def _wprim(self, Ukey, tkey=None):
         wp, K, w = self._wp, self._K, self._w
         shape = tuple(self.U.shape[1:])
-        wp.launch(K.prim_kernel, dim=shape, inputs=[w[Ukey], self.gamma, self.rho_min, self.p_min, w["W"]],
-                  device=self._wdev, stream=self._wp_stream)
+        self._L(K.prim_kernel, shape, [w[Ukey], self.gamma, self.rho_min, self.p_min, w["W"]])
         if self._iface is not None:
             self._iface(self)
         self._fill_bc(self.W_buf)
         ib = self._wp_ib
         if ib is not None:
-            wp.launch(K.ib_kernel, dim=ib["n"], inputs=[w["W"], ib["ghost"], ib["corner"], ib["weight"],
-                                                       ib["normal"], int(self.wall == "noslip")],
-                      device=self._wdev, stream=self._wp_stream)
-        wp.launch(K.shock_kernel, dim=shape, inputs=[w["W"], self._active_sensor, self.shock_threshold, w["S"]],
-                  device=self._wdev, stream=self._wp_stream)
+            self._L(K.ib_kernel, ib["n"], [w["W"], ib["ghost"], ib["corner"], ib["weight"],
+                                                       ib["normal"], int(self.wall == "noslip")])
+        self._L(K.shock_kernel, shape, [w["W"], self._active_sensor, self.shock_threshold, w["S"]])
         if self.turbulence:
             kk, oo = (("K", "O") if tkey in (None, "") else (tkey, "O1"))
             self._fill_bc_turb(getattr(self, kk + "_buf"), getattr(self, oo + "_buf"))
-            wp.launch(K.mut_kernel, dim=shape, inputs=[w["W"], w[kk], w[oo], self._vp, self._vp.mut],
-                      device=self._wdev, stream=self._wp_stream)
+            self._L(K.mut_kernel, shape, [w["W"], w[kk], w[oo], self._vp, self._vp.mut])
 
     def _wturb(self, kk, oo, outk, outo, a0, a1, local, dual=None):
         """SST residual on stage state (kk, oo) and point-implicit update into (outk, outo).
@@ -676,12 +691,14 @@ class Solver:
 
     def _wresidual(self, order, tiles=None):
         wp, K, w = self._wp, self._K, self._w
-        kind = {"vanleer": 0, "minmod": 1, "koren": 2}[self.limiter] + (4 if self.low_mach else 0)
+        lm = self.low_mach
+        if lm == "auto":
+            lm = np.linalg.norm(self.W_inf[1:4]) < np.sqrt(self.gamma * self.W_inf[4] / self.W_inf[0])
+        kind = {"vanleer": 0, "minmod": 1, "koren": 2}[self.limiter] + (4 if lm else 0)
         args = [w["W"], w["S"], w["ix"], w["iy"], w["iz"], self._active_flux, self.gamma, float(order), kind, w["blk"],
                 self._vp]
         if tiles is None:
-            wp.launch(K.residual_kernel, dim=self.n, inputs=args + [w["R"]],
-                      device=self._wdev, stream=self._wp_stream)
+            self._L(K.residual_kernel, self.n, args + [w["R"]])
         else:
             wp.launch(K.residual_tiles_kernel, dim=tiles.shape[0] * 512, inputs=args + [tiles, w["R"]],
                       device=self._wdev, stream=self._wp_stream)
@@ -733,8 +750,7 @@ class Solver:
         self._wprim("U")
         self._wresidual(order)
         if dual is not None:
-            wp.launch(K.dual_time_kernel, dim=self.n, inputs=[w["U"], w["Un"], w["Um"], w["R"], w["mask"], *dual],
-                      device=self._wdev, stream=self._wp_stream)
+            self._L(K.dual_time_kernel, self.n, [w["U"], w["Un"], w["Um"], w["R"], w["mask"], *dual])
         res = torch.sqrt(((self.R_buf[0] * self.mask_f) ** 2).sum() / self.n_fluid) if want_res else None
         if self.turbulence:
             # implicit k-omega: residual, then Jacobi sweeps at the turbulence's own local
@@ -743,39 +759,27 @@ class Solver:
                 self.dK2_buf = torch.zeros_like(self.K_buf)
                 self.dO2_buf = torch.zeros_like(self.O_buf)
                 w.update(dK2=wp.from_torch(self.dK2_buf), dO2=wp.from_torch(self.dO2_buf))
-            wp.launch(K.turb_rate_kernel, dim=self.n,
-                      inputs=[w["W"], w["ix"], w["iy"], w["iz"], self._active_flux, self._vp, float(cfl), w["dtl"]],
-                      device=self._wdev, stream=self._wp_stream)
-            wp.launch(K.turb_residual_kernel, dim=self.n,
-                      inputs=[w["W"], w["K"], w["O"], w["ix"], w["iy"], w["iz"], self._active_flux, w["blk"],
-                              self._vp, w["Rk"], w["Rw"], w["Dk"], w["Dw"], w["utau"]],
-                      device=self._wdev, stream=self._wp_stream)
+            self._L(K.turb_rate_kernel, self.n, [w["W"], w["ix"], w["iy"], w["iz"], self._active_flux, self._vp, float(cfl), w["dtl"]])
+            self._L(K.turb_residual_kernel, self.n, [w["W"], w["K"], w["O"], w["ix"], w["iy"], w["iz"], self._active_flux, w["blk"],
+                              self._vp, w["Rk"], w["Rw"], w["Dk"], w["Dw"], w["utau"]])
             if dual is not None:
-                wp.launch(K.dual_time_turb_kernel, dim=self.n,
-                          inputs=[w["Kn"], w["On"], w["Km"], w["Om"], w["Rk"], w["Rw"], w["Dk"], w["Dw"], *dual],
-                          device=self._wdev, stream=self._wp_stream)
+                self._L(K.dual_time_turb_kernel, self.n, [w["Kn"], w["On"], w["Km"], w["Om"], w["Rk"], w["Rw"], w["Dk"], w["Dw"], *dual])
             tb = (("K1", "O1"), ("dK2", "dO2"))
             for it in range(sweeps):
                 (ko, oo), (kn, on) = tb[(it + 1) % 2], tb[it % 2]
-                wp.launch(K.turb_sweep_kernel, dim=self.n,
-                          inputs=[w["W"], w["K"], w["O"], w["Rk"], w["Rw"], w["Dk"], w["Dw"], w["dtl"], self._vp,
+                self._L(K.turb_sweep_kernel, self.n, [w["W"], w["K"], w["O"], w["Rk"], w["Rw"], w["Dk"], w["Dw"], w["dtl"], self._vp,
                                   w["ix"], w["iy"], w["iz"], self._active_flux, w["blk"], int(it == 0),
-                                  w[ko], w[oo], w[kn], w[on]], device=self._wdev, stream=self._wp_stream)
+                                  w[ko], w[oo], w[kn], w[on]])
             kl, ol = tb[(sweeps - 1) % 2]
-            wp.launch(K.turb_apply_kernel, dim=self.n,
-                      inputs=[w["K"], w["O"], w[kl], w[ol], w["W"], self._vp, w["utau"],
-                              1e-6 * self.k_inf, 1e-3 * self.omega_inf], device=self._wdev, stream=self._wp_stream)
+            self._L(K.turb_apply_kernel, self.n, [w["K"], w["O"], w[kl], w[ol], w["W"], self._vp, w["utau"],
+                              1e-6 * self.k_inf, 1e-3 * self.omega_inf])
         bufs = ("U1", "dU2")
         for it in range(sweeps):
             src, dst = w[bufs[(it + 1) % 2]], w[bufs[it % 2]]
-            wp.launch(K.implicit_sweep_kernel, dim=self.n,
-                      inputs=[w["U"], w["W"], w["R"], w["ix"], w["iy"], w["iz"], self._active_flux, w["blk"],
+            self._L(K.implicit_sweep_kernel, self.n, [w["U"], w["W"], w["R"], w["ix"], w["iy"], w["iz"], self._active_flux, w["blk"],
                               w["mask"], self._vp, self.gamma, float(cfl),
-                              0.0 if dual is None else dual[0] * dual[3], int(it == 0), src, dst],
-                      device=self._wdev, stream=self._wp_stream)
-        wp.launch(K.implicit_apply_kernel, dim=self.n,
-                  inputs=[w["U"], w[bufs[(sweeps - 1) % 2]], w["mask"], self.gamma, maxrel],
-                  device=self._wdev, stream=self._wp_stream)
+                              0.0 if dual is None else dual[0] * dual[3], int(it == 0), src, dst])
+        self._L(K.implicit_apply_kernel, self.n, [w["U"], w[bufs[(sweeps - 1) % 2]], w["mask"], self.gamma, maxrel])
         return res
 
     def _refresh_tiles(self, frac):

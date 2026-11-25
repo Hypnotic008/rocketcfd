@@ -36,12 +36,22 @@ guessed aero coefficients in CatchSim (`quatsim/aero.py`).
 | Cylinder, Mach 4: surface pressure | modified Newtonian | matches near stagnation, above it further round (expected) |
 | Cylinder, Mach 4, stretched grid (2.8x fewer cells) | uniform-grid result | standoff within 1 %, stagnation pressure -0.5 % |
 | 1 mm flat plate, Mach 2, 5 deg, plate along the grid (thin walls) | shock-expansion theory | face pressures exact to 4 digits; CN -1.7 % |
-| Same plate tilted across the grid (staircase walls) | shock-expansion theory | CN +10.8 % (100 cells/chord), +7.5 % (200 cells/chord): first-order convergence |
+| Same plate tilted across the grid (staircase of blocked faces) | shock-expansion theory | with the plate normal in the wall flux (default): CN +6.1 % (100 cells/chord), +0.4 % (200); axis-mirror staircase (old): +7.1 %, +2.4 % (implicit, converged) |
 | Warp kernels vs PyTorch reference (Sod, cylinder, 3-D sphere) | identical numerics | max difference 2e-4 (float32) |
 | Viscous shear wave, periodic box (`tests/viscous_shearwave.py`) | exact decay exp(-nu k^2 t) | effective / set viscosity 0.999 (64 cells), 0.987 (16) |
 | Laminar flat plate, Mach 0.4, Re 1e5 (`cases/validate_blasius.py`) | Blasius | skin friction -0.5 % (0.2 < x < 0.8 m), velocity profile within 0.7 % of U |
 | Turbulent flat plate, SST + wall function, Re 1e7 (`cases/validate_turbulent_plate.py`) | White / Schlichting Cf, log law | Cf -6.3 % from White (on Schlichting); first-cell y+ 143; profile on the log law |
 | Same at Re 1e9 (Super Heavy scale, `--re 1e9`) | White Cf, log law | Cf -3.1 % from White with the first cell at y+ 10,700; profile on the log law |
+| Isentropic vortex, one period (`tests/vortex_order.py`) | exact (initial field) | Koren (default): order 2.8, L1 1.2e-4 at 128^2; van Leer: order 2.3, 3.1e-4 |
+| Sod / Mach 4 cylinder with Koren (`tests/limiter_shocks.py`) | exact / Rayleigh pitot | Sod L1 0.00144 (van Leer 0.00172); stagnation pressure +0.3 % (van Leer -1.0 %) |
+| Inviscid cylinder, Mach 0.1 (`tests/low_mach_cylinder.py`) | potential flow: CD 0, rear Cp 1 | low-Mach correction: CD +0.011, rear Cp 1.03; without: CD -0.053, rear Cp 0.69 |
+| Implicit vs explicit, Mach 3 sphere (`tests/steady_accel.py`) | explicit local time step | CD 0.9625 vs 0.9627, 480 vs 2000 steps, 2.5x less wall time (CPU) |
+| Implicit vs explicit, laminar plate (2x coarse grid) | explicit | same Cf (-7.15 %); needs 8 Jacobi sweeps (2 diverge, 4 stall) |
+| Local refinement, laminar plate (`tests/patch_blasius.py`) | one fine grid | friction drag 0.00899 vs 0.00896 (coarse grid alone 0.00967), 68 % of the cells |
+| Local refinement, Mach 3 sphere (`tests/patch_sphere.py`) | one fine grid | CD 0.9666 vs 0.9569 (coarse alone 1.0114), 45 % of the cells |
+| Laminar cylinder Re 100, dual time stepping | St 0.164 | St 0.160 (25 cells/D, 50 steps per period) |
+| Turbulent plate Re 1e7, implicit (`--implicit`) | White Cf | +2.6 % (explicit, converged: -6.2 %): two different converged SST states, see limits |
+| CatchSim drop-in vs the sweep it reads (`tests/catchsim_dropin_check.py`) | the computed cases | identical to 1e-15; mirror rule and centre-of-mass transfer exact |
 
 ## Results so far
 
@@ -226,6 +236,34 @@ python cases/validate_cylinder_turbulent.py --dual --patch-h 0.001 --shell 0.06
 python cases/validate_cylinder_turbulent.py --laminar --re 100 --mach 0.2 --h 0.02 --dual   # laminar shedding check
 ```
 
+### Aero database for CatchSim
+
+`cases/aero_database.py` sweeps Mach x angle of attack x roll attitude in one process: the
+grid is built once (roll turns the crossflow, not the vehicle), every case warm-starts from a
+converged neighbour, the fins are resolved by local refinement patches and the implicit solver
+runs to converged loads. Each case records the body-axis forces and moments, the breakdown by
+region and every fin's forces and hinge moment, appended to `cases.csv` (a stopped sweep
+resumes). At the end it writes `aero_db.json`.
+
+```bash
+python cases/aero_database.py --dry-run                     # grid, patches, memory, case list
+python cases/aero_database.py                               # default: 10 Mach x 6 aoa x 3 roll (GPU, hours)
+python cases/aero_database.py --mach 2.8 1.6 1.1 0.8 --aoa 0 8 16 --roll 0 180 --out results/db_quick
+```
+
+`integrations/catchsim/aero_cfd.py` is a drop-in for CatchSim (copy it into `quatsim/`):
+`CFDAeroModel` replaces `AeroModel` (full CFD force at the actual angle of attack and roll,
+grid fins included), `cfd_restoring_moment` replaces `restoring_moment` (full CFD moment about
+the centre of mass, plus CatchSim's pitch damping). It reads `aero_db.json`; the V3 layout's
+mirror symmetry fills roll angles 180-360. `tests/catchsim_dropin_check.py <out dir>` checks it
+reproduces every computed case.
+
+### Checking a machine
+
+```bash
+python tests/run_checks.py      # quick verification cases with PASS / FAIL
+```
+
 ### Sizing for the GPU
 
 Measured on an RTX 4050 Laptop GPU: about 0.46 KB per cell with the PyTorch path, so 6 GB holds ~11 M cells.
@@ -274,6 +312,15 @@ What a booster run writes (in its `--out` folder):
 The viewer adds Q-criterion vortex surfaces (`v`) and friction lines (`l`).
 
 ## Limits of this milestone (read before using numbers)
+
+* **Turbulent plate: implicit and explicit converge to different states** (Cf +2.6 % vs -6.2 % from
+  White at Re 1e7). Both residuals settle; the likely cause is SST's sensitivity to where the
+  boundary layer turns turbulent near the leading edge at low freestream turbulence, which the
+  path to convergence can change. Unresolved; check before trusting viscous drag to better than ~10 %.
+* **Experimental grid-fin data not yet used.** The wind-tunnel reports with isolated grid-fin normal
+  force vs Mach (e.g. Washington & Miller 1993; DTIC ADA383925 / ADA388765; the Orion LAS grid-fin
+  tests on NTRS) could not be downloaded from the development container. Validating the fin model
+  against one of them is the next accuracy step for the fins.
 
 * **Turbulence needs a resolved boundary layer for smooth-body separation.** SST + wall function
   gets skin friction right (flat plate within 3 % at Re 1e9) but a cylinder at Re 1e7 with

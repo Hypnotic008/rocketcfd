@@ -209,7 +209,22 @@ def main(argv=None):
                 runner.set_state(src)
             runner.set_freestream(fs, keep_state=True)
         print(f"\n=== M {m}  aoa {al}  roll {r}  ({'cold start' if cold else 'warm start'}) ===", flush=True)
-        tail, info = solve_case(runner, a, parts, cold)
+        try:
+            tail, info = solve_case(runner, a, parts, cold)
+        except FloatingPointError as e:
+            # retry from a uniform start at a lower CFL before giving up on this case
+            print(f"    diverged ({e}); retrying cold at CFL {a.cfl_max / 4:g}", flush=True)
+            runner.set_freestream(fs, keep_state=False)
+            cfl0, a.cfl_max = a.cfl_max, a.cfl_max / 4
+            try:
+                tail, info = solve_case(runner, a, parts, True)
+            except FloatingPointError as e2:
+                print(f"    diverged again ({e2}); case skipped", flush=True)
+                runner.set_freestream(fs, keep_state=False)
+                last = None
+                a.cfl_max = cfl0
+                continue
+            a.cfl_max = cfl0
         row = dict(mach=m, aoa=al, roll=r, alt=a.alt, **info, **averaged(tail, P))
         rows.append(row)
         if al == 0.0:
