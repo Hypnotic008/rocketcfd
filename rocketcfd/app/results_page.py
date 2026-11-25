@@ -30,19 +30,11 @@ class Scene:
         self.pv = pv
         self.folder = folder
         self.meta = read_json(os.path.join(folder, "loads.json")) or {}
-        self.flow = None
         self.surface = None
-        self.patches = None
-        fpath = os.path.join(folder, "flow.vtk")
-        if os.path.exists(fpath):
-            self.flow = pv.read(fpath)
-            if "velocity" in self.flow.point_data and "phi" in self.flow.point_data:
-                v = np.array(self.flow.point_data["velocity"])
-                v[np.asarray(self.flow.point_data["phi"]) < 0] = 0.0
-                self.flow.point_data["velocity"] = v
-        vtm = os.path.join(folder, "flow_patches.vtm")
-        if os.path.exists(vtm):
-            self.patches = pv.read(vtm)
+        from ..flowdata import FlowData
+        self.fd = FlowData(folder, _freestream(self.meta))       # base grid + refinement patches
+        self.flow = self.fd.base
+        self.patches = self.fd.patches
         spath = os.path.join(folder, "surface_cp.vtk")
         if os.path.exists(spath):
             self.surface = pv.read(spath)
@@ -63,11 +55,10 @@ class Scene:
         """Make sure the field exists on the flow grid (computing derived fields on demand)."""
         if self.flow is None:
             return False
-        if name in self.flow.point_data:
+        if name in self.flow.point_data and all(name in g.point_data for g in self.patches):
             return True
-        if name in DERIVED:
-            derived.add_to_grid(self.flow, [name], freestream=self.fs)
-            return name in self.flow.point_data
+        if name in DERIVED or name in self.flow.point_data:
+            return self.fd.ensure(name)
         return False
 
     def bounds(self):
@@ -451,7 +442,7 @@ class ResultsPage(QtWidgets.QWidget):
                                               scalar_bar_args=self._sargs("Cp (surface)"), render=False))
         elif mode.startswith("same") and s.flow is not None:
             name = self.field.currentText()
-            body = s.surface.sample(s.flow) if name not in s.surface.point_data else s.surface
+            body = s.fd.sample_onto(s.surface) if name not in s.surface.point_data else s.surface
             acts.append(self.plotter.add_mesh(body, scalars=name, cmap=self.cmap.currentText(), clim=self._clim(),
                                               opacity=op, smooth_shading=True, show_scalar_bar=False, render=False))
         else:
@@ -499,7 +490,7 @@ class ResultsPage(QtWidgets.QWidget):
             return
         cmap, clim = self._field_style(name)
         normal, origin = self._slice_geom()
-        sl = s.flow.slice(normal=normal, origin=origin)
+        sl = s.fd.slice(normal, origin)       # finest grid in each region
         if "phi" in sl.point_data:
             sl = sl.threshold(0.0, scalars="phi") if np.any(np.asarray(sl.point_data["phi"]) < 0) else sl
         acts = [self.plotter.add_mesh(sl, scalars=name, cmap=cmap, clim=clim,
@@ -527,14 +518,14 @@ class ResultsPage(QtWidgets.QWidget):
         name = self.iso_f.currentText()
         if not s.ensure(name):
             return
-        iso = s.flow.contour([self.iso_v.value()], scalars=name)
+        iso = s.fd.contour(self.iso_v.value(), name)
         if iso.n_points == 0:
             return
         if self.iso_col.isChecked():
             col = self.field.currentText()
             s.ensure(col)
             if col not in iso.point_data:
-                iso = iso.sample(s.flow)
+                iso = s.fd.sample_onto(iso)
             act = self.plotter.add_mesh(iso, scalars=col, cmap=self.cmap.currentText(), clim=self._clim(),
                                         opacity=self.iso_op.value() / 100.0, smooth_shading=True,
                                         show_scalar_bar=False, render=False)
@@ -595,7 +586,7 @@ class ResultsPage(QtWidgets.QWidget):
         h = ext.max() / n
         dims = np.maximum((ext / h).astype(int) + 1, 2)
         img = pv.ImageData(dimensions=dims, spacing=(h, h, h), origin=(b[0], b[2], b[4]))
-        img = img.sample(s.flow)
+        img = s.fd.sample_onto(img)
         a = np.asarray(img.point_data[name], float)
         a[~np.isfinite(a)] = clim[0]
         img.point_data[name] = a

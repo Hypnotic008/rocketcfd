@@ -328,7 +328,9 @@ def main(argv=None):
     with open(f"{a.out}/loads.json", "w") as fh:
         json.dump(res, fh, indent=2, default=float)
 
-    f = s.fields()
+    f = runner.fields(0) if patches else s.fields()
+    if patches:
+        runner.write_patches_vtm(f"{a.out}/flow_patches.vtm")
     title = (f"Super Heavy V3, engines-first descent: alt {a.alt/1e3:.1f} km, M {a.mach}, "
              f"{a.aoa} deg off engines-first, windward {a.windward:g} deg, fins={a.fins}"
              f"{'' if which == 'all' else ', chines=' + which}, h={a.h} m{' uniform' if a.uniform else ' near body'}"

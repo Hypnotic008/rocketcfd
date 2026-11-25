@@ -56,7 +56,7 @@ def result_folders():
         if depth > 2:
             dirs[:] = []
             continue
-        if any(f in files for f in ("flow.vtk", "flow.vtm", "surface_cp.vtk", "loads.json", "cases.csv")) or \
+        if any(f in files for f in ("flow.vtk", "flow_patches.vtm", "surface_cp.vtk", "loads.json", "cases.csv")) or \
                 os.path.isdir(os.path.join(root, "snapshots")):
             out.append(root)
     out.sort(key=lambda p: -os.path.getmtime(p))

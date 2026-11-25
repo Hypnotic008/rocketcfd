@@ -766,8 +766,30 @@ class PatchGrid:
         return tot
 
     def fields(self, grid=0):
-        """Fields of one grid (0 = base, whose covered cells hold the averaged patch solution)."""
-        return self.grids[grid].fields()
+        """Fields of one grid (0 = base, whose covered cells hold the averaged patch solution).
+        'covered' = 1 where a finer grid owns the cell (for visualisation: draw it from there)."""
+        f = self.grids[grid].fields()
+        own = self.grids[grid].owned
+        if own is not None:
+            f["covered"] = 1.0 - np.asarray(own)[NG:-NG, NG:-NG, NG:-NG]
+        return f
+
+    def write_patches_vtm(self, path, fields=("rho", "p", "mach", "phi", "mut", "k", "covered")):
+        """All patch grids (not the base) as one VTK multiblock file, each with its 'covered' mask,
+        so viewers can draw every region from the finest grid there (rocketcfd.app, cinematic)."""
+        import pyvista as pv
+        mb = pv.MultiBlock()
+        for gi in range(1, len(self.grids)):
+            f = self.fields(gi)
+            g = pv.RectilinearGrid(f["x"], f["y"], f["z"])
+            for n in fields:
+                if n in f:
+                    g.point_data[n] = np.ascontiguousarray(f[n].transpose(2, 1, 0)).reshape(-1).astype(np.float32)
+            vel = np.stack([f["u"], f["v"], f["w"]], -1).transpose(2, 1, 0, 3).reshape(-1, 3)
+            g.point_data["velocity"] = vel.astype(np.float32)
+            mb.append(g, f"patch_{gi}")
+        mb.save(path)
+        return path
 
 
 # ---------------------------------------------------------------- solution-adaptive patches

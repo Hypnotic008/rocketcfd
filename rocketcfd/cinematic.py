@@ -22,6 +22,7 @@ import numpy as np
 import pyvista as pv
 
 from . import derived
+from .flowdata import FlowData
 
 STYLES = ("lava", "schlieren", "mach", "pressure")
 
@@ -48,7 +49,6 @@ def _snap_grid(mesh, snap):
 
 
 def load_steady(folder):
-    g = pv.read(os.path.join(folder, "flow.vtk"))
     meta = {}
     mp = os.path.join(folder, "loads.json")
     if os.path.exists(mp):
@@ -56,12 +56,13 @@ def load_steady(folder):
             meta = json.load(fh)
     c = meta.get("condition") or {}
     fs = dict(rho=c["rho"], p=c["p"], u=c["V"], v=0.0, w=0.0) if {"rho", "p", "V"} <= set(c) else None
+    g = FlowData(folder, fs)                   # base grid + refinement patches (finest wins)
     surf = None
     sp = os.path.join(folder, "surface_cp.vtk")
     if os.path.exists(sp):
         surf = pv.read(sp)
-    elif "phi" in g.point_data:
-        surf = g.contour([0.0], scalars="phi")
+    elif "phi" in g.base.point_data:
+        surf = g.base.contour([0.0], scalars="phi")
     return g, surf, fs
 
 
@@ -76,25 +77,25 @@ def _surface_from_mesh(mesh, cp=None):
 
 # ---------------------------------------------------------------- scene
 def auto_q(g, frac=0.985):
-    q = np.asarray(g.point_data["Q"])
+    q = g.values("Q") if isinstance(g, FlowData) else np.asarray(g.point_data["Q"])
     pos = q[q > 0]
     return float(np.quantile(pos, frac)) if pos.size else 0.0
 
 
 def build(pl, flow, surf, style, q_level=None, plane_y=None, mach_range=None, cp_range=(-1.0, 1.0), fs=None,
           plane_axis=1):
-    """Add the actors for one frame. Returns the Q level used."""
-    names = ["schlieren", "Q"] if style != "pressure" else []
-    if "Q" not in flow.point_data or "schlieren" not in flow.point_data:
-        derived.add_to_grid(flow, names or ["schlieren"], freestream=fs)
-    mrange = mach_range or [0.0, float(np.nanpercentile(np.asarray(flow.point_data["mach"]), 99.5))]
-    b = flow.bounds
+    """Add the actors for one frame. Returns the Q level used. flow: a FlowData or one grid."""
+    fd = flow if isinstance(flow, FlowData) else FlowData.from_grid(flow, fs)
+    for n in (["schlieren", "Q"] if style != "pressure" else ["schlieren"]):
+        fd.ensure(n)
+    mrange = mach_range or [0.0, float(np.nanpercentile(fd.values("mach"), 99.5))]
+    b = fd.bounds()
     # the plane: through the axis (or at plane_y), cut by the body
     normal = [0, 0, 0]
     normal[plane_axis] = 1
     origin = [(b[0] + b[1]) / 2, (b[2] + b[3]) / 2, (b[4] + b[5]) / 2]
     origin[plane_axis] = 0.0 if plane_y is None else plane_y
-    sl = flow.slice(normal=normal, origin=origin)
+    sl = fd.slice(normal, origin)
     if surf is not None and surf.n_points:          # frame the plane around the vehicle
         sb = surf.bounds
         L = max(sb[1] - sb[0], sb[3] - sb[2], sb[5] - sb[4])
@@ -112,12 +113,12 @@ def build(pl, flow, surf, style, q_level=None, plane_y=None, mach_range=None, cp
                                          position_y=0.2, height=0.6, width=0.03, fmt="%.2f"))
     ql = q_level
     if style in ("lava", "mach"):
-        ql = q_level if q_level is not None else auto_q(flow)
+        ql = q_level if q_level is not None else auto_q(fd)
         if ql > 0:
-            iso = flow.contour([ql], scalars="Q")
+            iso = fd.contour(ql, "Q")
             if iso.n_points:
                 if "mach" not in iso.point_data:
-                    iso = iso.sample(flow)
+                    iso = fd.sample_onto(iso)
                 iso = iso.smooth(n_iter=20) if iso.n_points < 3_000_000 else iso
                 pl.add_mesh(iso, scalars="mach", cmap="turbo", clim=mrange, smooth_shading=True,
                             specular=0.5, specular_power=25, show_scalar_bar=(style == "lava"),
@@ -169,7 +170,7 @@ def render_still(folder, out, style="lava", width=1920, height=1080, q=None, tit
     flow, surf, fs = load_steady(folder)
     pl = setup_plotter(width, height)
     build(pl, flow, surf, style, q_level=q, fs=fs)
-    bb = surf.bounds if surf is not None else flow.bounds
+    bb = surf.bounds if surf is not None else flow.bounds()
     pl.camera_position = camera or orbit_cameras(1, bb, start_deg=-35, sweep_deg=0)[0]
     title_text(pl, title)
     pl.screenshot(out)
@@ -182,7 +183,7 @@ def render_orbit(folder, out, style="lava", width=1920, height=1080, frames=240,
     pl = setup_plotter(width, height)
     build(pl, flow, surf, style, q_level=q, fs=fs)
     title_text(pl, title)
-    bb = surf.bounds if surf is not None else flow.bounds
+    bb = surf.bounds if surf is not None else flow.bounds()
     pl.open_movie(out, framerate=fps, quality=8)
     for cam in orbit_cameras(frames, bb):
         pl.camera_position = cam
