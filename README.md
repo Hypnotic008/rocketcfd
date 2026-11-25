@@ -443,6 +443,14 @@ python cases/super_heavy_descent.py --mach 0.4 --alt 2000 --aoa 0 --h 0.3 --fins
 python -m rocketcfd.cinematic results/landing_burn --mode orbit --style mach
 ```
 
+## Restarts
+
+Every booster run writes `restart.npz` (all grids, with k and omega). `--restart <folder>` starts a
+new run from it: on the same grids it continues exactly; on other grids or with other physics the
+fields are interpolated from the finest old grid at each point. Useful for continuing a run that
+stopped early, refining a converged run, or starting `--les` / `--turbulent` from a converged
+inviscid solution (which skips most of the start-up).
+
 ## Probes: time histories and spectra
 
 `--probes` records rho, u, v, w, p every step at points in the wake, beside the hull, behind the

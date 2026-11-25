@@ -110,6 +110,9 @@ def main(argv=None):
     ap.add_argument("--steps", type=int, default=0, help="override step count")
     ap.add_argument("--out", default="results/sh_descent")
     ap.add_argument("--x64", action="store_true", help="double precision")
+    ap.add_argument("--restart", default="",
+                    help="start from a previous run's restart.npz (or its folder): same grid = continue exactly; "
+                         "other grid / physics = interpolated start (e.g. LES or RANS from a converged inviscid run)")
     a = ap.parse_args(argv)
     if a.les:
         # LES is unsteady: physical time steps, explicit, and the run never stops early (the
@@ -226,6 +229,9 @@ def main(argv=None):
             g_.jet_throttle = a.throttle
     if s.n_ib_fallback:
         print(f"note: {s.n_ib_fallback} ghost cells used nearest-fluid fallback (thin features)")
+    if a.restart:
+        from rocketcfd import restart
+        restart.load(runner, a.restart)
 
     # steps for the requested number of flow-throughs (estimated from the freestream)
     cs = c
@@ -372,7 +378,8 @@ def main(argv=None):
     plot_slices(f, f"{a.out}/slice_xz.png", title=title + "  [x-z plane: rudder fin +z]", p_inf=p, normal_axis=1)
     plot_slices(f, f"{a.out}/slice_xy.png", title=title + "  [x-y plane: catch fins]", p_inf=p, normal_axis=2)
     write_vtk(f, f"{a.out}/flow.vtk")
-    s.save(f"{a.out}/restart.npz")
+    from rocketcfd import restart as _rs
+    _rs.save(runner, f"{a.out}/restart.npz")
 
     # cross-section stations and 3-D surface pressure
     from rocketcfd.visual3d import plot_stations, surface_pressure, write_vtk_surface, render_surface, \

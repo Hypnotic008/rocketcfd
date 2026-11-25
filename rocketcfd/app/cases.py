@@ -101,6 +101,9 @@ def _sh_fields():
               "wake, beside the hull, behind the fins and at the engine end (Plots -> Probes: history and "
               "spectrum). For unsteady / LES runs.", G6),
         Field("probe-points", "Extra probe points", "text", "", 'e.g. "75,0,0; 80,0,3" (x,y,z in m)', G6, advanced=True),
+        Field("restart", "Start from run (folder)", "text", "", "A previous run's results folder: same grid = "
+              "continue it; other grid or physics = interpolated start (e.g. LES or RANS from a converged "
+              "inviscid run, which skips most of the start-up).", G5),
         Field("x64", "Double precision", "bool", False, "", G6, advanced=True),
         Field("out", "Results folder", "text", "results/sh_descent", "", G6, always=True),
     ]
@@ -120,7 +123,8 @@ SUPER_HEAVY = Case(
                                                         **{"fin-h": 0.06, "engine-h": 0.06, "wall-h": "0.25,0.03,0.03",
                                                            "wall-shell": 0.3, "patch-box": "32,48,48"}),
         "Landing burn plume (3 engines, subsonic)": dict(mach=0.4, alt=2000.0, aoa=0.0, h=0.3, engines="centre",
-                                                         implicit=True, iters=3000, fins="parametric"),
+                                                         implicit=True, iters=3000, fins="parametric",
+                                                         **{"engine-h": 0.1}),
         "Movie: unsteady LES wake": dict(h=0.3, fins="parametric", les=True, **{"time-accurate": True,
                                          "snapshots": 200, "snap-volume": 1, "fin-h": 0.0, "probes": True}, aoa=15.0,
                                          windward=0.0),
