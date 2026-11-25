@@ -74,6 +74,8 @@ def _sh_fields():
         Field("wall-h", "Hull shell patch cells hx,hy,hz [m]", "text", "", "Viscous runs: fine cells across the "
               "hull wall, e.g. 0.25,0.03,0.03 (blank = off).", G4, advanced=True),
         Field("wall-shell", "Hull shell thickness [m]", "float", 0.45, "", G4, lo=0.05, hi=3, advanced=True),
+        Field("patch-box", "Max patch size (cells x,y,z)", "text", "32,96,96", "Smaller boxes hug thin shells "
+              "tighter (fewer cells) but make more patches.", G4, advanced=True),
         Field("turbulent", "Viscous turbulent (RANS k-omega SST)", "bool", False, "Viscous air with the SST model and "
               "a wall function. Off = inviscid (Euler).", G5),
         Field("les", "Unsteady LES (wall-modelled)", "bool", False, "Time-accurate large-eddy simulation with the "
@@ -114,8 +116,9 @@ SUPER_HEAVY = Case(
         "Quick look (body only, coarse)": dict(h=0.5, fins="none", implicit=True, iters=1500),
         "Glide with fins (inviscid, patches)": dict(h=0.3, fins="parametric", **{"fin-h": 0.06, "engine-h": 0.06},
                                                    aoa=15.0, windward=0.0, iters=4000),
-        "Peak-q, viscous RANS": dict(h=0.3, fins="parametric", turbulent=True, **{"fin-h": 0.06, "engine-h": 0.06,
-                                                                                  "wall-h": "0.25,0.03,0.03"}),
+        "Peak-q, viscous RANS (22 M cells, ~4 GB)": dict(h=0.3, fins="parametric", turbulent=True, aoa=15.0, windward=0.0,
+                                                        **{"fin-h": 0.06, "engine-h": 0.06, "wall-h": "0.25,0.03,0.03",
+                                                           "wall-shell": 0.3, "patch-box": "32,48,48"}),
         "Landing burn plume (3 engines, subsonic)": dict(mach=0.4, alt=2000.0, aoa=0.0, h=0.3, engines="centre",
                                                          implicit=True, iters=3000, fins="parametric"),
         "Movie: unsteady LES wake": dict(h=0.3, fins="parametric", les=True, **{"time-accurate": True,
