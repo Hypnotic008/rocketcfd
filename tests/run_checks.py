@@ -39,9 +39,10 @@ def check_low_mach():
     import low_mach_cylinder as lm
     cd0, _, cpr0, _, rms0 = lm.run(0.1, False)
     cd1, _, cpr1, _, rms1 = lm.run(0.1, True)
-    ok = abs(cd0) < 0.03 and rms1 < rms0
-    return ok, (f"Mach 0.1 cylinder (exact: CD 0, rear Cp 1): default CD {cd0:+.4f}, rear Cp {cpr0:.3f}, rms Cp error "
-                f"{rms0:.3f}; low_mach=True option: CD {cd1:+.4f}, rear Cp {cpr1:.3f}, rms {rms1:.3f}")
+    ok = abs(cd1) < abs(cd0) and abs(cpr1 - 1.0) < abs(cpr0 - 1.0) and abs(cd1) < 0.03
+    return ok, (f"Mach 0.1 cylinder (exact: CD 0, rear Cp 1): without the low-Mach correction CD {cd0:+.4f}, rear Cp "
+                f"{cpr0:.3f}, rms Cp error {rms0:.3f}; with it (default for subsonic flow) CD {cd1:+.4f}, rear Cp "
+                f"{cpr1:.3f}, rms {rms1:.3f}")
 
 
 def check_shocks():

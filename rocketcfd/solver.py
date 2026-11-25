@@ -67,7 +67,7 @@ class Solver:
     def __init__(self, lo, hi, h, freestream, sdf=None, gamma=1.4, bcs="auto", cfl=0.7,
                  limiter="koren", shock_threshold=0.5, dtype=torch.float32, device=None,
                  verbose=True, faces=None, backend="auto", thin_sdf=None, thin_box=None,
-                 viscous=None, wall=None, turbulence=None, alloc=None, thin_normals=True, low_mach=False):
+                 viscous=None, wall=None, turbulence=None, alloc=None, thin_normals=True, low_mach="auto"):
         """
         lo, hi     : domain corners (m)
         h          : cell size, scalar or (hx, hy, hz)
@@ -91,10 +91,9 @@ class Solver:
         limiter    : 'koren' (default: kappa = 1/3 MUSCL, third-order upwind-biased where smooth;
                      tests/vortex_order.py), 'vanleer' (the earlier default) or 'minmod'
         low_mach   : Thornber et al. (2008) low-Mach correction of the reconstructed velocities (less
-                     dissipation in slow flow; tests/low_mach_cylinder.py). Off by default: with Koren and
-                     the linear-extrapolation ghost cells it lowers the surface-pressure error at Mach 0.1
-                     (rms 0.069 vs 0.087) but raises the spurious drag (0.027 vs 0.002). True / 'auto'
-                     (on for a subsonic freestream) to use it
+                     dissipation in slow flow; tests/low_mach_cylinder.py: Mach 0.1 cylinder drag +0.010
+                     vs -0.037 without, rear stagnation Cp 1.07 vs 0.69). 'auto' (default) = on for a
+                     subsonic freestream only: behind strong shocks it costs ~2 % stagnation pressure
         thin_normals : thin-wall faces use the real plate normal for the wall pressure (default);
                      False = axis-aligned mirror (staircase), the earlier behaviour
         alloc      : optional callable(name, shape) -> tensor for the state arrays (U, W, K, O);
