@@ -69,13 +69,16 @@ class Solver:
             v = dict(model="sutherland", mu=1.716e-5, T0=273.15, S=110.4, R=287.05, Pr=0.72)
             v.update(viscous)
             self.viscous = v
-        self.wall = wall or ("noslip" if self.viscous else "slip")
         self.turbulence = None
         if turbulence is not None:
             if self.viscous is None:
                 raise ValueError("turbulence needs viscous=...")
             self.turbulence = dict(model="sst")
             self.turbulence.update(turbulence)
+        # With the wall function the wall shear comes from the law of the wall, so immersed-wall
+        # ghost cells mirror the velocity as a slip wall (a no-slip mirror would put a spurious
+        # steep gradient into the first cell's strain rate and turbulence production).
+        self.wall = wall or ("slip" if self.turbulence else "noslip" if self.viscous else "slip")
         self.shock_threshold = shock_threshold
         self.dtype = dtype
         self.device = torch.device(device) if device is not None else default_device()

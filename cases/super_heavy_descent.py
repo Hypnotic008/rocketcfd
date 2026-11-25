@@ -58,6 +58,8 @@ def main(argv=None):
                          "lattice spacing near the fins, e.g. --h-fins 0.03)")
     ap.add_argument("--fin-deflection", type=float, nargs=3, default=(0.0, 0.0, 0.0))
     ap.add_argument("--no-chines", action="store_true", help="remove all four chines (to isolate their effect)")
+    ap.add_argument("--turbulent", action="store_true",
+                    help="viscous air (Sutherland) with k-omega SST and the wall function (default: inviscid)")
     ap.add_argument("--chines", choices=["all", "tall", "short", "none"], default="all",
                     help="which chines to fit: tall = the raceway-side pair, short = the rudder-side pair")
     ap.add_argument("--flowthroughs", type=float, default=4.0, help="maximum run length")
@@ -119,13 +121,16 @@ def main(argv=None):
             n = np.prod([len(f) - 1 for f in faces])
             try:
                 import warp  # noqa: F401
-                per, what = 115, "Warp kernels"
+                per, what = (175, "Warp kernels + SST") if a.turbulent else (115, "Warp kernels")
             except ImportError:
                 per, what = 500, "PyTorch path"
             print(f"estimated GPU memory ~{n * per / 2**30:.1f} GB ({what}, ~{per} B/cell); "
                   f"setup needs ~{n * 120 / 2**30:.0f} GB of system RAM")
             return None
-    s = Solver(lo, hi, a.h, fs, sdf=sdf, cfl=0.7, dtype=dtype, faces=faces, thin_sdf=thin_sdf, thin_box=thin_box)
+    visc = dict(model="sutherland") if a.turbulent else None
+    turb = dict(model="sst") if a.turbulent else None
+    s = Solver(lo, hi, a.h, fs, sdf=sdf, cfl=0.7, dtype=dtype, faces=faces, thin_sdf=thin_sdf, thin_box=thin_box,
+               viscous=visc, turbulence=turb)
     if s.n_ib_fallback:
         print(f"note: {s.n_ib_fallback} ghost cells used nearest-fluid fallback (thin features)")
 
@@ -216,7 +221,8 @@ def main(argv=None):
     f = s.fields()
     title = (f"Super Heavy V3, engines-first descent: alt {a.alt/1e3:.1f} km, M {a.mach}, "
              f"{a.aoa} deg off engines-first, windward {a.windward:g} deg, fins={a.fins}"
-             f"{'' if which == 'all' else ', chines=' + which}, h={a.h} m{' uniform' if a.uniform else ' near body'}")
+             f"{'' if which == 'all' else ', chines=' + which}, h={a.h} m{' uniform' if a.uniform else ' near body'}"
+             f"{', SST turbulent' if a.turbulent else ', inviscid'}")
     plot_slices(f, f"{a.out}/slice_xz.png", title=title + "  [x-z plane: rudder fin +z]", p_inf=p, normal_axis=1)
     plot_slices(f, f"{a.out}/slice_xy.png", title=title + "  [x-y plane: catch fins]", p_inf=p, normal_axis=2)
     write_vtk(f, f"{a.out}/flow.vtk")

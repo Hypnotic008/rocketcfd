@@ -36,6 +36,8 @@ guessed aero coefficients in CatchSim (`quatsim/aero.py`).
 | Warp kernels vs PyTorch reference (Sod, cylinder, 3-D sphere) | identical numerics | max difference 2e-4 (float32) |
 | Viscous shear wave, periodic box (`tests/viscous_shearwave.py`) | exact decay exp(-nu k^2 t) | effective / set viscosity 0.999 (64 cells), 0.987 (16) |
 | Laminar flat plate, Mach 0.4, Re 1e5 (`cases/validate_blasius.py`) | Blasius | skin friction -0.5 % (0.2 < x < 0.8 m), velocity profile within 0.7 % of U |
+| Turbulent flat plate, SST + wall function, Re 1e7 (`cases/validate_turbulent_plate.py`) | White / Schlichting Cf, log law | Cf -6.3 % from White (on Schlichting); first-cell y+ 143; profile on the log law |
+| Same at Re 1e9 (Super Heavy scale, `--re 1e9`) | White Cf, log law | Cf -3.1 % from White with the first cell at y+ 10,700; profile on the log law |
 
 ## Results so far
 
