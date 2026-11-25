@@ -125,7 +125,27 @@ Per fin (restoring moment): catch fins +0.0245 each, rudder fin +0.010.
 * The tower side is a low-energy, vortical leeward region from x ~ 12 m to the top: a fin there
   would see much less dynamic pressure. The taller (tower-side) chines shed vortices there.
 * Glide lift-to-drag ~0.2 (CL ~0.73 from CN and CA); the hull carries 3/4 of the normal force.
-* Next: the same with the tower side windward (`--windward 180`) and without chines (`--no-chines`).
+
+Same condition with the **tower side** into the wind (`--windward 180`):
+
+| | rudder side windward | tower side windward |
+|---|---|---|
+| CN (lift) | 1.62 | 1.50 |
+| CD | 3.53 | 3.52 |
+| restoring moment | **+0.011 (stable)** | **-0.059 (unstable)** |
+| rudder fin | +0.010 | -0.002 (in the leeward wake) |
+| each catch fin | +0.0245 | +0.0248 |
+| fin band | +0.109 | +0.054 |
+| engine end | -0.066 | -0.088 |
+
+* Stability depends on **roll attitude**: stable with the rudder side windward, unstable with
+  the tower side windward. CatchSim's axisymmetric aero model cannot represent this.
+* The rudder fin only works on the windward side; in the leeward wake it does nothing.
+* The catch fins (at +/-y, symmetric to the crossflow either way) give the same moment in both
+  runs, a consistency check on the comparison.
+* With the rudder side windward the hull beside the fins adds ~+0.05 (rudder fin / pod raising
+  the pressure on the hull ahead of them); with the tower side windward it does not.
+* Next: rudder side windward without chines (`--no-chines`) to isolate the chines.
 
 ## Running
 
