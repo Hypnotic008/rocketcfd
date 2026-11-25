@@ -139,6 +139,26 @@ class Visc:
     cx: wp.array(dtype=wp.float32)  # padded cell-centre coordinates
     cy: wp.array(dtype=wp.float32)
     cz: wp.array(dtype=wp.float32)
+    turb: int                      # 1: k-omega SST eddy viscosity + wall function
+    mut: wp.array3d(dtype=wp.float32)    # eddy viscosity (padded)
+    dist: wp.array3d(dtype=wp.float32)   # wall distance (padded; large far from walls)
+    fluid: wp.array3d(dtype=wp.float32)  # 1 in fluid cells (padded)
+
+
+# SST constants (Menter 2003) and log law
+BSTAR = wp.constant(0.09)
+KAPPA = wp.constant(0.41)
+A1 = wp.constant(0.31)
+SK1 = wp.constant(0.85)
+SK2 = wp.constant(1.0)
+SW1 = wp.constant(0.5)
+SW2 = wp.constant(0.856)
+BETA1 = wp.constant(0.075)
+BETA2 = wp.constant(0.0828)
+GAM1 = wp.constant(0.5532)
+GAM2 = wp.constant(0.4404)
+PRT = wp.constant(0.9)
+BLOG = wp.constant(5.0)
 
 
 @wp.func
@@ -207,8 +227,12 @@ def mu_of(vp: Visc, T: float):
 def visc_flux(W: wp.array4d(dtype=wp.float32), vp: Visc, g: float, ia: int, ja: int, ka: int,
               ib: int, jb: int, kb: int, d: int):
     """Viscous flux (stress and heat conduction) through the face between A and B = A + e_d."""
-    mu = 0.5 * (mu_of(vp, qcomp(W, ia, ja, ka, 3, vp.R)) + mu_of(vp, qcomp(W, ib, jb, kb, 3, vp.R)))
-    kcond = mu * g * vp.R / ((g - 1.0) * vp.Pr)
+    mul = 0.5 * (mu_of(vp, qcomp(W, ia, ja, ka, 3, vp.R)) + mu_of(vp, qcomp(W, ib, jb, kb, 3, vp.R)))
+    mt = float(0.0)
+    if vp.turb != 0:
+        mt = 0.5 * (vp.mut[ia, ja, ka] + vp.mut[ib, jb, kb])
+    mu = mul + mt
+    kcond = g * vp.R / (g - 1.0) * (mul / vp.Pr + mt / PRT)
     div = face_deriv(W, vp, ia, ja, ka, ib, jb, kb, d, 0, 0) + face_deriv(W, vp, ia, ja, ka, ib, jb, kb, d, 1, 1) \
         + face_deriv(W, vp, ia, ja, ka, ib, jb, kb, d, 2, 2)
     t = wp.vec3()
@@ -311,6 +335,53 @@ def shock_kernel(W: wp.array4d(dtype=wp.float32), active: wp.vec3i, thr: float,
 
 
 @wp.func
+def spalding_utau(u: float, y: float, nu: float):
+    """Friction velocity from Spalding's law of the wall (valid from the viscous sublayer
+    through the log layer): y+ = u+ + exp(-kB) [exp(k u+) - 1 - k u+ - (k u+)^2/2 - (k u+)^3/6]."""
+    if u <= 1.0e-12:
+        return 0.0
+    ut = wp.sqrt(nu * u / y)                      # viscous-sublayer guess
+    if y * ut / nu > 11.0:                        # log-law guess, fixed-point
+        for it in range(8):
+            ut = KAPPA * u / wp.log(wp.max(9.0 * y * ut / nu, 1.0001))
+    for it in range(12):                          # Newton on g(ut) = spalding(u/ut) - y ut / nu
+        up = u / ut
+        kp = KAPPA * up
+        e = wp.exp(-KAPPA * BLOG)
+        f = up + e * (wp.exp(kp) - 1.0 - kp - 0.5 * kp * kp - kp * kp * kp / 6.0) - y * ut / nu
+        dfdup = 1.0 + e * KAPPA * (wp.exp(kp) - 1.0 - kp - 0.5 * kp * kp)
+        df = dfdup * (-up / ut) - y / nu
+        ut = wp.max(ut - f / df, 0.1 * ut)
+    return ut
+
+
+@wp.func
+def wallfn_flux(W: wp.array4d(dtype=wp.float32), vp: Visc, i: int, j: int, k: int, d: int, wall_high: int):
+    """Wall shear from the law of the wall on a face between fluid cell (i,j,k) and a wall
+    (immersed-boundary ghost cell or thin plate) normal to e_d."""
+    rho = W[0, i, j, k]
+    nu = mu_of(vp, qcomp(W, i, j, k, 3, vp.R)) / rho
+    ut2 = float(0.0)
+    for c in range(3):
+        if c != d:
+            ut2 = ut2 + W[1 + c, i, j, k] * W[1 + c, i, j, k]
+    ut_mag = wp.sqrt(ut2)
+    y = wp.max(vp.dist[i, j, k], 1.0e-6)
+    tau = float(0.0)
+    if ut_mag > 1.0e-12:
+        utau = spalding_utau(ut_mag, y, nu)
+        tau = rho * utau * utau / ut_mag
+    sgn = 1.0
+    if wall_high != 0:
+        sgn = -1.0
+    t = wp.vec3()
+    for c in range(3):
+        if c != d:
+            t[c] = sgn * tau * W[1 + c, i, j, k]
+    return vec5(0.0, t[0], t[1], t[2], 0.0)
+
+
+@wp.func
 def cell_residual(W: wp.array4d(dtype=wp.float32), S: wp.array3d(dtype=wp.int32),
                   ix: wp.array(dtype=wp.float32), iy: wp.array(dtype=wp.float32),
                   iz: wp.array(dtype=wp.float32), active: wp.vec3i, g: float, order: float,
@@ -364,12 +435,25 @@ def cell_residual(W: wp.array4d(dtype=wp.float32), S: wp.array3d(dtype=wp.int32)
             if vp.mode != 0:
                 vl = vec5()
                 vr = vec5()
-                if bL != 0:
-                    vl = wall_visc(W, vp, I, J, K, d, 0)
+                wl = bL
+                wr = bR
+                if vp.turb != 0:
+                    if vp.fluid[I - di, J - dj, K - dk] < 0.5:
+                        wl = 1
+                    if vp.fluid[I + di, J + dj, K + dk] < 0.5:
+                        wr = 1
+                if wl != 0:
+                    if vp.turb != 0:
+                        vl = wallfn_flux(W, vp, I, J, K, d, 0)
+                    else:
+                        vl = wall_visc(W, vp, I, J, K, d, 0)
                 else:
                     vl = visc_flux(W, vp, g, I - di, J - dj, K - dk, I, J, K, d)
-                if bR != 0:
-                    vr = wall_visc(W, vp, I, J, K, d, 1)
+                if wr != 0:
+                    if vp.turb != 0:
+                        vr = wallfn_flux(W, vp, I, J, K, d, 1)
+                    else:
+                        vr = wall_visc(W, vp, I, J, K, d, 1)
                 else:
                     vr = visc_flux(W, vp, g, I, J, K, I + di, J + dj, K + dk, d)
                 acc = acc + (vr - vl) * inv
@@ -448,6 +532,8 @@ def rate_kernel(W: wp.array4d(dtype=wp.float32), ix: wp.array(dtype=wp.float32),
         s2 = s2 + iz[k] * iz[k]
     if vp.mode != 0:                 # explicit viscous stability limit
         mu = mu_of(vp, W[4, I, J, K] / (W[0, I, J, K] * vp.R))
+        if vp.turb != 0:
+            mu = mu + vp.mut[I, J, K]
         r = r + 2.0 * mu / W[0, I, J, K] * wp.max(4.0 / 3.0, g / vp.Pr) * s2
     rate[i, j, k] = r * mask[i, j, k]
 
@@ -494,3 +580,250 @@ def rk_tiles_kernel(U0: wp.array4d(dtype=wp.float32), Ua: wp.array4d(dtype=wp.fl
     if c3[0] >= R.shape[1] or c3[1] >= R.shape[2] or c3[2] >= R.shape[3]:
         return
     rk_cell(U0, Ua, R, dt, dtl, local, mask, a0, a1, out, c3[0], c3[1], c3[2])
+
+
+# ---------------------------------------------------------------- k-omega SST transport
+@wp.func
+def strain2(W: wp.array4d(dtype=wp.float32), vp: Visc, i: int, j: int, k: int):
+    """S^2 = 2 S_ij S_ij from central velocity derivatives at cell (i, j, k)."""
+    gm = wp.mat33()
+    for a in range(3):
+        for b in range(3):
+            gm[a, b] = cdiff(W, vp, i, j, k, a, b)
+    s2 = float(0.0)
+    for a in range(3):
+        for b in range(3):
+            sab = 0.5 * (gm[a, b] + gm[b, a])
+            s2 = s2 + 2.0 * sab * sab
+    return s2
+
+
+@wp.kernel
+def mut_kernel(W: wp.array4d(dtype=wp.float32), Kt: wp.array3d(dtype=wp.float32),
+               Om: wp.array3d(dtype=wp.float32), vp: Visc, out: wp.array3d(dtype=wp.float32)):
+    """SST eddy viscosity mu_t = rho a1 k / max(a1 omega, S F2) on padded cells."""
+    i, j, k = wp.tid()
+    if i < 1 or j < 1 or k < 1 or i > W.shape[1] - 2 or j > W.shape[2] - 2 or k > W.shape[3] - 2:
+        out[i, j, k] = 0.0
+        return
+    if vp.fluid[i, j, k] < 0.5:
+        out[i, j, k] = 0.0
+        return
+    rho = W[0, i, j, k]
+    kk = wp.max(Kt[i, j, k] / rho, 0.0)
+    om = wp.max(Om[i, j, k] / rho, 1.0e-12)
+    nu = mu_of(vp, qcomp(W, i, j, k, 3, vp.R)) / rho
+    d = wp.max(vp.dist[i, j, k], 1.0e-6)
+    arg2 = wp.max(2.0 * wp.sqrt(kk) / (BSTAR * om * d), 500.0 * nu / (d * d * om))
+    f2 = wp.tanh(arg2 * arg2)
+    s = wp.sqrt(strain2(W, vp, i, j, k))
+    out[i, j, k] = rho * A1 * kk / wp.max(A1 * om, s * f2)
+
+
+@wp.func
+def tval(T: wp.array3d(dtype=wp.float32), W: wp.array4d(dtype=wp.float32), i: int, j: int, k: int, floor: float):
+    return wp.max(T[i, j, k] / W[0, i, j, k], floor)
+
+
+@wp.kernel
+def turb_residual_kernel(W: wp.array4d(dtype=wp.float32), Kt: wp.array3d(dtype=wp.float32),
+                         Om: wp.array3d(dtype=wp.float32), ix: wp.array(dtype=wp.float32),
+                         iy: wp.array(dtype=wp.float32), iz: wp.array(dtype=wp.float32), active: wp.vec3i,
+                         blk: wp.array3d(dtype=wp.int32), vp: Visc,
+                         Rk: wp.array3d(dtype=wp.float32), Rw: wp.array3d(dtype=wp.float32),
+                         Dk: wp.array3d(dtype=wp.float32), Dw: wp.array3d(dtype=wp.float32),
+                         utau: wp.array3d(dtype=wp.float32)):
+    """Explicit k / omega residuals (first-order upwind convection, SST-blended diffusion,
+    production, cross diffusion), the implicit destruction coefficients, and the friction
+    velocity in cells next to a wall (-1 elsewhere)."""
+    i, j, k = wp.tid()
+    I = i + 2
+    J = j + 2
+    K = k + 2
+    if vp.fluid[I, J, K] < 0.5:
+        Rk[i, j, k] = 0.0
+        Rw[i, j, k] = 0.0
+        Dk[i, j, k] = 0.0
+        Dw[i, j, k] = 0.0
+        utau[i, j, k] = -1.0
+        return
+    rho = W[0, I, J, K]
+    mul = mu_of(vp, qcomp(W, I, J, K, 3, vp.R))
+    nu = mul / rho
+    kk = tval(Kt, W, I, J, K, 0.0)
+    om = tval(Om, W, I, J, K, 1.0e-12)
+    mt = vp.mut[I, J, K]
+    d = wp.max(vp.dist[I, J, K], 1.0e-6)
+    near = int(0)
+    gk = wp.vec3()
+    gw = wp.vec3()
+    kmv = wp.vec3()
+    kpv = wp.vec3()
+    wmv = wp.vec3()
+    wpv = wp.vec3()
+    okm_v = wp.vec3i()
+    okp_v = wp.vec3i()
+    # pass 1: neighbour values (a wall or blocked face repeats the own value) and gradients
+    for e in range(3):
+        if active[e] != 0:
+            di = int(0)
+            dj = int(0)
+            dk = int(0)
+            idx = int(0)
+            if e == 0:
+                di = 1
+                idx = I
+            elif e == 1:
+                dj = 1
+                idx = J
+            else:
+                dk = 1
+                idx = K
+            okm = (((blk[I - di, J - dj, K - dk] >> e) & 1) == 0) and vp.fluid[I - di, J - dj, K - dk] > 0.5
+            okp = (((blk[I, J, K] >> e) & 1) == 0) and vp.fluid[I + di, J + dj, K + dk] > 0.5
+            if not okm or not okp:
+                near = 1
+            kmv[e] = kk
+            wmv[e] = om
+            kpv[e] = kk
+            wpv[e] = om
+            if okm:
+                okm_v[e] = 1
+                kmv[e] = tval(Kt, W, I - di, J - dj, K - dk, 0.0)
+                wmv[e] = tval(Om, W, I - di, J - dj, K - dk, 1.0e-12)
+            if okp:
+                okp_v[e] = 1
+                kpv[e] = tval(Kt, W, I + di, J + dj, K + dk, 0.0)
+                wpv[e] = tval(Om, W, I + di, J + dj, K + dk, 1.0e-12)
+            span = coord(vp, e, idx + 1) - coord(vp, e, idx - 1)
+            gk[e] = (kpv[e] - kmv[e]) / span
+            gw[e] = (wpv[e] - wmv[e]) / span
+    cd = 2.0 * rho * SW2 / om * wp.dot(gk, gw)
+    cdkw = wp.max(cd, 1.0e-10)
+    arg1 = wp.min(wp.max(wp.sqrt(kk) / (BSTAR * om * d), 500.0 * nu / (d * d * om)),
+                  4.0 * rho * SW2 * kk / (cdkw * d * d))
+    f1 = wp.tanh(arg1 * arg1 * arg1 * arg1)
+    sk = f1 * SK1 + (1.0 - f1) * SK2
+    sw = f1 * SW1 + (1.0 - f1) * SW2
+    beta = f1 * BETA1 + (1.0 - f1) * BETA2
+    gam = f1 * GAM1 + (1.0 - f1) * GAM2
+    # pass 2: face fluxes (first-order upwind convection + blended diffusion); none through walls
+    ak = float(0.0)
+    aw = float(0.0)
+    for e in range(3):
+        if active[e] != 0:
+            di = int(0)
+            dj = int(0)
+            dk = int(0)
+            inv = float(0.0)
+            idx = int(0)
+            if e == 0:
+                di = 1
+                inv = ix[i]
+                idx = I
+            elif e == 1:
+                dj = 1
+                inv = iy[j]
+                idx = J
+            else:
+                dk = 1
+                inv = iz[k]
+                idx = K
+            for side in range(2):
+                ok = okm_v[e]
+                ia = I - di
+                ja = J - dj
+                ka = K - dk
+                ib = I
+                jb = J
+                kb = K
+                kA = kmv[e]
+                wA = wmv[e]
+                kB = kk
+                wB = om
+                if side == 1:
+                    ok = okp_v[e]
+                    ia = I
+                    ja = J
+                    ka = K
+                    ib = I + di
+                    jb = J + dj
+                    kb = K + dk
+                    kA = kk
+                    wA = om
+                    kB = kpv[e]
+                    wB = wpv[e]
+                if ok != 0:
+                    mf = 0.5 * (W[0, ia, ja, ka] * W[1 + e, ia, ja, ka] + W[0, ib, jb, kb] * W[1 + e, ib, jb, kb])
+                    ku = kB
+                    wu = wB
+                    if mf > 0.0:
+                        ku = kA
+                        wu = wA
+                    dn = coord(vp, e, idx + side) - coord(vp, e, idx + side - 1)
+                    mtf = 0.5 * (vp.mut[ia, ja, ka] + vp.mut[ib, jb, kb])
+                    fk = mf * ku - (mul + sk * mtf) * (kB - kA) / dn
+                    fw = mf * wu - (mul + sw * mtf) * (wB - wA) / dn
+                    sgn = -1.0
+                    if side == 0:
+                        sgn = 1.0
+                    ak = ak + sgn * fk * inv
+                    aw = aw + sgn * fw * inv
+    s2 = strain2(W, vp, I, J, K)
+    praw = mt * s2
+    pk = wp.min(praw, 10.0 * BSTAR * rho * kk * om)
+    ratio = float(1.0)
+    if praw > 1.0e-30:
+        ratio = pk / praw
+    pw = gam * rho * s2 * ratio
+    Rk[i, j, k] = ak + pk
+    Rw[i, j, k] = aw + pw + (1.0 - f1) * cd
+    Dk[i, j, k] = BSTAR * om
+    Dw[i, j, k] = beta * om
+    ut = float(-1.0)
+    if near != 0:
+        vel = wp.sqrt(W[1, I, J, K] * W[1, I, J, K] + W[2, I, J, K] * W[2, I, J, K] + W[3, I, J, K] * W[3, I, J, K])
+        ut = spalding_utau(vel, d, nu)
+    utau[i, j, k] = ut
+
+
+@wp.kernel
+def turb_update_kernel(K0: wp.array3d(dtype=wp.float32), O0: wp.array3d(dtype=wp.float32),
+                       Ka: wp.array3d(dtype=wp.float32), Oa: wp.array3d(dtype=wp.float32),
+                       Rk: wp.array3d(dtype=wp.float32), Rw: wp.array3d(dtype=wp.float32),
+                       Dk: wp.array3d(dtype=wp.float32), Dw: wp.array3d(dtype=wp.float32),
+                       dt: wp.array(dtype=wp.float32), dtl: wp.array3d(dtype=wp.float32), local: int,
+                       vp: Visc, W: wp.array4d(dtype=wp.float32), utau: wp.array3d(dtype=wp.float32),
+                       a0: float, a1: float, kmin: float, wmin: float,
+                       outK: wp.array3d(dtype=wp.float32), outO: wp.array3d(dtype=wp.float32)):
+    """Point-implicit RK stage for rho k and rho omega; near-wall cells take omega (and, above
+    y+ = 11, k) from the wall function."""
+    i, j, k = wp.tid()
+    I = i + 2
+    J = j + 2
+    K = k + 2
+    if vp.fluid[I, J, K] < 0.5:
+        outK[I, J, K] = K0[I, J, K]
+        outO[I, J, K] = O0[I, J, K]
+        return
+    h = dt[0]
+    if local != 0:
+        h = dtl[i, j, k]
+    ks = (Ka[I, J, K] + h * Rk[i, j, k]) / (1.0 + h * Dk[i, j, k])
+    ws = (Oa[I, J, K] + h * Rw[i, j, k]) / (1.0 + h * Dw[i, j, k])
+    kn = a0 * K0[I, J, K] + a1 * ks
+    wn = a0 * O0[I, J, K] + a1 * ws
+    rho = W[0, I, J, K]
+    kn = wp.max(kn, rho * kmin)
+    wn = wp.max(wn, rho * wmin)
+    ut = utau[i, j, k]
+    if ut >= 0.0:
+        y = wp.max(vp.dist[I, J, K], 1.0e-6)
+        nu = mu_of(vp, qcomp(W, I, J, K, 3, vp.R)) / rho
+        wv = 6.0 * nu / (BETA1 * y * y)
+        wl = ut / (wp.sqrt(BSTAR) * KAPPA * y)
+        wn = rho * wp.sqrt(wv * wv + wl * wl)
+        if y * ut / nu > 11.0:
+            kn = rho * ut * ut / wp.sqrt(BSTAR)
+    outK[I, J, K] = kn
+    outO[I, J, K] = wn

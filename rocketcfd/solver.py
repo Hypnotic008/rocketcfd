@@ -41,7 +41,7 @@ class Solver:
     def __init__(self, lo, hi, h, freestream, sdf=None, gamma=1.4, bcs="auto", cfl=0.7,
                  limiter="vanleer", shock_threshold=0.5, dtype=torch.float32, device=None,
                  verbose=True, faces=None, backend="auto", thin_sdf=None, thin_box=None,
-                 viscous=None, wall=None):
+                 viscous=None, wall=None, turbulence=None):
         """
         lo, hi     : domain corners (m)
         h          : cell size, scalar or (hx, hy, hz)
@@ -59,6 +59,9 @@ class Solver:
         viscous    : None (Euler) or dict(mu=..., model='constant'|'sutherland', T0=273.15, S=110.4,
                      R=287.05, Pr=0.72). Sutherland defaults are for air (mu=1.716e-5 at 273.15 K).
         wall       : 'slip' (default for Euler) or 'noslip' (default when viscous) for immersed walls
+        turbulence : None or dict(model='sst', k_inf=..., omega_inf=...): k-omega SST with a
+                     Spalding wall function on immersed walls and thin walls (needs viscous).
+                     Defaults: k_inf = 9e-9 a^2, omega_inf = 1e-6 rho a^2 / mu (NASA TMR).
         """
         self.gamma, self.cfl, self.limiter = gamma, cfl, limiter
         self.viscous = None
@@ -67,6 +70,12 @@ class Solver:
             v.update(viscous)
             self.viscous = v
         self.wall = wall or ("noslip" if self.viscous else "slip")
+        self.turbulence = None
+        if turbulence is not None:
+            if self.viscous is None:
+                raise ValueError("turbulence needs viscous=...")
+            self.turbulence = dict(model="sst")
+            self.turbulence.update(turbulence)
         self.shock_threshold = shock_threshold
         self.dtype = dtype
         self.device = torch.device(device) if device is not None else default_device()
@@ -146,7 +155,7 @@ class Solver:
             import warp  # noqa: F401
         except ImportError:
             ok = False
-        if (backend == "warp" or self.has_thin or self.viscous or self.wall != "slip") and not ok:
+        if (backend == "warp" or self.has_thin or self.viscous or self.wall != "slip" or self.turbulence) and not ok:
             raise RuntimeError("warp backend (needed for thin walls) needs `pip install warp-lang` and float32")
         return "warp" if ok else "torch"
 
@@ -204,7 +213,74 @@ class Solver:
         vp.Pr = float(v.get("Pr", 0.72))
         self._centres = [torch.as_tensor(self.axes[d].astype(np.float32), device=dev) for d in range(3)]
         vp.cx, vp.cy, vp.cz = (wp.from_torch(c_) for c_ in self._centres)
+        vp.turb = 1 if self.turbulence else 0
+        shape3 = tuple(self.U.shape[1:])
+        if self.turbulence:
+            dist = np.where(self.phi > 0, self.phi, 0.0).astype(np.float32)
+            dist[self.phi >= 1e8] = 1e3
+            if getattr(self, "_thin_dist", None) is not None:
+                sub, td = self._thin_dist
+                dist[sub] = np.minimum(dist[sub], td)
+            self.dist_buf = torch.as_tensor(np.maximum(dist, 1e-6), device=dev)
+            self.fluid_buf = torch.as_tensor(self.fluid.astype(np.float32), device=dev)
+            self.mut_buf = torch.zeros(shape3, dtype=self.dtype, device=dev)
+            self._init_turbulence()
+            for name in ("K1", "O1"):
+                setattr(self, name + "_buf", torch.empty(shape3, dtype=self.dtype, device=dev))
+            self.K1_buf.copy_(self.K_buf)
+            self.O1_buf.copy_(self.O_buf)
+            for name in ("Rk", "Rw", "Dk", "Dw", "utau"):
+                setattr(self, name + "_buf", torch.zeros(self.n, dtype=self.dtype, device=dev))
+            f = wp.from_torch
+            self._w.update(K=f(self.K_buf), O=f(self.O_buf), K1=f(self.K1_buf), O1=f(self.O1_buf),
+                           Rk=f(self.Rk_buf), Rw=f(self.Rw_buf), Dk=f(self.Dk_buf), Dw=f(self.Dw_buf),
+                           utau=f(self.utau_buf))
+        else:
+            self.dist_buf = torch.ones((1, 1, 1), dtype=self.dtype, device=dev)
+            self.fluid_buf = torch.ones((1, 1, 1), dtype=self.dtype, device=dev)
+            self.mut_buf = torch.zeros((1, 1, 1), dtype=self.dtype, device=dev)
+        vp.mut = wp.from_torch(self.mut_buf)
+        vp.dist = wp.from_torch(self.dist_buf)
+        vp.fluid = wp.from_torch(self.fluid_buf)
         self._vp = vp
+
+    def _init_turbulence(self):
+        """Freestream k and omega (NASA Turbulence Modeling Resource SST defaults) everywhere."""
+        rho, p = self.W_inf[0], self.W_inf[4]
+        a2 = self.gamma * p / rho
+        v = self.viscous
+        T = p / (rho * v["R"])
+        mu = v["mu"] if v["model"] == "constant" else v["mu"] * (T / v["T0"]) ** 1.5 * (v["T0"] + v["S"]) / (T + v["S"])
+        tb = self.turbulence
+        self.k_inf = float(tb.get("k_inf", 9e-9 * a2))
+        self.omega_inf = float(tb.get("omega_inf", 1e-6 * rho * a2 / mu))
+        shape3 = tuple(self.U.shape[1:])
+        if getattr(self, "K_buf", None) is None:
+            self.K_buf = torch.empty(shape3, dtype=self.dtype, device=self.device)
+            self.O_buf = torch.empty(shape3, dtype=self.dtype, device=self.device)
+        self.K_buf.fill_(rho * self.k_inf)
+        self.O_buf.fill_(rho * self.omega_inf)
+
+    def _fill_bc_turb(self, Kt, Om):
+        """k / omega ghost layers: freestream on inflow faces, zero gradient elsewhere."""
+        n = self.n
+        vel = self.W_inf[1:4]
+        rho = self.W_inf[0]
+        for d in range(3):
+            N = n[d]
+            for side in (0, 1):
+                kind = self.bcs[(d, side)]
+                for T, val in ((Kt, rho * self.k_inf), (Om, rho * self.omega_inf)):
+                    dst = _sl(T, d, 0, NG) if side == 0 else _sl(T, d, N + NG, N + 2 * NG)
+                    if kind == "periodic":
+                        dst.copy_(_sl(T, d, N, N + NG) if side == 0 else _sl(T, d, NG, 2 * NG))
+                        continue
+                    into = (vel[d] > 1e-9) if side == 0 else (vel[d] < -1e-9)
+                    if kind in ("freestream", "farfield") and into:
+                        dst.fill_(val)
+                    else:
+                        edge = _sl(T, d, NG, NG + 1) if side == 0 else _sl(T, d, N + NG - 1, N + NG)
+                        dst.copy_(edge.expand_as(dst))
 
     # ------------------------------------------------------------------ setup
     def _setup_bcs(self, bcs):
@@ -253,6 +329,7 @@ class Solver:
         pc = thin_sdf(*G)
         ts = pc < 0
         self.thin_solid[sub] = ts
+        self._thin_dist = (sub, np.abs(pc).astype(np.float32))
         for d in range(3):
             if len(ax[d]) < 2 or (self.n[d] == 1 and self.bcs[(d, 0)] == "periodic"):
                 continue
@@ -502,7 +579,7 @@ class Solver:
         return A[:, NG:-NG, NG:-NG, NG:-NG]
 
     # ------------------------------------------------------------ warp path
-    def _wprim(self, Ukey):
+    def _wprim(self, Ukey, tkey=None):
         wp, K, w = self._wp, self._K, self._w
         shape = tuple(self.U.shape[1:])
         wp.launch(K.prim_kernel, dim=shape, inputs=[w[Ukey], self.gamma, self.rho_min, self.p_min, w["W"]],
@@ -515,6 +592,22 @@ class Solver:
                       device=self._wdev, stream=self._wp_stream)
         wp.launch(K.shock_kernel, dim=shape, inputs=[w["W"], self._active_sensor, self.shock_threshold, w["S"]],
                   device=self._wdev, stream=self._wp_stream)
+        if self.turbulence:
+            kk, oo = (("K", "O") if tkey in (None, "") else (tkey, "O1"))
+            self._fill_bc_turb(getattr(self, kk + "_buf"), getattr(self, oo + "_buf"))
+            wp.launch(K.mut_kernel, dim=shape, inputs=[w["W"], w[kk], w[oo], self._vp, self._vp.mut],
+                      device=self._wdev, stream=self._wp_stream)
+
+    def _wturb(self, kk, oo, outk, outo, a0, a1, local):
+        """SST residual on stage state (kk, oo) and point-implicit update into (outk, outo)."""
+        wp, K, w = self._wp, self._K, self._w
+        wp.launch(K.turb_residual_kernel, dim=self.n,
+                  inputs=[w["W"], w[kk], w[oo], w["ix"], w["iy"], w["iz"], self._active_flux, w["blk"], self._vp,
+                          w["Rk"], w["Rw"], w["Dk"], w["Dw"], w["utau"]], device=self._wdev, stream=self._wp_stream)
+        wp.launch(K.turb_update_kernel, dim=self.n,
+                  inputs=[w["K"], w["O"], w[kk], w[oo], w["Rk"], w["Rw"], w["Dk"], w["Dw"], w["dt"], w["dtl"],
+                          int(local), self._vp, w["W"], w["utau"], a0, a1, 1e-6 * self.k_inf, 1e-3 * self.omega_inf,
+                          w[outk], w[outo]], device=self._wdev, stream=self._wp_stream)
 
     def _wresidual(self, order, tiles=None):
         wp, K, w = self._wp, self._K, self._w
@@ -553,9 +646,13 @@ class Solver:
         self._wresidual(order, tiles)
         res = torch.sqrt(((self.R_buf[0] * self.mask_f) ** 2).sum() / self.n_fluid) if want_res else None
         self._wrk("U", 0.0, 1.0, "U1", local, tiles)
-        self._wprim("U1")
+        if self.turbulence:
+            self._wturb("K", "O", "K1", "O1", 0.0, 1.0, local)
+        self._wprim("U1", "K1" if self.turbulence else None)
         self._wresidual(order, tiles)
         self._wrk("U1", 0.5, 0.5, "U", local, tiles)
+        if self.turbulence:
+            self._wturb("K1", "O1", "K", "O", 0.5, 0.5, local)
         return self.dt_buf[0].clone(), res
 
     def _refresh_tiles(self, frac):
@@ -615,6 +712,8 @@ class Solver:
         if active_tiles is None:
             active_tiles = steady
         active_tiles = active_tiles and steady
+        if self.turbulence and active_tiles:
+            active_tiles = False                # the turbulence kernels always cover the whole grid
         self._tiles_on = active_tiles
         local = steady and local_dt
         done = 0
@@ -680,6 +779,8 @@ class Solver:
         if not keep_state:
             shape = self.U.shape[1:]
             self.U.copy_(prim_to_cons(self.W_inf_t.reshape(5, 1, 1, 1).expand((5,) + tuple(shape)), self.gamma))
+            if self.turbulence:
+                self._init_turbulence()
         if self.backend == "warp":
             self.U1.copy_(self.U)
         self.t = 0.0
@@ -700,6 +801,19 @@ class Solver:
             return self._prim(self.U).cpu().numpy().astype(np.float64)
 
     def fields(self):
+        out = self._fields()
+        if self.turbulence:
+            with torch.no_grad():
+                if self.backend == "warp":
+                    self._wprim("U")
+                sl = (slice(NG, -NG),) * 3
+                rho = out["rho"]
+                out["k"] = (self.K_buf[sl].double().cpu().numpy()) / rho
+                out["omega"] = (self.O_buf[sl].double().cpu().numpy()) / rho
+                out["mut"] = self.mut_buf[sl].double().cpu().numpy()
+        return out
+
+    def _fields(self):
         W = self.primitive()[:, NG:-NG, NG:-NG, NG:-NG]
         rho, u, v, w, p = W
         c = np.sqrt(self.gamma * p / rho)
