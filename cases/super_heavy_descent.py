@@ -47,6 +47,9 @@ def main(argv=None):
     ap.add_argument("--growth", type=float, default=1.12, help="max cell-size ratio between neighbours")
     ap.add_argument("--uniform", action="store_true", help="uniform grid at --h everywhere (old behaviour)")
     ap.add_argument("--dry-run", action="store_true", help="print the grid and exit")
+    ap.add_argument("--profile", type=int, default=0, metavar="N",
+                    help="build the case, time N explicit steps, N implicit iterations and the load "
+                         "integration (per-kernel breakdown), then exit")
     ap.add_argument("--snapshots", type=int, default=0,
                     help="save about this many frames over the run for `viewer --movie evolve` "
                          "(use with --time-accurate for a physically time-accurate movie)")
@@ -233,6 +236,11 @@ def main(argv=None):
                 print(f"      converged: loads steady to {a.tol:g} and not drifting", flush=True)
                 return True
         return False
+
+    if a.profile:
+        from rocketcfd.profiling import profile_runner
+        profile_runner(runner, a.profile, loads=lambda: runner.loads(**REFERENCE, parts=PARTS))
+        return None
 
     t0 = time.time()
     chunk = max(100, int(round(nsteps / 40 / 50)) * 50)       # ~40 load checks over the max length
