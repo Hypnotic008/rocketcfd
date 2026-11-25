@@ -99,7 +99,8 @@ python cases/validate_cylinder_turbulent.py --dual --patch-h 0.001 --shell 0.06
 | Local refinement, laminar plate (`tests/patch_blasius.py`) | one fine grid | friction drag 0.00899 vs 0.00896 (coarse grid alone 0.00967), 68 % of the cells |
 | Local refinement, Mach 3 sphere (`tests/patch_sphere.py`) | one fine grid | CD 0.9666 vs 0.9569 (coarse alone 1.0114), 45 % of the cells |
 | Laminar cylinder Re 100, dual time stepping | St 0.164, Cd 1.33 | St 0.160 (25 cells/D, 50 steps per period, 15 inner iterations); with 40 steps and 12 inner iterations St 0.137 and Cd 1.336, the same with a refinement patch: use the defaults (80 / 20) |
-| Laminar cylinder Re 40, steady (immersed no-slip wall) | Dennis & Chang: Cd 1.52 | Cd 1.585 / 1.527 at D/25 / D/50 (before the ghost-cell fix: 1.464 / 1.372, moving away) |
+| Laminar cylinder Re 40, steady (immersed no-slip wall) | Dennis & Chang: Cd 1.52 | Cd 1.486 / 1.561 at D/25 / D/50 (tangential velocity extrapolated through the wall, triangulated loads; before: 1.464 / 1.372, moving away) |
+| Flat-nosed body, Mach 3, front face exactly on a cell face / between (`flat-face` test) | the same body, other grids | CD 1.61 / 1.62 (loads: triangulated surface); an intermediate ghost-cell change that scaled the normal velocity let the flow through the face (CD 0.03) and was reverted |
 | Turbulent plate Re 1e7, implicit (`--implicit`) | White Cf | +2.6 % (explicit, converged: -6.2 %): two different converged SST states, see limits |
 | CatchSim drop-in vs the sweep it reads (`tests/catchsim_dropin_check.py`) | the computed cases | identical to 1e-15; mirror rule and centre-of-mass transfer exact |
 
@@ -171,6 +172,16 @@ from the previous (10 deg) case. The sweep now starts every incidence from the a
   +0.35. An installed (fins-on) booster run is needed to settle it.
 
 ### Whole booster with installed grid fins: gliding attitude
+
+> **Drag values in this section are wrong (found Nov 25).** These runs refined the fins with
+> whole slabs of fine cells, which left the engine end with long, flat cells (0.25 m along the
+> axis, 6 cm across). The old smoothed-band force integration mis-weights a flat wall facing the
+> long side of such cells: the engine-end axial force came out ~1.5x too large (CD_aft 2.87 is above
+> what stagnation pressure on the whole frontal area allows, ~2.2). Loads now use a triangulated
+> surface (`Solver.loads(method="tri")`), which does not depend on cell shape; on a flat-faced test
+> body the band gave -90 % .. +150 % depending on where the face fell between cell centres, the
+> triangulated surface 1.45-1.50 every time. CN and C_restore come mostly from the hull sides, where
+> those cells were fine, but treat them as unverified until these cases are rerun with patches.
 
 V3 with the three parametric fins (thin walls), Mach 2.82 at 10.7 km, 15 deg off
 engines-first, crossflow arriving on the rudder side. 34.2 M cells (0.25 m along the body,

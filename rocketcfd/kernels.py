@@ -345,9 +345,11 @@ def prim_kernel(U: wp.array4d(dtype=wp.float32), g: float, rmin: float, pmin: fl
 def ib_kernel(W: wp.array4d(dtype=wp.float32), ghost: wp.array(dtype=wp.vec3i),
               corner: wp.array2d(dtype=wp.vec3i), weight: wp.array2d(dtype=wp.float32),
               normal: wp.array(dtype=wp.vec3), ratio: wp.array(dtype=wp.float32), noslip: int):
-    """Immersed-boundary ghost cells: image-point state with the wall-normal velocity (no-slip:
-    all velocity) extrapolated linearly through zero at the wall, -ratio x image value
-    (ratio = ghost / image distance from the wall; 1 for an exact mirror point)."""
+    """Immersed-boundary ghost cells: image-point state with the wall-normal velocity mirrored
+    (the flux across the fluid / ghost face then carries no mass: the wall is watertight) and,
+    on no-slip walls, the tangential velocity extrapolated linearly through zero at the wall:
+    -ratio x image value (ratio = ghost / image distance from the wall, 1 for an exact mirror
+    point). Scaling the normal component too made walls leak where a ghost sits on the wall."""
     t = wp.tid()
     q = vec5()
     for m in range(8):
@@ -358,10 +360,11 @@ def ib_kernel(W: wp.array4d(dtype=wp.float32), ghost: wp.array(dtype=wp.vec3i),
     n = normal[t]
     r = ratio[t]
     vel = wp.vec3(q[1], q[2], q[3])
+    vn = wp.dot(vel, n)
     if noslip != 0:
-        vel = -r * vel                               # no-slip: zero velocity at the wall
+        vel = -r * (vel - vn * n) - vn * n           # no-slip: zero velocity at the wall
     else:
-        vel = vel - (1.0 + r) * wp.dot(vel, n) * n   # slip: zero normal velocity at the wall
+        vel = vel - 2.0 * vn * n                     # slip: mirror the normal component
     gc = ghost[t]
     W[0, gc[0], gc[1], gc[2]] = q[0]
     W[1, gc[0], gc[1], gc[2]] = vel[0]

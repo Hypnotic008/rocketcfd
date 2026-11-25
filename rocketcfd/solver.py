@@ -565,10 +565,11 @@ class Solver:
             cw[sel] = 0.0
             cw[sel, 0] = 1.0
         self.n_ib_fallback = int(todo.sum())
-        # wall-normal velocity (and, no-slip, all velocity) goes linearly through zero at the wall:
-        # ghost value = -(d_ghost / d_image) x image value, distances from the wall. The image is the
-        # ghost's mirror point (ratio 1) unless it had to move further out (ghost almost on the
-        # wall, or the mirror stencil not in the fluid); then plain reflection overstates it.
+        # no-slip walls: the tangential velocity goes linearly through zero at the wall, ghost value =
+        # -(d_ghost / d_image) x image value (distances from the wall). The image is the ghost's
+        # mirror point (ratio 1) unless it had to move further out (ghost almost on the wall, or the
+        # mirror stencil not in the fluid); plain reflection then overstates the shear. The normal
+        # component is always mirrored (kernels.ib_kernel), which keeps the wall watertight.
         dg = np.maximum(-phi.ravel()[gi], 0.0)
         ratio = np.clip(dg / np.maximum(d_img - dg, 1e-12), 0.0, 1.0)
         ratio[todo] = 1.0
@@ -653,7 +654,7 @@ class Solver:
         qi = (Wf[:, ib["c"]] * ib["w"]).sum(-1)            # (5, Ng)
         vel = qi[1:4]
         vn = (vel * ib["n"]).sum(0)
-        vel = vel - (1.0 + ib["r"]) * vn * ib["n"]
+        vel = vel - 2.0 * vn * ib["n"]                     # slip wall: mirror the normal component
         Wf[:, ib["g"]] = torch.cat([qi[:1], vel, qi[4:]], 0)
         return W
 
@@ -1179,17 +1180,21 @@ class Solver:
                     phi=self.phi[NG:-NG, NG:-NG, NG:-NG],
                     x=self.axes[0][NG:-NG], y=self.axes[1][NG:-NG], z=self.axes[2][NG:-NG])
 
-    def loads(self, S_ref, L_ref, x_ref=(0.0, 0.0, 0.0), band=1.5, parts=None, friction=True):
+    def loads(self, S_ref, L_ref, x_ref=(0.0, 0.0, 0.0), band=1.5, parts=None, friction=True, method="tri"):
         """Integrate surface pressure: -∮ (p - p_inf) n dA via a smoothed delta function, plus
         (viscous runs, friction=True) the wall shear -- from the velocity interpolated 1.5 cells
         out along the wall normal, through the same law of the wall as the solver's wall function
         when turbulent, mu u_t / y when laminar (thin walls: the adjacent cells). All coefficients,
         parts and moments include friction; CD_friction / C_friction give its share.
         Returns body-axis force/moment coefficients and wind-axis drag/lift.
-        The surface band and its weights are computed once; each call only gathers the
-        pressure in the band (a few thousand values) from the device."""
-        sf = self._surface(band)
-        tf = sf.get("thin")
+
+        method="tri" (default): immersed walls are triangulated (marching cubes of phi) and the
+        pressure is interpolated at each triangle's centroid; exact for any cell shape. "band": the
+        earlier smoothed-delta band, which mis-integrates flat walls facing the long side of
+        stretched cells (-90 % .. +150 % on a flat end face with 4:1 cells). Thin walls use the
+        blocked faces either way. The surface data are built once; each call only gathers values."""
+        sf = self._surface_tri() if method == "tri" else self._surface(band)
+        tf = self._surface(band).get("thin") if method == "tri" else sf.get("thin")
         with torch.no_grad():
             if self.backend == "warp":
                 self._wprim("U")
@@ -1197,7 +1202,10 @@ class Solver:
             else:
                 Wsrc = self._prim(self.U)
             pflat = Wsrc[4].reshape(-1)
-            pb = pflat[sf["flat_t"]]
+            if "p_idx" in sf:
+                pb = (pflat[sf["p_idx"]] * sf["p_w"]).sum(-1)
+            else:
+                pb = pflat[sf["flat_t"]]
             if tf is not None:
                 pa = pflat[tf["a_t"]].double().cpu().numpy()
                 pbb = pflat[tf["b_t"]].double().cpu().numpy()
@@ -1317,6 +1325,108 @@ class Solver:
         else:
             tau = mu * um / y
         return tau * ut / um
+
+    def _surface_tri(self):
+        """Triangulated immersed walls for the loads: marching cubes of phi in index space (in
+        slabs, so memory stays bounded), oriented toward the fluid, mapped to physical space.
+        Per triangle: area vector, centroid, the trilinear stencil for the pressure at the centroid
+        (ghost cells hold the wall state, so no masking), and wall-shear sample stencils."""
+        if getattr(self, "_tri", None) is not None:
+            return self._tri
+        from skimage.measure import marching_cubes
+        from scipy.ndimage import map_coordinates
+        phi = self.phi
+        shape = phi.shape
+        wx, wy, wz = self.widths
+        near = np.abs(phi) < 3.0 * np.maximum(np.maximum(wx[:, None, None], wy[None, :, None]), wz[None, None, :])
+        cen_l, area_l = [], []
+        if near.any() and phi.min() < 0 < phi.max():
+            lo_i = [int(np.flatnonzero(near.any(axis=tuple(e for e in range(3) if e != d)))[0]) for d in range(3)]
+            hi_i = [int(np.flatnonzero(near.any(axis=tuple(e for e in range(3) if e != d)))[-1]) for d in range(3)]
+            lo_i = [max(v - 1, 0) for v in lo_i]
+            hi_i = [min(v + 2, shape[d]) for d, v in enumerate(hi_i)]
+            sl12 = (slice(lo_i[1], hi_i[1]), slice(lo_i[2], hi_i[2]))
+            step = 48
+            for k0 in range(lo_i[0], hi_i[0] - 1, step):
+                k1 = min(k0 + step + 1, hi_i[0])
+                blk = phi[k0:k1][:, sl12[0], sl12[1]]
+                if blk.shape[0] < 2 or blk.min() >= 0 or blk.max() <= 0:
+                    continue
+                if min(blk.shape) < 2:
+                    continue
+                v, f, _, _ = marching_cubes(blk, 0.0)
+                v = v + np.array([k0, lo_i[1], lo_i[2]], float)        # padded index space
+                t = v[f]                                              # (T, 3, 3)
+                c = t.mean(1)
+                n = np.cross(t[:, 1] - t[:, 0], t[:, 2] - t[:, 0])
+                nn = n / (np.linalg.norm(n, axis=1, keepdims=True) + 1e-30)
+                pp = map_coordinates(phi, (c + 0.25 * nn).T, order=1, mode="nearest")
+                pm = map_coordinates(phi, (c - 0.25 * nn).T, order=1, mode="nearest")
+                flip = pp < pm                                        # normal must point to the fluid
+                tp = np.stack([np.stack([np.interp(t[:, j, d], np.arange(shape[d]), self.axes[d])
+                                         for d in range(3)], 1) for j in range(3)], 1)
+                a = 0.5 * np.cross(tp[:, 1] - tp[:, 0], tp[:, 2] - tp[:, 0])
+                a[flip] *= -1.0
+                cen_l.append(c)
+                area_l.append(a)
+        if cen_l:
+            c_idx = np.concatenate(cen_l)
+            avec = np.concatenate(area_l)
+        else:
+            c_idx = np.zeros((0, 3))
+            avec = np.zeros((0, 3))
+        # keep triangles whose centroid lies in an interior cell this grid owns
+        cell = np.floor(c_idx + 0.5).astype(np.int64)
+        for d in range(3):
+            cell[:, d] = np.clip(cell[:, d], 0, shape[d] - 1)
+        cflat = np.ravel_multi_index(cell.T, shape) if len(cell) else np.zeros(0, np.int64)
+        inner = np.zeros(shape, bool)
+        inner[NG:-NG, NG:-NG, NG:-NG] = True
+        keep = inner.ravel()[cflat] if len(cflat) else np.zeros(0, bool)
+        if self.owned is not None and len(cflat):
+            keep &= self.owned.ravel()[cflat] > 0.5
+        c_idx, avec, cell = c_idx[keep], avec[keep], cell[keep]
+        pos = np.stack([np.interp(c_idx[:, d], np.arange(shape[d]), self.axes[d]) for d in range(3)])
+        area = np.linalg.norm(avec, axis=1)
+        nrm = (avec / np.maximum(area, 1e-30)[:, None]).T
+
+        def stencil(pts, fluid_only):
+            i0, fr = [], []
+            for d in range(3):
+                cax = self.axes[d]
+                k = np.clip(np.searchsorted(cax, pts[d]) - 1, 0, len(cax) - 2)
+                i0.append(k)
+                fr.append(np.clip((pts[d] - cax[k]) / (cax[k + 1] - cax[k]), 0.0, 1.0))
+            ii = np.zeros((pts.shape[1], 8), np.int64)
+            ww = np.zeros((pts.shape[1], 8))
+            fluid_f = self.fluid.ravel()
+            m_ = 0
+            for a_ in (0, 1):
+                for b_ in (0, 1):
+                    for c_ in (0, 1):
+                        f_ = np.ravel_multi_index((i0[0] + a_, i0[1] + b_, i0[2] + c_), shape)
+                        ii[:, m_] = f_
+                        w_ = ((fr[0] if a_ else 1 - fr[0]) * (fr[1] if b_ else 1 - fr[1])
+                              * (fr[2] if c_ else 1 - fr[2]))
+                        ww[:, m_] = w_ * fluid_f[f_] if fluid_only else w_
+                        m_ += 1
+            tw = ww.sum(1)
+            ok = tw > 1e-6
+            ww[ok] /= tw[ok, None]
+            return ii, ww, ok
+
+        p_idx, p_w, _ = stencil(pos, False)
+        hloc = np.minimum.reduce([self.widths[d][cell[:, d]] for d in range(3)]) if len(cell) else np.zeros(0)
+        y_img = (np.stack([1.0 * hloc, 2.0 * hloc]) if not self.turbulence else 1.5 * hloc[None])
+        st_ = [stencil(pos + y_ * nrm, True) for y_ in y_img]
+        dev = self.device
+        self._tri = dict(
+            wF=-avec.T, pos=pos, nrm=nrm, y_img=y_img, area=area,
+            wfr=area * np.logical_and.reduce([t_[2] for t_ in st_]) if st_ else area,
+            p_idx=torch.as_tensor(p_idx, device=dev), p_w=torch.as_tensor(p_w, dtype=self.dtype, device=dev),
+            img_idx=torch.as_tensor(np.concatenate([t_[0] for t_ in st_], 1), device=dev),
+            img_w=torch.as_tensor(np.concatenate([t_[1] for t_ in st_], 1), dtype=self.dtype, device=dev))
+        return self._tri
 
     def _surface(self, band):
         key = ("surface", band)
