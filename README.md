@@ -502,8 +502,12 @@ The viewer adds Q-criterion vortex surfaces (`v`) and friction lines (`l`).
 * **Turbulent runs: the implicit k-omega path does not land on the steady state.** On the flat
   plate the implicit solver settles at Cf -1 % (Koren; +2.6 % with van Leer) from White, and the
   explicit solver continued from that state moves it to -6.3 %, where explicit runs from scratch
-  also end. So the explicit result is the steady state and the implicit one is not (cause not
-  found yet: the equations at the fixed point are the same). `Solver.run(implicit=True)` therefore
+  also end. So the explicit result is the steady state and the implicit one is not. Diagnosed
+  further (Nov 25): the implicit residual stalls about two orders down (0.3 from 14 at CFL 20, 0.17
+  at CFL 5) and where it settles depends on the CFL number, so it is an iteration that does not
+  converge, not a second steady state; the largest residuals sit in the wall-function cells and the
+  near wake behind the trailing edge. Neither an implicit wall-shear diagonal (`wall_stiffness`) nor
+  a wall-cell CFL cap (`cfl_wall`) removes the stall. `Solver.run(implicit=True)` therefore
   finishes turbulent runs with explicit local-time-step steps (`explicit_finish`, default 3x the
   implicit iterations, stopping early on the same convergence test). Inviscid and laminar implicit
   runs agree with explicit ones.
