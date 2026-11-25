@@ -58,6 +58,11 @@ def _sh_fields():
         Field("exit-T", "Exit temperature [K]", "float", 2200.0, "Single-gas model: chosen so the exit velocity is "
               "Raptor-like (~3300 m/s).", G2, lo=200, hi=4000, step=50, decimals=0, advanced=True),
         Field("throttle", "Throttle", "float", 1.0, "0..1", G2, lo=0.0, hi=1.0, step=0.05, advanced=True),
+        Field("plume-h", "Plume block cell size [m]", "float", 0.0, "Refine a block in front of the engines "
+              "(where the plume goes) to this cell size (0 = off).", G2, lo=0.0, hi=1.0, step=0.05),
+        Field("plume-length", "Plume block length [m]", "float", 30.0, "", G2, lo=2, hi=200, step=5, advanced=True),
+        Field("upstream", "Domain ahead of the engines [m]", "float", 15.5, "Make it longer than the plume "
+              "(e.g. 45 m with engines firing).", G3, lo=5, hi=300, step=5, advanced=True),
         Field("h", "Cell size near vehicle [m]", "float", 0.5, "Base grid cell size around the booster. 0.3 is a good "
               "balance; 0.5 for quick looks.", G3, lo=0.02, hi=2, step=0.05),
         Field("h-far", "Farfield cell size [m]", "float", 0.0, "0 = 4 x the near-vehicle size.", G3, lo=0, hi=10,
@@ -124,7 +129,7 @@ SUPER_HEAVY = Case(
                                                            "wall-shell": 0.3, "patch-box": "32,48,48"}),
         "Landing burn plume (3 engines, subsonic)": dict(mach=0.4, alt=2000.0, aoa=0.0, h=0.3, engines="centre",
                                                          implicit=True, iters=3000, fins="parametric",
-                                                         **{"engine-h": 0.1}),
+                                                         **{"engine-h": 0.1, "plume-h": 0.15, "upstream": 45.0}),
         "Movie: unsteady LES wake": dict(h=0.3, fins="parametric", les=True, **{"time-accurate": True,
                                          "snapshots": 200, "snap-volume": 1, "fin-h": 0.0, "probes": True}, aoa=15.0,
                                          windward=0.0),

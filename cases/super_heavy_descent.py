@@ -80,6 +80,11 @@ def main(argv=None):
     ap.add_argument("--exit-T", type=float, default=2200.0,
                     help="exit temperature [K] for air (2200 K with Mach 3.5 gives ~3300 m/s, Raptor-like)")
     ap.add_argument("--throttle", type=float, default=1.0, help="0..1, blends the exit state from ambient")
+    ap.add_argument("--plume-h", type=float, default=0.0,
+                    help="refine a block in front of the engines (the plume) to this cell size [m] (0 = off)")
+    ap.add_argument("--plume-length", type=float, default=30.0, help="length of the refined plume block [m]")
+    ap.add_argument("--upstream", type=float, default=15.5,
+                    help="domain length ahead of the engines [m] (more for long plumes, e.g. 45 with --engines)")
     ap.add_argument("--chines", choices=["all", "tall", "short", "none"], default="all",
                     help="which chines to fit: tall = the raceway-side pair, short = the rudder-side pair")
     ap.add_argument("--implicit", action="store_true",
@@ -151,7 +156,7 @@ def main(argv=None):
         thin_box = super_heavy_fins_box(P)
 
     L = P.length
-    lo = (-15.5, -22.0, -22.0)
+    lo = (-a.upstream, -22.0, -22.0)
     hi = (L + 18.0, 22.0, 22.0)
     dtype = torch.float64 if a.x64 else torch.float32
     faces = None
@@ -169,7 +174,7 @@ def main(argv=None):
         h3 = np.broadcast_to(np.asarray(a.h, float), (3,))
         faces = [lo[d] + h3[d] * np.arange(int(round((hi[d] - lo[d]) / h3[d])) + 1) for d in range(3)]
     patches = []
-    if a.wall_h or a.fin_h or a.engine_h:
+    if a.wall_h or a.fin_h or a.engine_h or a.plume_h:
         from rocketcfd.patches import wall_patches
         a.implicit = not a.explicit
         pbox = tuple(int(v) for v in a.patch_box.split(","))
@@ -183,6 +188,12 @@ def main(argv=None):
             reg = ((-2.0, -R_eng, -R_eng), (P.skirt_bottom_x + 1.0, R_eng, R_eng))
             print(f"engine-end patches ({a.engine_h} m cells within {a.engine_shell} m of the walls, x < {reg[1][0]:.1f} m):")
             patches += wall_patches(faces, a.engine_h, a.engine_shell, sdf=sdf, region=reg, box=(64, 64, 64))
+        if a.plume_h:
+            Rp = P.radius + 1.5
+            reg = ((-a.plume_length, -Rp, -Rp), (0.5, Rp, Rp))
+            print(f"plume block patches ({a.plume_h} m cells, x {reg[0][0]:.0f} .. {reg[1][0]:.1f} m, radius {Rp:.1f} m):")
+            patches += wall_patches(faces, a.plume_h, 0.0, sdf=lambda X, Y, Z: np.zeros_like(X) - 1e-9, region=reg,
+                                    box=(64, 64, 64), inner=1e9)
         if a.fin_h:
             if thin_sdf is None:
                 raise SystemExit("--fin-h needs --fins parametric")

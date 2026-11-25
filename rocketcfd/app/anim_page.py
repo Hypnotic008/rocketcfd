@@ -16,6 +16,7 @@ MOVIES = [
     ("Cinematic: orbit, schlieren only", "-m rocketcfd.cinematic", ["--mode", "orbit", "--style", "schlieren"]),
     ("Cinematic: orbit, Mach plane + vortices", "-m rocketcfd.cinematic", ["--mode", "orbit", "--style", "mach"]),
     ("Cinematic: orbit, surface pressure", "-m rocketcfd.cinematic", ["--mode", "orbit", "--style", "pressure"]),
+    ("Cinematic: orbit, engine plumes (temperature)", "-m rocketcfd.cinematic", ["--mode", "orbit", "--style", "plume"]),
     ("Cinematic: still image (4K)", "-m rocketcfd.cinematic", ["--mode", "still", "--width", "3840", "--height", "2160"]),
     ("Streamline particles: orbit", "-m rocketcfd.viewer", ["--movie", "orbit"]),
     ("Slice sweeping along the booster", "-m rocketcfd.viewer", ["--movie", "sweep"]),

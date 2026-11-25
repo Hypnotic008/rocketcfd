@@ -428,7 +428,8 @@ python -m rocketcfd.cinematic results/les_wake --mode evolve                   #
 ```
 
 Styles: `lava` (vortex surfaces coloured by Mach over a greyscale schlieren plane, black
-background), `schlieren`, `mach`, `pressure`. `evolve` needs a run with `--snapshots N
+background), `schlieren`, `mach`, `pressure`, `plume` (hot exhaust as a glowing temperature volume
+and a hot-gas surface coloured by Mach, over schlieren). `evolve` needs a run with `--snapshots N
 --snap-volume 1` (or 2 for half the resolution and an eighth of the disk space).
 
 ## Engine plumes
@@ -442,8 +443,9 @@ Check: `tests/underexpanded_jet.py` (Mach-disk position of a sonic jet vs the Cr
 correlation).
 
 ```bash
-python cases/super_heavy_descent.py --mach 0.4 --alt 2000 --aoa 0 --h 0.3 --fins parametric --engines centre --implicit --out results/landing_burn
-python -m rocketcfd.cinematic results/landing_burn --mode orbit --style mach
+# 4.3 M cells: 10 cm cells at the engine end, 15 cm in a 30 m block where the plume goes
+python cases/super_heavy_descent.py --mach 0.4 --alt 2000 --aoa 0 --h 0.3 --fins parametric --engines centre --engine-h 0.1 --plume-h 0.15 --upstream 45 --out results/landing_burn
+python -m rocketcfd.cinematic results/landing_burn --mode orbit --style plume
 ```
 
 ## Restarts

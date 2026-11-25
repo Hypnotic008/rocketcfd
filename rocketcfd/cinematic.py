@@ -24,7 +24,7 @@ import pyvista as pv
 from . import derived
 from .flowdata import FlowData
 
-STYLES = ("lava", "schlieren", "mach", "pressure")
+STYLES = ("lava", "schlieren", "mach", "pressure", "plume")
 
 
 # ---------------------------------------------------------------- data
@@ -104,9 +104,9 @@ def build(pl, flow, surf, style, q_level=None, plane_y=None, mach_range=None, cp
         sl = sl.clip_box(box, invert=False)
     if "phi" in sl.point_data and np.any(np.asarray(sl.point_data["phi"]) < 0):
         sl = sl.threshold(0.0, scalars="phi")
-    if style in ("lava", "schlieren"):
+    if style in ("lava", "schlieren", "plume"):
         pl.add_mesh(sl, scalars="schlieren", cmap="gray", clim=[0.05, 1.0], show_scalar_bar=False,
-                    ambient=0.55, diffuse=0.45, specular=0.0, opacity=0.92 if style == "lava" else 1.0)
+                    ambient=0.55, diffuse=0.45, specular=0.0, opacity=0.92 if style != "schlieren" else 1.0)
     else:
         pl.add_mesh(sl, scalars="mach", cmap="turbo", clim=mrange, show_scalar_bar=True,
                     scalar_bar_args=dict(title="Mach", color="white", vertical=True, position_x=0.92,
@@ -124,6 +124,36 @@ def build(pl, flow, surf, style, q_level=None, plane_y=None, mach_range=None, cp
                             specular=0.5, specular_power=25, show_scalar_bar=(style == "lava"),
                             scalar_bar_args=dict(title="Mach", color="white", vertical=True, position_x=0.92,
                                                  position_y=0.2, height=0.6, width=0.03, fmt="%.2f"))
+    if style == "plume":
+        # hot exhaust: glowing temperature volume, and a hot-gas surface coloured by Mach
+        fd.ensure("T")
+        T_inf = (fs["p"] / (fs["rho"] * derived.R_AIR)) if fs else float(np.nanpercentile(fd.values("T"), 5))
+        Tv = fd.values("T")
+        T_hi = float(np.nanpercentile(Tv[np.isfinite(Tv)], 99.9))
+        if T_hi > 1.5 * T_inf:
+            bb = surf.bounds if surf is not None else b
+            Lb = max(bb[1] - bb[0], 1.0)
+            box = [b[0], b[1], b[2], b[3], b[4], b[5]]
+            n = 170
+            ext = np.array([box[1] - box[0], box[3] - box[2], box[5] - box[4]])
+            h = ext.max() / n
+            dims = np.maximum((ext / h).astype(int) + 1, 2)
+            img = pv.ImageData(dimensions=dims, spacing=(h, h, h), origin=(box[0], box[2], box[4]))
+            img = fd.sample_onto(img)
+            a = np.asarray(img.point_data["T"], float)
+            a[~np.isfinite(a)] = T_inf
+            img.point_data["T"] = np.clip(a, T_inf, None)
+            opac = [0.0, 0.0, 0.02, 0.08, 0.2, 0.4, 0.6]
+            pl.add_volume(img, scalars="T", cmap="inferno", clim=[1.3 * T_inf, T_hi], opacity=opac,
+                          show_scalar_bar=False)
+            hot = fd.contour(T_inf + 0.35 * (T_hi - T_inf), "T")
+            if hot.n_points:
+                if "mach" not in hot.point_data:
+                    hot = fd.sample_onto(hot)
+                pl.add_mesh(hot, scalars="mach", cmap="turbo", clim=mrange, opacity=0.35, smooth_shading=True,
+                            show_scalar_bar=True, scalar_bar_args=dict(title="Mach", color="white", vertical=True,
+                                                                         position_x=0.92, position_y=0.2,
+                                                                         height=0.6, width=0.03, fmt="%.2f"))
     if surf is not None and surf.n_points:
         if style == "pressure" and "Cp" in surf.point_data:
             pl.add_mesh(surf, scalars="Cp", cmap="coolwarm", clim=list(cp_range), smooth_shading=True,
