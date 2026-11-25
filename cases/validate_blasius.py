@@ -1,6 +1,9 @@
 """Validation 4: laminar flat plate (Blasius) -- tests the viscous terms and no-slip walls.
 
 A thin plate (both sides wetted) in Mach 0.4 air, Re_L = 1e5 with constant viscosity.
+Result on an RTX 4050 Laptop GPU (4 min): Cf within -0.5 % of Blasius on 0.2 < x < 0.8 m,
+velocity profile within 0.7 % of U. The outflow boundary must be well downstream of the
+plate (default 3 m): at 0.2 m behind it, its suction raised Cf on the rear half by up to 30 %.
 References: Blasius skin friction Cf = 0.664 / sqrt(Re_x) and the Blasius velocity profile
 u/U = f'(eta), eta = y sqrt(U / (nu x)). At Mach 0.4 compressibility lowers Cf by ~1 %.
 """
@@ -21,7 +24,7 @@ def blasius_profile(eta_max=8.0):
     return sol
 
 
-def main(out="results", Re=1e5, M=0.4, hy=0.0008, hx=0.01, tiles=True, local_dt=False, x_out=1.2, y_half=0.12,
+def main(out="results", Re=1e5, M=0.4, hy=0.0008, hx=0.01, tiles=True, local_dt=False, x_out=4.0, y_half=0.6,
          tag_extra=""):
     os.makedirs(out, exist_ok=True)
     T, p = 288.15, 101325.0
@@ -105,10 +108,11 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--no-tiles", action="store_true")
     ap.add_argument("--local-dt", action="store_true")
-    ap.add_argument("--x-out", type=float, default=1.2, help="outflow boundary position [m] (plate ends at 1.0)")
-    ap.add_argument("--y-half", type=float, default=0.12, help="half-height of the domain [m]")
+    ap.add_argument("--x-out", type=float, default=4.0,
+                    help="outflow boundary position [m] (plate ends at 1.0; at 1.2 the outflow raises Cf on the rear half)")
+    ap.add_argument("--y-half", type=float, default=0.6, help="half-height of the domain [m]")
     ap.add_argument("--coarse", action="store_true", help="2x coarser (quick check)")
     a = ap.parse_args()
     k = 2.0 if a.coarse else 1.0
     main(tiles=not a.no_tiles, local_dt=a.local_dt, x_out=a.x_out, y_half=a.y_half, hy=0.0008 * k, hx=0.01 * k,
-         tag_extra=("_coarse" if a.coarse else "") + (f"_x{a.x_out:g}_y{a.y_half:g}" if (a.x_out, a.y_half) != (1.2, 0.12) else ""))
+         tag_extra=("_coarse" if a.coarse else "") + (f"_x{a.x_out:g}_y{a.y_half:g}" if (a.x_out, a.y_half) != (4.0, 0.6) else ""))

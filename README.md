@@ -35,6 +35,7 @@ guessed aero coefficients in CatchSim (`quatsim/aero.py`).
 | Same plate tilted across the grid (staircase walls) | shock-expansion theory | CN +10.8 % (100 cells/chord), +7.5 % (200 cells/chord): first-order convergence |
 | Warp kernels vs PyTorch reference (Sod, cylinder, 3-D sphere) | identical numerics | max difference 2e-4 (float32) |
 | Viscous shear wave, periodic box (`tests/viscous_shearwave.py`) | exact decay exp(-nu k^2 t) | effective / set viscosity 0.999 (64 cells), 0.987 (16) |
+| Laminar flat plate, Mach 0.4, Re 1e5 (`cases/validate_blasius.py`) | Blasius | skin friction -0.5 % (0.2 < x < 0.8 m), velocity profile within 0.7 % of U |
 
 ## Results so far
 
