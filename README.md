@@ -58,7 +58,10 @@ python cases/super_heavy_descent.py --h 0.25 --fins parametric --fin-h 0.04 --en
 # 3. a quick aero database, then the full one (overnight) -> aero_db.json for CatchSim
 python cases/aero_database.py --mach 2.8 2.0 1.3 0.9 --aoa 0 8 16 --roll 0 180 --out results/db_quick
 python cases/aero_database.py --out results/aero_db
-# 4. viscous: does SST separate from a smooth cylinder once the boundary layer is resolved?
+# 4. isolated grid fin Mach sweep with the current numerics (the fin table below predates them);
+#    prints the supersonic cascade-theory slope next to each result
+python cases/grid_fin.py --implicit --h 0.025 --out results/grid_fin_v2
+# 5. viscous: does SST separate from a smooth cylinder once the boundary layer is resolved?
 python cases/validate_cylinder_turbulent.py --dual --patch-h 0.001 --shell 0.06
 ```
 
@@ -86,6 +89,7 @@ python cases/validate_cylinder_turbulent.py --dual --patch-h 0.001 --shell 0.06
 | Implicit vs explicit, laminar plate (2x coarse grid) | explicit | same Cf (-7.15 %); needs 8 Jacobi sweeps (2 diverge, 4 stall) |
 | Red-black Gauss-Seidel vs Jacobi relaxation | same steady state | Mach 3 sphere CD 0.9591 vs 0.9596 in 89 s vs 140 s; plate: same Cf after the same iterations (default now) |
 | Super Heavy bare body, 0.5 m grid, M 2.82, 5 deg (CPU) | earlier explicit van Leer run | implicit + Koren: CD 2.208, CN 0.205, C_restore -0.051 vs 2.218, 0.207, -0.050; with the ghost-cell fix: 2.202, 0.199, -0.0515 |
+| Isolated V3 grid fin, Mach 4, 4 cm cells (CPU, implicit) | supersonic cascade theory 1.83 /rad (upper bound) | slope 1.11 /rad with the current numerics, 1.09 with the old (van Leer, axis-mirror walls); 2.5 cm cells gave 1.40 earlier: the fin is resolution-limited, not numerics-limited, at these cell sizes |
 | Ghost-cell fix, Mach 4 cylinder forebody / Mach 3 sphere | before the fix | forebody drag 1.2361 vs 1.2355 (unchanged); sphere CD 0.981 vs 0.959, the difference is in the base / wake region |
 | Solution-adaptive patches, Mach 4 cylinder (`tests/adapt_cylinder.py`) | fine grid, Billig | bow-shock standoff +7.0 % (fine grid +7.4 %, coarse +13.9 %) |
 | Local refinement with SST turbulence, flat plate Re 1e7 (`tests/patch_turbulent_plate.py`) | one fine grid | friction drag 0.00581 vs 0.00581 (fully turbulent Prandtl-Schlichting 0.00601) |
