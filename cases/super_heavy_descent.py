@@ -53,6 +53,9 @@ def main(argv=None):
                     help="parametric = V3 fin model as thin walls (needs cells well below the 0.31 m "
                          "lattice spacing near the fins, e.g. --h-fins 0.03)")
     ap.add_argument("--fin-deflection", type=float, nargs=3, default=(0.0, 0.0, 0.0))
+    ap.add_argument("--no-chines", action="store_true", help="remove all four chines (to isolate their effect)")
+    ap.add_argument("--chines", choices=["all", "tall", "short", "none"], default="all",
+                    help="which chines to fit: tall = the raceway-side pair, short = the rudder-side pair")
     ap.add_argument("--flowthroughs", type=float, default=4.0, help="maximum run length")
     ap.add_argument("--min-flowthroughs", type=float, default=1.0, help="never stop before this")
     ap.add_argument("--tol", type=float, default=5e-4,
@@ -81,6 +84,11 @@ def main(argv=None):
           f"M {a.mach}  q {q/1e3:.1f} kPa  aoa {a.aoa} deg from engines-first, windward side {a.windward} deg")
 
     P = v3_params(fin_model=a.fins, fin_deflection_deg=tuple(a.fin_deflection))
+    which = "none" if a.no_chines else a.chines
+    if which != "all":
+        tall = tuple(c for c in P.chines if c[2] > 32.0)
+        P.chines = {"none": (), "tall": tall, "short": tuple(c for c in P.chines if c not in tall)}[which]
+        print(f"chines fitted: {which} ({len(P.chines)})")
     sdf = lambda X, Y, Z: super_heavy_sdf(X, Y, Z, P)
     thin_sdf = thin_box = None
     if a.fins == "parametric":
@@ -195,7 +203,8 @@ def main(argv=None):
 
     f = s.fields()
     title = (f"Super Heavy V3, engines-first descent: alt {a.alt/1e3:.1f} km, M {a.mach}, "
-             f"{a.aoa} deg off engines-first, fins={a.fins}, h={a.h} m{' uniform' if a.uniform else ' near body'}")
+             f"{a.aoa} deg off engines-first, windward {a.windward:g} deg, fins={a.fins}"
+             f"{'' if which == 'all' else ', chines=' + which}, h={a.h} m{' uniform' if a.uniform else ' near body'}")
     plot_slices(f, f"{a.out}/slice_xz.png", title=title + "  [x-z plane: rudder fin +z]", p_inf=p, normal_axis=1)
     plot_slices(f, f"{a.out}/slice_xy.png", title=title + "  [x-y plane: catch fins]", p_inf=p, normal_axis=2)
     write_vtk(f, f"{a.out}/flow.vtk")
