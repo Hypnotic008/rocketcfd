@@ -20,10 +20,31 @@ from .gas import prim_to_cons, cons_to_prim, hllc_flux
 NG = 2  # ghost layers on the domain boundary
 
 
+_CPU_WARNED = False
+
+
 def default_device():
+    global _CPU_WARNED
     if os.environ.get("ROCKETCFD_DEVICE"):
         return torch.device(os.environ["ROCKETCFD_DEVICE"])
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if not _CPU_WARNED:
+        _CPU_WARNED = True
+        gpu = False
+        try:
+            import shutil
+            import subprocess
+            if shutil.which("nvidia-smi"):
+                gpu = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, timeout=10).returncode == 0
+        except Exception:                                          # noqa: BLE001
+            pass
+        if gpu:
+            print(f"WARNING: an NVIDIA GPU is present but this PyTorch ({torch.__version__}) cannot use CUDA, so "
+                  "rocketcfd runs on the CPU. Reinstall the CUDA build:\n"
+                  "  pip install --force-reinstall torch --index-url https://download.pytorch.org/whl/cu126",
+                  flush=True)
+    return torch.device("cpu")
 
 
 def _sl(a, ax, start, stop):
@@ -46,7 +67,7 @@ class Solver:
     def __init__(self, lo, hi, h, freestream, sdf=None, gamma=1.4, bcs="auto", cfl=0.7,
                  limiter="koren", shock_threshold=0.5, dtype=torch.float32, device=None,
                  verbose=True, faces=None, backend="auto", thin_sdf=None, thin_box=None,
-                 viscous=None, wall=None, turbulence=None, alloc=None, thin_normals=True, low_mach="auto"):
+                 viscous=None, wall=None, turbulence=None, alloc=None, thin_normals=True, low_mach=False):
         """
         lo, hi     : domain corners (m)
         h          : cell size, scalar or (hx, hy, hz)
@@ -70,8 +91,10 @@ class Solver:
         limiter    : 'koren' (default: kappa = 1/3 MUSCL, third-order upwind-biased where smooth;
                      tests/vortex_order.py), 'vanleer' (the earlier default) or 'minmod'
         low_mach   : Thornber et al. (2008) low-Mach correction of the reconstructed velocities (less
-                     dissipation in slow flow; tests/low_mach_cylinder.py). 'auto' (default) = on for a
-                     subsonic freestream only: behind strong shocks it costs ~2 % stagnation pressure
+                     dissipation in slow flow; tests/low_mach_cylinder.py). Off by default: with Koren and
+                     the linear-extrapolation ghost cells it lowers the surface-pressure error at Mach 0.1
+                     (rms 0.069 vs 0.087) but raises the spurious drag (0.027 vs 0.002). True / 'auto'
+                     (on for a subsonic freestream) to use it
         thin_normals : thin-wall faces use the real plate normal for the wall pressure (default);
                      False = axis-aligned mirror (staircase), the earlier behaviour
         alloc      : optional callable(name, shape) -> tensor for the state arrays (U, W, K, O);

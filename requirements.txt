@@ -1,6 +1,7 @@
-# PyTorch: on an NVIDIA machine install the CUDA build first, e.g.
+# PyTorch is NOT listed here on purpose: PyPI's Windows wheels are CPU-only, and pip would
+# replace the CUDA build with one. Install it separately, from the PyTorch index:
 #   pip install torch --index-url https://download.pytorch.org/whl/cu126
-torch>=2.4
+# Check: python -c "import torch; print(torch.__version__, torch.cuda.is_available())"  -> ...+cu126 True
 warp-lang>=1.5          # fused GPU kernels (NVIDIA); falls back to PyTorch without it
 numpy>=1.26
 scipy>=1.11

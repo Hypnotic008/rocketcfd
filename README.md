@@ -36,8 +36,9 @@ guessed aero coefficients in CatchSim (`quatsim/aero.py`).
 * **Local refinement patches**: fine cells only where needed (engine end, grid fins, boundary-
   layer shells, shocks), snapped to the base grid; forebody loads within 0.03 % of an all-fine grid.
   The inviscid booster setup with 6 cm engine end and fins is 6.1 M cells instead of 34 M.
-* **Numerics**: Koren (kappa = 1/3) reconstruction (third order where smooth), low-Mach correction
-  for subsonic freestreams, plate normals on thin walls, true-normal wall function.
+* **Numerics**: Koren (kappa = 1/3) reconstruction (third order where smooth), plate normals on
+  thin walls, linear-extrapolation ghost cells, true-normal wall function; a low-Mach correction
+  is available as an option.
 * **Robustness / memory**: thin-wall setup 13 GB -> 0.3 GB for a grid fin; NaN in viscous patch runs
   fixed; launches cached; divergence retry in the database sweep.
 * **CatchSim**: `cases/aero_database.py` (Mach x aoa x roll sweep with warm starts) ->
@@ -84,7 +85,7 @@ python cases/validate_cylinder_turbulent.py --dual --patch-h 0.001 --shell 0.06
 | Same at Re 1e9 (Super Heavy scale, `--re 1e9`) | White Cf, log law | Cf -3.1 % from White with the first cell at y+ 10,700; profile on the log law |
 | Isentropic vortex, one period (`tests/vortex_order.py`) | exact (initial field) | Koren (default): order 2.8, L1 1.2e-4 at 128^2; van Leer: order 2.3, 3.1e-4 |
 | Sod / Mach 4 cylinder with Koren (`tests/limiter_shocks.py`) | exact / Rayleigh pitot | Sod L1 0.00144 (van Leer 0.00172); stagnation pressure +0.3 % (van Leer -1.0 %) |
-| Inviscid cylinder, Mach 0.1 (`tests/low_mach_cylinder.py`) | potential flow: CD 0, rear Cp 1 | low-Mach correction: CD +0.011, rear Cp 1.03; without: CD -0.053, rear Cp 0.69 |
+| Inviscid cylinder, Mach 0.1 (`tests/low_mach_cylinder.py`) | potential flow: CD 0, rear Cp 1 | current defaults (Koren, ghost-cell fix): CD +0.002, rear Cp 0.65, rms Cp error 0.087; with the low-Mach correction (`low_mach=True`): CD +0.027, rear Cp 1.04, rms 0.069 -- mixed, so it is off by default. (With van Leer and the old ghost cells it had cut CD from -0.053 to +0.011.) |
 | Implicit vs explicit, Mach 3 sphere (`tests/steady_accel.py`) | explicit local time step | CD 0.9625 vs 0.9627, 480 vs 2000 steps, 2.5x less wall time (CPU) |
 | Implicit vs explicit, laminar plate (2x coarse grid) | explicit | same Cf (-7.15 %); needs 8 Jacobi sweeps (2 diverge, 4 stall) |
 | Red-black Gauss-Seidel vs Jacobi relaxation | same steady state | Mach 3 sphere CD 0.9591 vs 0.9596 in 89 s vs 140 s; plate: same Cf after the same iterations (default now) |
@@ -290,8 +291,9 @@ python cases/validate_cylinder_turbulent.py --laminar --re 100 --mach 0.2 --h 0.
 ```
 
 Numerics defaults (changed in this round, see the validation table): Koren (kappa = 1/3) MUSCL
-reconstruction instead of van Leer; Thornber low-Mach correction on for subsonic freestreams;
-thin walls use the real plate normal. Older results in this README used van Leer and the axis-
+reconstruction instead of van Leer; thin walls use the real plate normal; immersed-wall ghost cells
+extrapolate linearly through the wall. The Thornber low-Mach correction is available (`low_mach=True`)
+but off: with the other changes its benefit became mixed. Older results in this README used van Leer and the axis-
 mirror thin walls, so reruns will differ by about the size of their stated uncertainty.
 
 ### Aero database for CatchSim
