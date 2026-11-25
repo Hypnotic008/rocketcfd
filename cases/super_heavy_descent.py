@@ -97,9 +97,9 @@ def main(argv=None):
         r_out = P.radius + 1.35 + 0.5                     # chines reach 5.85 m; outer bells 5.05 m
         zones = [Zone((-1.5, -r_out, -r_out), (L + 1.0, r_out, r_out), a.h, "vehicle")]
         if a.fins != "none" and a.h_fins and a.h_fins < a.h:
-            r_fin = P.radius + 4.2 + 0.4
-            zones.append(Zone((P.fin_x_center - 0.8, -r_fin, -r_fin), (P.fin_x_center + 0.8, r_fin, r_fin),
-                              a.h_fins, "grid fins"))
+            from rocketcfd.vehicles.super_heavy import super_heavy_fins_box
+            fb = super_heavy_fins_box(P, margin=0.3)      # only where fins are (none on the tower side)
+            zones.append(Zone(fb[0], fb[1], a.h_fins, "grid fins"))
         faces = stretched_faces(lo, hi, a.h_far or 4 * a.h, zones, growth=a.growth)
         print(describe(faces))
         if a.dry_run:
@@ -132,6 +132,12 @@ def main(argv=None):
              "hull": (0, P.skirt_bottom_x + 0.6, xf0),
              "fin band": (0, xf0, P.tank_top_x - 0.05),      # fins, pods and the hull beside them
              "top": (0, P.tank_top_x - 0.05, 1e9)}
+    FIN_PARTS = []
+    if a.fins != "none":
+        from rocketcfd.vehicles.super_heavy import fin_selectors
+        fsel = fin_selectors(P)
+        FIN_PARTS = list(fsel)
+        PARTS.update(fsel)
     KEYS = ("CD", "CL", "CN", "CS", "C_roll", "C_restore")
     min_steps = int(a.min_flowthroughs / a.flowthroughs * nsteps)
 
@@ -195,15 +201,42 @@ def main(argv=None):
     write_vtk(f, f"{a.out}/flow.vtk")
     s.save(f"{a.out}/restart.npz")
 
+    # cross-section stations and 3-D surface pressure
+    from rocketcfd.visual3d import plot_stations, surface_pressure, write_vtk_surface, render_surface, \
+        fin_outline_polys
+    stations = [(0.6, "engine bells"), (2.2, "bells at the thrust plate"), (12.0, "lower hull, all 4 chines"),
+                (32.0, "taller chines only"), (50.0, "upper hull"), (P.fin_x_center, "grid fins"),
+                (70.0, "top (truss / dome)")]
+    plot_stations(f, f"{a.out}/stations.png", stations, p, q,
+                  title=title + "\nCp and Mach around the booster (looking from the engines toward the top)",
+                  crossflow=(fs["v"], fs["w"]), fin_sdf=thin_sdf)
+    region = ((-1.5, -6.6, -6.6), (L + 0.6, 6.6, 6.6))
+    xyz, tris, cp_s = surface_pressure(s, q, region)
+    if len(tris) > 400_000:
+        xyz, tris, cp_s = surface_pressure(s, q, region, stride=2)
+    write_vtk_surface(f"{a.out}/surface_cp.vtk", xyz, tris, cp_s)
+    fin_polys = []
+    if a.fins != "none":
+        from rocketcfd.vehicles.grid_fin import GridFinParams
+        fin_polys = fin_outline_polys(P, GridFinParams())
+    tw_vec = (np.cos(tw), np.sin(tw))
+    render_surface(f"{a.out}/surface_cp.png", xyz, tris, cp_s, title=title, fin_polys=fin_polys, windward=tw_vec)
+
     ce = res["catchsim_equivalent"]
     print("\n=== result ===")
     print(f"cells {np.prod(s.n)/1e6:.2f} M, {s.step_count} steps, {wall/60:.1f} min")
     print(f"averaged over the last {len(tail)} load checks (± = unsteadiness, 1 std):")
     print(f"  CD {avg['CD']:.4f} ± {std['CD']:.4f}   CN {avg['CN']:+.4f} ± {std['CN']:.4f}   "
           f"C_restore {avg['C_restore']:+.5f} ± {std['C_restore']:.5f}")
-    for n in PARTS:
+    for n in [k for k in PARTS if k not in FIN_PARTS]:
         print(f"    {n:9s}: CD {avg[f'CD[{n}]']:+.4f} ± {std[f'CD[{n}]']:.4f}   CN {avg[f'CN[{n}]']:+.4f}   "
               f"C_restore {avg[f'C_restore[{n}]']:+.5f}")
+    fin_names = FIN_PARTS
+    if fin_names:
+        print("  per fin (body axes, x toward the top; the fins are also inside 'fin band'):")
+        for n in fin_names:
+            print(f"    {n:13s}: CX {ld['parts'][n]['CX']:+.4f}  CY {ld['parts'][n]['CY']:+.4f}  "
+                  f"CZ {ld['parts'][n]['CZ']:+.4f}  C_restore {ld['parts'][n]['C_restore']:+.5f}")
     print(f"drag coefficient        CFD {ce['drag_coefficient']:.3f}   CatchSim body {ref['cd_body']:.3f}, "
           f"with fin factor {ref['cd_with_fins']:.3f}")
     if ce["cn_alpha"] is not None:

@@ -628,12 +628,17 @@ class Solver:
         F = F_ib + F_thin
         M = M_ib + M_thin
         part_out = {}
-        for name, (axis, lo_, hi_) in (parts or {}).items():
-            sel = (sf["pos"][axis] >= lo_) & (sf["pos"][axis] < hi_)
+        for name, spec in (parts or {}).items():
+            if callable(spec):                     # spec(pos) -> mask, pos is (3, N)
+                sel_of = spec
+            else:
+                axis, lo_, hi_ = spec
+                sel_of = lambda pos, axis=axis, lo_=lo_, hi_=hi_: (pos[axis] >= lo_) & (pos[axis] < hi_)
+            sel = sel_of(sf["pos"])
             Fp = dF[:, sel].sum(1)
             Mp = np.cross(r[:, sel].T, dF[:, sel].T).sum(0)
             if tf is not None:
-                selt = (tf["pos"][axis] >= lo_) & (tf["pos"][axis] < hi_)
+                selt = sel_of(tf["pos"])
                 Fp = Fp + dFt[:, selt].sum(1)
                 Mp = Mp + np.cross(rt[:, selt].T, dFt[:, selt].T).sum(0)
             part_out[name] = (Fp, Mp)
@@ -658,7 +663,8 @@ class Solver:
             else -side
         qs = q * S_ref
         parts_c = {k: dict(CD=float(v[0] @ e_d / qs), CN=float(v[0] @ cross / qs),
-                           C_restore=float(v[1] @ restore_axis / (qs * L_ref)))
+                           C_restore=float(v[1] @ restore_axis / (qs * L_ref)),
+                           CX=float(v[0][0] / qs), CY=float(v[0][1] / qs), CZ=float(v[0][2] / qs))
                    for k, v in part_out.items()}
         return dict(F=F, M=M, F_thin=F_thin, M_thin=M_thin, q_inf=q, parts=parts_c,
                     C_thin=F_thin / (q * S_ref), Cm_thin=M_thin / (q * S_ref * L_ref),

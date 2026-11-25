@@ -165,11 +165,36 @@ def super_heavy_fins_sdf(X, Y, Z, P: SuperHeavyParams = SuperHeavyParams(), fin=
     return out
 
 
-def super_heavy_fins_box(P: SuperHeavyParams = SuperHeavyParams(), fin=None):
+def super_heavy_fins_box(P: SuperHeavyParams = SuperHeavyParams(), fin=None, margin=0.1):
+    """Tight bounding box around the fins that are actually fitted (T layout: no fin on the
+    tower side, so the box does not reach there)."""
     from .grid_fin import GridFinParams
     fin = fin or GridFinParams()
-    rr = P.radius + fin.z_tip + 0.1
-    return ((P.fin_x_center - 0.5 * fin.depth - 0.1, -rr, -rr), (P.fin_x_center + 0.5 * fin.depth + 0.1, rr, rr))
+    ys, zs = [], []
+    for az in P.fin_azimuths:
+        th = _az(az)
+        for r in (P.radius - 0.1, P.radius + fin.z_tip):
+            for t in (-fin.w, fin.w):
+                ys.append(r * np.cos(th) - t * np.sin(th))
+                zs.append(r * np.sin(th) + t * np.cos(th))
+    reach = 0.5 * fin.depth + 0.2      # allows for some fin deflection
+    return ((P.fin_x_center - reach - margin, min(ys) - margin, min(zs) - margin),
+            (P.fin_x_center + reach + margin, max(ys) + margin, max(zs) + margin))
+
+
+def fin_selectors(P: SuperHeavyParams = SuperHeavyParams()):
+    """Load-breakdown selectors (pos -> mask) for each fin, by azimuth and radius."""
+    out = {}
+    names = {0.0: "rudder fin", 90.0: "catch fin 90", 270.0: "catch fin 270"}
+    for az in P.fin_azimuths:
+        th = _az(az)
+
+        def sel(pos, th=th):
+            r = np.hypot(pos[1], pos[2])
+            ang = np.angle(np.exp(1j * (np.arctan2(pos[2], pos[1]) - th)))
+            return (np.abs(pos[0] - P.fin_x_center) < 1.0) & (r > P.radius + 0.3) & (np.abs(ang) < np.radians(40))
+        out[names.get(az, f"fin {az:g}")] = sel
+    return out
 
 
 def _grid_fin_cad(X, Y, Z, P, theta, delta):
