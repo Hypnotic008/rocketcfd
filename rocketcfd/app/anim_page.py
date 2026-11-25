@@ -8,7 +8,7 @@ import sys
 import numpy as np
 from PySide6 import QtCore, QtWidgets
 
-from .common import ROOT, RESULTS, hint, mpl_canvas, open_path, result_folders, style_axes
+from .common import ROOT, RESULTS, hint, mpl_canvas, new_process, open_path, python_exe, result_folders, style_axes
 
 MOVIES = [
     ("Cinematic: flow evolving (LAVA style, needs 3-D snapshots)", "-m rocketcfd.cinematic", ["--mode", "evolve", "--style", "lava"]),
@@ -264,13 +264,11 @@ class AnimPage(QtWidgets.QWidget):
             args += ["--fps", str(self.mfps.value()), "--frames", str(self.frames.value())]
         self.mlog.clear()
         self.mlog.appendPlainText("python " + " ".join(args))
-        self.proc = QtCore.QProcess(self)
-        self.proc.setWorkingDirectory(ROOT)
-        self.proc.setProcessChannelMode(QtCore.QProcess.MergedChannels)
+        self.proc = new_process(self)
         self.proc.readyReadStandardOutput.connect(
             lambda: self.mlog.appendPlainText(bytes(self.proc.readAllStandardOutput()).decode(errors="replace").rstrip()))
         self.proc.finished.connect(self._rendered)
-        self.proc.start(sys.executable, args)
+        self.proc.start(python_exe(), args)
 
     def _cancel(self):
         if self.proc is not None:

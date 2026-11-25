@@ -5,9 +5,9 @@ import re
 import sys
 import time
 
-from PySide6 import QtCore, QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets
 
-from .common import ROOT, hint, mpl_canvas, style_axes
+from .common import ROOT, hint, mpl_canvas, new_process, python_exe, style_axes
 
 RE_MAX = re.compile(r"up to (\d+) (?:iterations|steps)")
 RE_RES = re.compile(r"^(?:iter|step)\s+(\d+).*?res\(rho\) = ([0-9.eE+-]+)")
@@ -137,18 +137,12 @@ class RunPage(QtWidgets.QWidget):
         self.current = nxt
         nxt.status = "running"
         nxt.t0 = time.time()
-        self.proc = QtCore.QProcess(self)
-        self.proc.setWorkingDirectory(ROOT)
-        self.proc.setProcessChannelMode(QtCore.QProcess.MergedChannels)
-        env = QtCore.QProcessEnvironment.systemEnvironment()
-        env.insert("PYTHONUNBUFFERED", "1")
-        env.insert("MPLBACKEND", "Agg")
-        self.proc.setProcessEnvironment(env)
+        self.proc = new_process(self)
         self.proc.readyReadStandardOutput.connect(self._read)
         self.proc.finished.connect(self._done)
         script = nxt.script
         args = (["-u", "-m", script[3:].strip()] if script.startswith("-m ") else ["-u", os.path.join(ROOT, script)])
-        self.proc.start(sys.executable, args + list(nxt.args))
+        self.proc.start(python_exe(), args + list(nxt.args))
         self._relabel()
         self.queue.setCurrentRow(self.jobs.index(nxt))
 
@@ -219,7 +213,7 @@ class RunPage(QtWidgets.QWidget):
             return
         j = self.jobs[row]
         self.logw.setPlainText("\n".join(j.log[-20000:]))
-        self.logw.moveCursor(self.logw.textCursor().End)
+        self.logw.moveCursor(QtGui.QTextCursor.End)
         self._dirty = True
         self._refresh()
 

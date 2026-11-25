@@ -8,7 +8,7 @@ import sys
 from PySide6 import QtCore, QtWidgets
 
 from .cases import CASES, command_line
-from .common import ROOT, hint
+from .common import ROOT, hint, new_process, python_exe
 
 
 class SetupPage(QtWidgets.QWidget):
@@ -239,7 +239,7 @@ class SetupPage(QtWidgets.QWidget):
 
     # ------------------------------------------------------------------ quick checks
     def _quick(self, *flag):
-        cmd = [sys.executable, "-u", os.path.join(ROOT, self.case.script)] + self.args() + list(flag)
+        cmd = [python_exe(), "-u", os.path.join(ROOT, self.case.script)] + self.args() + list(flag)
         dlg = QtWidgets.QDialog(self)
         dlg.setWindowTitle("Grid estimate" if flag[0] == "--dry-run" else "Speed measurement")
         dlg.resize(820, 520)
@@ -250,9 +250,7 @@ class SetupPage(QtWidgets.QWidget):
         close = QtWidgets.QPushButton("Close")
         close.clicked.connect(dlg.accept)
         lay.addWidget(close)
-        proc = QtCore.QProcess(dlg)
-        proc.setWorkingDirectory(ROOT)
-        proc.setProcessChannelMode(QtCore.QProcess.MergedChannels)
+        proc = new_process(dlg)
         proc.readyReadStandardOutput.connect(
             lambda: txt.appendPlainText(bytes(proc.readAllStandardOutput()).decode(errors="replace").rstrip()))
         proc.finished.connect(lambda *_: txt.appendPlainText("\n[done]"))

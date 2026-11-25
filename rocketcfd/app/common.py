@@ -110,3 +110,35 @@ def style_axes(ax, dark=True):
 
 def open_path(path):
     QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(path))
+
+
+def python_exe():
+    """The console Python next to the app's interpreter (the desktop shortcut starts the app
+    with pythonw.exe, whose children would have no usable stdout)."""
+    import sys
+    exe = sys.executable
+    if exe.lower().endswith("pythonw.exe"):
+        cand = exe[:-len("pythonw.exe")] + "python.exe"
+        if os.path.exists(cand):
+            return cand
+    return exe
+
+
+def new_process(parent):
+    """A QProcess in the project folder, output merged, unbuffered, no console window on Windows."""
+    proc = QtCore.QProcess(parent)
+    proc.setWorkingDirectory(ROOT)
+    proc.setProcessChannelMode(QtCore.QProcess.MergedChannels)
+    env = QtCore.QProcessEnvironment.systemEnvironment()
+    env.insert("PYTHONUNBUFFERED", "1")
+    env.insert("MPLBACKEND", "Agg")
+    proc.setProcessEnvironment(env)
+    import sys
+    if sys.platform == "win32":
+        try:
+            def no_window(args):
+                args.flags |= 0x08000000          # CREATE_NO_WINDOW
+            proc.setCreateProcessArgumentsModifier(no_window)
+        except Exception:                          # noqa: BLE001
+            pass
+    return proc
