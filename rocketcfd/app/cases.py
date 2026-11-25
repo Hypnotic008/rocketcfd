@@ -90,7 +90,8 @@ def _sh_fields():
               "On automatically with refinement patches.", G5),
         Field("explicit", "Force explicit (with patches)", "bool", False, "Explicit local time steps on the patch "
               "grids instead of the implicit solver.", G5, advanced=True),
-        Field("cfl-max", "Implicit CFL", "float", 20.0, "", G5, lo=1, hi=200, step=5, advanced=True),
+        Field("cfl-max", "Implicit CFL", "float", 0.0, "0 = automatic (20; 5 with engines firing)", G5, lo=0, hi=200,
+              step=5, advanced=True),
         Field("iters", "Max implicit iterations", "int", 4000, "", G5, lo=10, hi=100000, step=500),
         Field("flowthroughs", "Max flow-throughs (explicit)", "float", 4.0, "Run length for the explicit solver.",
               G5, lo=0.1, hi=100, step=1, advanced=True),
@@ -224,7 +225,37 @@ PLATE = Case(
     ])
 
 
-CASES = [SUPER_HEAVY, AERO_DB, GRID_FIN, CYLINDER, TGV, PLATE]
+HOT_STAGING = Case(
+    "Hot staging - Starship lights on the booster",
+    "cases/hot_staging.py",
+    "Starship's engines ignite while it sits on the booster's vented interstage: the plumes hit the "
+    "booster's dome and blow out through the vents. Time-accurate, with an ignition ramp; made for "
+    "movies (snapshots) and pressure histories (probes). Approximate public dimensions.",
+    [
+        Field("mach", "Mach number", "float", 4.5, "", "Flight condition", lo=0.5, hi=10, step=0.5),
+        Field("alt", "Altitude [m]", "float", 65000.0, "", "Flight condition", lo=0, hi=90000, step=1000, decimals=0),
+        Field("aoa", "Angle of attack [deg]", "float", 0.0, "", "Flight condition", lo=0, hi=20, step=1),
+        Field("ship-engines", "Ship engines", "choice", "all", "", "Engines", choices=["all", "sea-level", "none"]),
+        Field("booster-engines", "Booster engines still firing", "choice", "centre", "", "Engines",
+              choices=["centre", "inner", "none"]),
+        Field("ignition", "Ignition ramp [s]", "float", 0.02, "", "Engines", lo=0.0, hi=1.0, step=0.005, decimals=3),
+        Field("h", "Cell size near the stack [m]", "float", 0.5, "", "Grid", lo=0.05, hi=2, step=0.05),
+        Field("ring-h", "Interstage refinement [m]", "float", 0.0, "Cell size in a block around the hot-stage ring "
+              "(0 = off), e.g. 0.1.", "Grid", lo=0.0, hi=0.5, step=0.02),
+        Field("time", "Physical time [s]", "float", 0.15, "", "Solver", lo=0.001, hi=5, step=0.05),
+        Field("cfl", "CFL", "float", 0.6, "", "Solver", lo=0.1, hi=0.9, step=0.05, advanced=True),
+        Field("snapshots", "Snapshots for movies", "int", 0, "", "Output", lo=0, hi=5000, step=50),
+        Field("snap-volume", "3-D snapshot stride", "int", 0, "", "Output", lo=0, hi=8),
+        Field("probes", "Probe points", "bool", False, "", "Output"),
+        Field("out", "Results folder", "text", "results/hot_staging", "", "Output", always=True),
+    ],
+    presets={"Quick test (coarse, 50 ms)": dict(h=1.0, time=0.05, snapshots=20, **{"snap-volume": 1}, probes=True),
+             "Movie (fine interstage, 0.25 s)": dict(h=0.4, time=0.25, snapshots=150, probes=True,
+                                                     **{"ring-h": 0.1, "snap-volume": 1})},
+    dry_run=True, gpu_minutes="minutes (quick test) to ~1-2 h (movie)")
+
+
+CASES = [SUPER_HEAVY, AERO_DB, HOT_STAGING, GRID_FIN, CYLINDER, TGV, PLATE]
 
 
 def command_line(case, values):

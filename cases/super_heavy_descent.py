@@ -90,7 +90,7 @@ def main(argv=None):
     ap.add_argument("--implicit", action="store_true",
                     help="implicit steady solver (DP-LUR pseudo-time stepping): far fewer iterations "
                          "than the explicit solver, most useful with fine near-wall cells")
-    ap.add_argument("--cfl-max", type=float, default=20.0, help="implicit solver CFL number")
+    ap.add_argument("--cfl-max", type=float, default=0.0, help="implicit solver CFL number (default 20; 5 with engines firing)")
     ap.add_argument("--explicit", action="store_true",
                     help="with patches: explicit local-time-step steps instead of the implicit solver "
                          "(cheaper per step; often faster for inviscid runs without very thin cells)")
@@ -119,6 +119,9 @@ def main(argv=None):
                     help="start from a previous run's restart.npz (or its folder): same grid = continue exactly; "
                          "other grid / physics = interpolated start (e.g. LES or RANS from a converged inviscid run)")
     a = ap.parse_args(argv)
+    if not a.cfl_max:
+        # plumes against the oncoming flow are strongly unsteady: smaller pseudo time steps
+        a.cfl_max = 5.0 if a.engines != "none" else 20.0
     if a.les:
         # LES is unsteady: physical time steps, explicit, and the run never stops early (the
         # reported coefficients are averages over the last quarter of the run)

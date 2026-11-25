@@ -1498,13 +1498,13 @@ DIV_KERNELS = [[_make_div_kernel(d, v) for d in range(3)] for v in (0, 1)]
 # ---------------------------------------------------------------- engine jets
 @wp.kernel
 def jet_kernel(W: wp.array4d(dtype=wp.float32), cells: wp.array(dtype=wp.vec3i), state: wp.array(dtype=vec5),
-               ambient: vec5, throttle: float):
+               group: wp.array(dtype=wp.int32), ambient: vec5, throttle: wp.array(dtype=wp.float32)):
     """Nozzle-exit inflow: the solid cells just inside each nozzle exit hold the exhaust state
     (overriding the immersed-boundary mirror), so the jet flows out through the exit plane.
-    throttle 0..1 blends from the ambient state (ignition / shutdown transients)."""
+    throttle[jet] 0..1 blends from the ambient state (ignition / shutdown transients)."""
     t = wp.tid()
     c = cells[t]
-    q = ambient + (state[t] - ambient) * throttle
+    q = ambient + (state[t] - ambient) * throttle[group[t]]
     for m in range(5):
         W[m, c[0], c[1], c[2]] = q[m]
 

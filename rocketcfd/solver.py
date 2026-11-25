@@ -109,7 +109,8 @@ class Solver:
                      ~2.5 cells behind each exit disk hold the exhaust state, so the plume is part of the
                      flow (landing burns, hot staging, retropropulsion). One perfect gas (the freestream
                      gamma and R): choose T so the exit velocity mach * sqrt(gamma R T) is right.
-                     self.jet_throttle (0..1) blends from ambient (ignition transients). Warp backend.
+                     self.jet_throttle (0..1, or a list with one value per jet) blends from ambient
+                     (ignition transients). Warp backend.
         thin_normals : thin-wall faces use the real plate normal for the wall pressure (default);
                      False = axis-aligned mirror (staircase), the earlier behaviour
         alloc      : optional callable(name, shape) -> tensor for the state arrays (U, W, K, O);
@@ -333,10 +334,10 @@ class Solver:
 
     def _setup_jets(self, wp, K):
         """Cells that hold each engine's exhaust state (see the `jets` argument)."""
-        cells, states = [], []
+        cells, states, groups = [], [], []
         g = self.gamma
         self.jet_cells = []
-        for jt in self.jets:
+        for ji, jt in enumerate(self.jets):
             c = np.asarray(jt["center"], float)
             d = np.asarray(jt["direction"], float)
             d = d / np.linalg.norm(d)
@@ -365,14 +366,18 @@ class Solver:
             q = np.array([pe / (Rg * T), u[0], u[1], u[2], pe], np.float32)
             cells.append(idx)
             states.append(np.repeat(q[None], len(idx), 0))
+            groups.append(np.full(len(idx), ji, np.int32))
             self.jet_cells.append(len(idx))
         if not cells or sum(len(cc) for cc in cells) == 0:
             return None
         cells = np.concatenate(cells).astype(np.int32)
         states = np.concatenate(states).astype(np.float32)
+        self._jet_thr = torch.ones(len(self.jets), dtype=torch.float32, device=self.device)
+        self._jet_thr_np = np.ones(len(self.jets), np.float32)
         return dict(n=len(cells), cells=wp.array(cells, dtype=wp.vec3i, device=self._wdev),
                     state=wp.array(states, dtype=K.vec5, device=self._wdev),
-                    ambient=K.vec5(*[float(v) for v in self.W_inf]))
+                    group=wp.array(np.concatenate(groups), dtype=wp.int32, device=self._wdev),
+                    ambient=K.vec5(*[float(v) for v in self.W_inf]), throttle=wp.from_torch(self._jet_thr))
 
     def _init_turbulence(self):
         """Freestream k and omega (NASA Turbulence Modeling Resource SST defaults) everywhere."""
@@ -811,7 +816,11 @@ class Solver:
                                                        ib["normal"], ib["ratio"], int(self.wall == "noslip")])
         jt = getattr(self, "_wp_jets", None)
         if jt is not None:
-            self._L(K.jet_kernel, jt["n"], [w["W"], jt["cells"], jt["state"], jt["ambient"], float(self.jet_throttle)])
+            thr = np.broadcast_to(np.asarray(self.jet_throttle, np.float32), self._jet_thr_np.shape)
+            if np.any(thr != self._jet_thr_np):                 # upload only when it changes
+                self._jet_thr_np = thr.copy()
+                self._jet_thr.copy_(torch.as_tensor(self._jet_thr_np))
+            self._L(K.jet_kernel, jt["n"], [w["W"], jt["cells"], jt["state"], jt["group"], jt["ambient"], jt["throttle"]])
         self._L(K.shock_kernel, shape, [w["W"], self._active_sensor, self.shock_threshold, w["S"]])
         if self.les and self.les["sgs"] == "vreman":
             self._L(K.vreman_kernel, shape, [w["W"], self._vp, float(self.les["cv"]), self._vp.mut])
