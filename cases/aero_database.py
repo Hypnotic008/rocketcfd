@@ -100,6 +100,18 @@ def solve_case(runner, a, parts, cold):
             return settled(hist, tolv)
         return False
 
+    if a.explicit:
+        min_it = 1500 if cold else 600
+        t0 = time.time()
+        if hasattr(runner, "run_explicit"):
+            runner.run_explicit(a.max_steps, chunk=200, report=report, first_order_steps=(300 if cold else 0))
+        else:
+            runner.run(a.max_steps, chunk=200, first_order_steps=(300 if cold else 0), report=report, steady=True,
+                       local_dt=True, active_tiles=False)
+        tail = full[-max(3, len(full) // 5):]
+        conv = len(hist) >= 4 and settled(hist, (a.tol * max(abs(hist[-1][0]), 1e-6), a.tol, a.tol))
+        return tail, dict(iters=runner.step_count, wall_s=time.time() - t0, converged=bool(conv),
+                          res=float(runner.history[-1][-1]) if runner.history else float("nan"))
     kw = dict(chunk=a.check, report=report, cfl_max=a.cfl_max)
     if cold:
         kw.update(first_order_steps=150, cfl_start=1.0, cfl_ramp=200)
@@ -157,6 +169,9 @@ def main(argv=None):
     ap.add_argument("--turbulent", action="store_true")
     ap.add_argument("--cfl-max", type=float, default=20.0)
     ap.add_argument("--max-iters", type=int, default=1500)
+    ap.add_argument("--explicit", action="store_true",
+                    help="explicit local-time-step steps instead of the implicit solver (compare speed)")
+    ap.add_argument("--max-steps", type=int, default=6000, help="explicit: maximum steps per case")
     ap.add_argument("--min-iters", type=int, default=200, help="warm-started cases")
     ap.add_argument("--min-iters-cold", type=int, default=500)
     ap.add_argument("--check", type=int, default=50, help="iterations between load checks")

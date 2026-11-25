@@ -537,7 +537,7 @@ class PatchGrid:
             K = g._K
             g._L(K.prim_kernel, tuple(g.U.shape[1:]), [g._w["U"], g.gamma, g.rho_min, g.p_min, g._w["W"]])
 
-    def run_explicit(self, steps, chunk=500, report=None):
+    def run_explicit(self, steps, chunk=500, report=None, first_order_steps=0):
         """Explicit SSP-RK2 local-time-step steps on all grids (each grid with its own local steps,
         coupled every step as in run). Used to finish turbulent runs; see Solver.run."""
         t0 = time.time()
@@ -549,9 +549,10 @@ class PatchGrid:
                 k = min(chunk, steps - done)
                 for kk in range(k):
                     rs = []
+                    order = 0.0 if self.base.step_count + kk < first_order_steps else 1.0
                     for gi in order_by_size:
                         g = self.grids[gi]
-                        _, r = g._step_warp(1.0, want_res=(kk == k - 1), local=True)
+                        _, r = g._step_warp(order, want_res=(kk == k - 1), local=True)
                         rs.append((g.n_fluid, r))
                     self._restrict()
                 done += k

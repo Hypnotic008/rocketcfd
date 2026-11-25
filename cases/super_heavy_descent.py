@@ -66,6 +66,9 @@ def main(argv=None):
                     help="implicit steady solver (DP-LUR pseudo-time stepping): far fewer iterations "
                          "than the explicit solver, most useful with fine near-wall cells")
     ap.add_argument("--cfl-max", type=float, default=20.0, help="implicit solver CFL number")
+    ap.add_argument("--explicit", action="store_true",
+                    help="with patches: explicit local-time-step steps instead of the implicit solver "
+                         "(cheaper per step; often faster for inviscid runs without very thin cells)")
     ap.add_argument("--wall-h", default="",
                     help="local refinement: a shell of patches around the hull with cells hx,hy,hz [m], "
                          "e.g. 0.25,0.03,0.03 (fine across the wall, long along the booster). Implies --implicit")
@@ -141,7 +144,7 @@ def main(argv=None):
     patches = []
     if a.wall_h or a.fin_h or a.engine_h:
         from rocketcfd.patches import wall_patches
-        a.implicit = True
+        a.implicit = not a.explicit
         pbox = tuple(int(v) for v in a.patch_box.split(","))
         if a.wall_h:
             hw = tuple(float(v) for v in a.wall_h.split(","))
@@ -243,7 +246,9 @@ def main(argv=None):
         rec.record(0, 0.0)
         snap = (max(1, nsteps // a.snapshots), rec.record)
         print(f"recording a snapshot every {snap[0]} steps into {a.out}/snapshots")
-    if patches:
+    if patches and a.explicit:
+        runner.run_explicit(nsteps, chunk=chunk, report=report, first_order_steps=400)
+    elif patches:
         runner.run(nsteps, chunk=chunk, first_order_steps=200, report=report, snapshot=snap,
                    cfl_max=a.cfl_max, cfl_ramp=300)
     elif a.implicit:
