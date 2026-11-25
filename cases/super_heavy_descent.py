@@ -62,6 +62,20 @@ def main(argv=None):
                     help="viscous air (Sutherland) with k-omega SST and the wall function (default: inviscid)")
     ap.add_argument("--chines", choices=["all", "tall", "short", "none"], default="all",
                     help="which chines to fit: tall = the raceway-side pair, short = the rudder-side pair")
+    ap.add_argument("--implicit", action="store_true",
+                    help="implicit steady solver (DP-LUR pseudo-time stepping): far fewer iterations "
+                         "than the explicit solver, most useful with fine near-wall cells")
+    ap.add_argument("--cfl-max", type=float, default=20.0, help="implicit solver CFL number")
+    ap.add_argument("--wall-h", default="",
+                    help="local refinement: a shell of patches around the hull with cells hx,hy,hz [m], "
+                         "e.g. 0.25,0.03,0.03 (fine across the wall, long along the booster). Implies --implicit")
+    ap.add_argument("--wall-shell", type=float, default=0.45, help="thickness of the refined hull shell [m]")
+    ap.add_argument("--fin-h", type=float, default=0.0,
+                    help="local refinement: patches of this cell size [m] around the grid fins only, "
+                         "e.g. 0.03 (replaces --h-fins slab refinement). Implies --implicit")
+    ap.add_argument("--fin-shell", type=float, default=0.3, help="refined distance around the fins [m]")
+    ap.add_argument("--patch-box", default="32,96,96", help="max patch size in cells (x,y,z)")
+    ap.add_argument("--iters", type=int, default=4000, help="implicit solver: maximum iterations")
     ap.add_argument("--flowthroughs", type=float, default=4.0, help="maximum run length")
     ap.add_argument("--min-flowthroughs", type=float, default=1.0, help="never stop before this")
     ap.add_argument("--tol", type=float, default=5e-4,
@@ -117,20 +131,50 @@ def main(argv=None):
             zones.append(Zone(fb[0], fb[1], a.h_fins, "grid fins"))
         faces = stretched_faces(lo, hi, a.h_far or 4 * a.h, zones, growth=a.growth)
         print(describe(faces))
+    else:
+        h3 = np.broadcast_to(np.asarray(a.h, float), (3,))
+        faces = [lo[d] + h3[d] * np.arange(int(round((hi[d] - lo[d]) / h3[d])) + 1) for d in range(3)]
+    patches = []
+    if a.wall_h or a.fin_h:
+        from rocketcfd.patches import wall_patches
+        a.implicit = True
+        pbox = tuple(int(v) for v in a.patch_box.split(","))
+        if a.wall_h:
+            hw = tuple(float(v) for v in a.wall_h.split(","))
+            hw = hw * 3 if len(hw) == 1 else hw
+            print(f"hull shell patches ({hw} m cells within {a.wall_shell} m of the hull):")
+            patches += wall_patches(faces, hw, a.wall_shell, sdf=sdf, box=pbox)
+        if a.fin_h:
+            if thin_sdf is None:
+                raise SystemExit("--fin-h needs --fins parametric")
+            print(f"grid fin patches ({a.fin_h} m cells within {a.fin_shell} m of the fins):")
+            patches += wall_patches(faces, a.fin_h, a.fin_shell, thin_sdf=thin_sdf, thin_box=thin_box,
+                                    box=(64, 64, 64))
+    if not a.uniform or patches:
         if a.dry_run:
-            n = np.prod([len(f) - 1 for f in faces])
+            n = np.prod([len(f) - 1 for f in faces]) + sum(int(np.prod([len(f) - 1 for f in pf])) for pf in patches)
             try:
                 import warp  # noqa: F401
                 per, what = (175, "Warp kernels + SST") if a.turbulent else (115, "Warp kernels")
+                if a.implicit:
+                    per, what = per + 25, what + " + implicit"
             except ImportError:
                 per, what = 500, "PyTorch path"
+            if patches:
+                print(f"base grid + {len(patches)} patches = {n/1e6:.2f} M cells")
             print(f"estimated GPU memory ~{n * per / 2**30:.1f} GB ({what}, ~{per} B/cell); "
                   f"setup needs ~{n * 120 / 2**30:.0f} GB of system RAM")
             return None
     visc = dict(model="sutherland") if a.turbulent else None
     turb = dict(model="sst") if a.turbulent else None
-    s = Solver(lo, hi, a.h, fs, sdf=sdf, cfl=0.7, dtype=dtype, faces=faces, thin_sdf=thin_sdf, thin_box=thin_box,
-               viscous=visc, turbulence=turb)
+    if patches:
+        from rocketcfd.patches import PatchGrid
+        runner = PatchGrid(faces, patches, fs, sdf=sdf, cfl=0.7, thin_sdf=thin_sdf, thin_box=thin_box,
+                           viscous=visc, turbulence=turb)
+        s = runner.base
+    else:
+        s = runner = Solver(lo, hi, a.h, fs, sdf=sdf, cfl=0.7, dtype=dtype, faces=faces, thin_sdf=thin_sdf,
+                            thin_box=thin_box, viscous=visc, turbulence=turb)
     if s.n_ib_fallback:
         print(f"note: {s.n_ib_fallback} ghost cells used nearest-fluid fallback (thin features)")
 
@@ -140,7 +184,11 @@ def main(argv=None):
     dt_est = s.cfl / ((V + cs) / hmin + 2 * (cs + V * np.sin(al)) / hmin)
     nsteps = a.steps or int(a.flowthroughs * (s.hi[0] - s.lo[0]) / V / dt_est)
     nsteps = int(np.ceil(nsteps / 100) * 100)
-    print(f"running up to {nsteps} steps ({a.flowthroughs:g} flow-throughs), stopping early when converged")
+    if a.implicit:
+        nsteps = a.steps or a.iters
+        print(f"implicit solver: up to {nsteps} iterations at CFL {a.cfl_max:g}, stopping early when converged")
+    else:
+        print(f"running up to {nsteps} steps ({a.flowthroughs:g} flow-throughs), stopping early when converged")
 
     hist = []
     full = []
@@ -157,7 +205,7 @@ def main(argv=None):
         FIN_PARTS = list(fsel)
         PARTS.update(fsel)
     KEYS = ("CD", "CL", "CN", "CS", "C_roll", "C_restore")
-    min_steps = int(a.min_flowthroughs / a.flowthroughs * nsteps)
+    min_steps = int(a.min_flowthroughs / a.flowthroughs * nsteps) if not a.implicit else min(600, nsteps)
 
     def report(sv):
         ld = sv.loads(**REFERENCE, parts=PARTS)
@@ -176,6 +224,8 @@ def main(argv=None):
 
     t0 = time.time()
     chunk = max(100, int(round(nsteps / 40 / 50)) * 50)       # ~40 load checks over the max length
+    if a.implicit:
+        chunk = 50
     snap = None
     if a.snapshots:
         from rocketcfd.snapshots import SnapshotRecorder
@@ -184,10 +234,18 @@ def main(argv=None):
         rec.record(0, 0.0)
         snap = (max(1, nsteps // a.snapshots), rec.record)
         print(f"recording a snapshot every {snap[0]} steps into {a.out}/snapshots")
-    s.run(nsteps, chunk=chunk, first_order_steps=400, report=report, steady=not a.time_accurate, snapshot=snap)
+    if patches:
+        runner.run(nsteps, chunk=chunk, first_order_steps=200, report=report, snapshot=snap,
+                   cfl_max=a.cfl_max, cfl_ramp=300)
+    elif a.implicit:
+        s.run(nsteps, chunk=chunk, first_order_steps=200, report=report, steady=True, snapshot=snap,
+              implicit=True, cfl_max=a.cfl_max, cfl_ramp=300)
+    else:
+        s.run(nsteps, chunk=chunk, first_order_steps=400, report=report, steady=not a.time_accurate,
+              snapshot=snap)
     wall = time.time() - t0
 
-    ld = s.loads(**REFERENCE, parts=PARTS)
+    ld = runner.loads(**REFERENCE, parts=PARTS)
     sa = np.sin(al)
     # average over the last quarter of the load checks (at least 4): unsteady wakes make a
     # single snapshot misleading; the standard deviation shows how unsteady it was
@@ -199,7 +257,7 @@ def main(argv=None):
         condition=dict(alt=a.alt, mach=a.mach, aoa_from_engines_first=a.aoa, V=V, q=q, p=p, rho=rho, T=T),
         grid=dict(h=a.h, h_far=None if a.uniform else (a.h_far or 4 * a.h), h_fins=a.h_fins or None,
                   uniform=a.uniform, growth=a.growth, n=list(s.n), cells=int(np.prod(s.n)),
-                  steps=s.step_count, wall_s=wall,
+                  steps=s.step_count, wall_s=wall, solver="implicit" if a.implicit else "explicit",
                   device=str(s.device), gpu=torch.cuda.get_device_name(s.device) if s.device.type == "cuda" else None),
         fins=dict(model=a.fins, scale=list(P.fin_scale), deflection=list(a.fin_deflection)),
         condition_windward=a.windward,

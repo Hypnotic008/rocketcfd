@@ -25,7 +25,7 @@ def blasius_profile(eta_max=8.0):
 
 
 def main(out="results", Re=1e5, M=0.4, hy=0.0008, hx=0.01, tiles=True, local_dt=False, x_out=4.0, y_half=0.6,
-         tag_extra=""):
+         tag_extra="", implicit=False, cfl_max=20.0):
     os.makedirs(out, exist_ok=True)
     T, p = 288.15, 101325.0
     R, g = 287.05, 1.4
@@ -56,8 +56,12 @@ def main(out="results", Re=1e5, M=0.4, hy=0.0008, hx=0.01, tiles=True, local_dt=
 
     import time
     t0 = time.time()
-    s.run(120000, chunk=2000, first_order_steps=500, report=report, steady=tiles or local_dt,
-          active_tiles=tiles, local_dt=local_dt)
+    if implicit:
+        s.run(20000, chunk=100, first_order_steps=200, report=report, steady=True, implicit=True,
+              cfl_max=cfl_max, cfl_ramp=300)
+    else:
+        s.run(120000, chunk=2000, first_order_steps=500, report=report, steady=tiles or local_dt,
+              active_tiles=tiles, local_dt=local_dt)
     wall = time.time() - t0
     f = s.fields()
     x, y = f["x"], f["y"]
@@ -95,11 +99,12 @@ def main(out="results", Re=1e5, M=0.4, hy=0.0008, hx=0.01, tiles=True, local_dt=
     ax[1].legend()
     ax[1].set_title(f"profile: max |error| {prof_err:.3f}")
     fig.suptitle(f"Laminar flat plate, Mach {M}, Re_L = {Re:.0e}, {int(0.04/hy)} cells across +/-2 cm")
-    tag = ("" if tiles else "_notiles") + ("_localdt" if local_dt else "") + tag_extra
+    tag = ("_implicit" if implicit else ("" if tiles else "_notiles") + ("_localdt" if local_dt else "")) + tag_extra
     fig.savefig(f"{out}/validate_blasius{tag}.png", dpi=120)
     print(f"Blasius: Cf mean deviation {100*err:+.2f} % (0.2 < x < 0.8); profile max |u/U error| {prof_err:.3f}; "
-          f"{s.step_count} steps, {wall/60:.1f} min ({'tiles' if tiles else 'no tiles'}, "
-          f"{'local' if local_dt else 'global'} time step)")
+          f"{s.step_count} {'iterations' if implicit else 'steps'}, {wall/60:.1f} min "
+          + (f"(implicit, CFL {cfl_max:g})" if implicit else
+             f"({'tiles' if tiles else 'no tiles'}, {'local' if local_dt else 'global'} time step)"))
     return err, prof_err
 
 
@@ -112,7 +117,11 @@ if __name__ == "__main__":
                     help="outflow boundary position [m] (plate ends at 1.0; at 1.2 the outflow raises Cf on the rear half)")
     ap.add_argument("--y-half", type=float, default=0.6, help="half-height of the domain [m]")
     ap.add_argument("--coarse", action="store_true", help="2x coarser (quick check)")
+    ap.add_argument("--implicit", action="store_true", help="implicit steady solver (DP-LUR)")
+    ap.add_argument("--out", default="results")
+    ap.add_argument("--cfl-max", type=float, default=20.0, help="implicit solver CFL number")
     a = ap.parse_args()
     k = 2.0 if a.coarse else 1.0
-    main(tiles=not a.no_tiles, local_dt=a.local_dt, x_out=a.x_out, y_half=a.y_half, hy=0.0008 * k, hx=0.01 * k,
-         tag_extra=("_coarse" if a.coarse else "") + (f"_x{a.x_out:g}_y{a.y_half:g}" if (a.x_out, a.y_half) != (4.0, 0.6) else ""))
+    main(out=a.out, tiles=not a.no_tiles, local_dt=a.local_dt, x_out=a.x_out, y_half=a.y_half, hy=0.0008 * k, hx=0.01 * k,
+         tag_extra=("_coarse" if a.coarse else "") + (f"_x{a.x_out:g}_y{a.y_half:g}" if (a.x_out, a.y_half) != (4.0, 0.6) else ""),
+         implicit=a.implicit, cfl_max=a.cfl_max)

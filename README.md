@@ -21,6 +21,10 @@ guessed aero coefficients in CatchSim (`quatsim/aero.py`).
 | Pressure loads -> CD, CN, Cm in CatchSim's reference frame | done |
 | One-case-per-GPU sweep that writes an aero database CSV | done |
 | Output: slice plots, ParaView VTK, STL of the geometry | done |
+| Laminar Navier-Stokes; k-omega SST with a Spalding wall function; skin friction included in the loads | done |
+| Implicit steady solver: backward Euler in pseudo time, matrix-free Rusanov Jacobian, 8 Jacobi sweeps (DP-LUR), local pseudo time steps; k-omega advanced the same way (`--implicit`) | done |
+| Dual time stepping (BDF2 outer steps, implicit inner iterations) for unsteady flows: the time step follows the physics, not the smallest cell | done |
+| Local refinement: patches of finer cells (anisotropic allowed) coupled to a coarse base grid; generator for shells around walls and boxes around the grid fins (`--wall-h`, `--fin-h`) | done |
 
 ### Validation
 
@@ -187,6 +191,39 @@ python cases/super_heavy_descent.py --h 0.1 --fins cad_filled
 python cases/aero_sweep.py --gpus 1 --h 0.3                  # descent x AoA x windward side
 python cases/benchmark.py                                    # speed: PyTorch vs Warp kernels
 python tests/compare_backends.py                             # Warp kernels vs PyTorch reference
+```
+
+### Implicit solver and local refinement
+
+Steady runs converge in far fewer iterations with the implicit solver, most of all when
+the grid has thin cells next to walls:
+
+```bash
+python cases/validate_blasius.py --implicit
+python cases/validate_turbulent_plate.py --implicit
+python cases/super_heavy_descent.py --h 0.25 --h-fins 0.07 --fins parametric --aoa 15 --windward 0 --implicit
+```
+
+Local refinement puts fine cells only where they are needed instead of refining whole
+slabs of the grid. Patches can be anisotropic: around the hull, cells only 3 cm across the
+wall but 25 cm along the booster resolve the boundary layer at a fraction of the cost.
+Patches imply the implicit solver:
+
+```bash
+# grid fins resolved by 3 cm patches around each fin (no fin slab), coarse base grid
+python cases/super_heavy_descent.py --h 0.3 --fins parametric --fin-h 0.03 --aoa 15 --windward 0
+# plus a boundary-layer shell around the hull, viscous
+python cases/super_heavy_descent.py --h 0.4 --fins parametric --fin-h 0.03 --wall-h 0.25,0.03,0.03 \
+    --wall-shell 0.4 --aoa 15 --windward 0 --turbulent
+# add --dry-run to see the patch count, cells and memory first
+```
+
+Unsteady flows use dual time stepping (`Solver.run_unsteady`, `PatchGrid.run_unsteady`), e.g.
+the cylinder with its boundary layer resolved by a 1 mm patch shell:
+
+```bash
+python cases/validate_cylinder_turbulent.py --dual --patch-h 0.001 --shell 0.06
+python cases/validate_cylinder_turbulent.py --laminar --re 100 --mach 0.2 --h 0.02 --dual   # laminar shedding check
 ```
 
 ### Sizing for the GPU

@@ -47,6 +47,8 @@ def main():
     ap.add_argument("--hx", type=float, default=0.01)
     ap.add_argument("--max-steps", type=int, default=150000)
     ap.add_argument("--out", default="results")
+    ap.add_argument("--implicit", action="store_true", help="implicit steady solver (DP-LUR)")
+    ap.add_argument("--cfl-max", type=float, default=20.0)
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     T, p, R, g = 288.15, 101325.0, 287.05, 1.4
@@ -77,7 +79,11 @@ def main():
         return settled(hist, 1e-3 * np.maximum(np.abs(vals), 1e-3), window=4, trend_window=8, horizon=10)
 
     t0 = time.time()
-    s.run(a.max_steps, chunk=2000, first_order_steps=500, report=report, steady=True, active_tiles=False)
+    if a.implicit:
+        s.run(min(a.max_steps, 20000), chunk=100, first_order_steps=200, report=report, steady=True,
+              implicit=True, cfl_max=a.cfl_max, cfl_ramp=300)
+    else:
+        s.run(a.max_steps, chunk=2000, first_order_steps=500, report=report, steady=True, active_tiles=False)
     wall = time.time() - t0
     f = s.fields()
     x, y = f["x"], f["y"]

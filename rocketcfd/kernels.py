@@ -890,7 +890,7 @@ def implicit_sweep_kernel(U: wp.array4d(dtype=wp.float32), W: wp.array4d(dtype=w
                           R: wp.array4d(dtype=wp.float32), ix: wp.array(dtype=wp.float32),
                           iy: wp.array(dtype=wp.float32), iz: wp.array(dtype=wp.float32), active: wp.vec3i,
                           blk: wp.array3d(dtype=wp.int32), mask: wp.array3d(dtype=wp.float32), vp: Visc,
-                          g: float, cfl: float, first: int,
+                          g: float, cfl: float, ddiag: float, first: int,
                           dUo: wp.array4d(dtype=wp.float32), dUn: wp.array4d(dtype=wp.float32)):
     """One Jacobi sweep of the backward-Euler system (1/dt + dF/dU) dU = R with a matrix-free,
     first-order Rusanov Jacobian (data-parallel LU relaxation, Wright, Candler & Bose 1996):
@@ -899,7 +899,8 @@ def implicit_sweep_kernel(U: wp.array4d(dtype=wp.float32), W: wp.array4d(dtype=w
 
     with D = (1 + 1/cfl) sum_d lam_d / dx_d, i.e. the local pseudo time step dt = cfl / sum(lam/dx).
     dF(n) = F(U_n + dU_n) - F(U_n) is the exact flux change. Boundary, wall and thin-wall
-    neighbours are treated explicitly (no coupling). first = 1 starts from dU = 0."""
+    neighbours are treated explicitly (no coupling). first = 1 starts from dU = 0.
+    ddiag adds a0 / dt_phys to the diagonal in dual time stepping (0 for steady runs)."""
     i, j, k = wp.tid()
     I = i + 2
     J = j + 2
@@ -937,7 +938,7 @@ def implicit_sweep_kernel(U: wp.array4d(dtype=wp.float32), W: wp.array4d(dtype=w
                             dF = flux_of_cons(un + du, d, g) - flux_of_cons(un, d, g)
                             ln = lam_speed(W, vp, g, ni + 2, nj + 2, nk + 2, d, inv_at(ix, iy, iz, d, p))
                             off = off + (float(sg) * dF - du * ln) * (0.5 * inv)
-    dg = s / cfl + s
+    dg = s / cfl + s + ddiag
     for c in range(5):
         dUn[c, I, J, K] = (R[c, i, j, k] - off[c]) / dg
 
@@ -985,3 +986,135 @@ def turb_rate_kernel(W: wp.array4d(dtype=wp.float32), ix: wp.array(dtype=wp.floa
             e, inv, pos = dir_info(ix, iy, iz, d, i, j, k)
             r = r + wp.abs(W[1 + d, I, J, K]) * inv + 2.0 * nu * inv * inv
     dtl[i, j, k] = cfl / wp.max(r, 1.0e-30)
+
+
+# ---------------------------------------------------------------- dual time stepping (BDF1 / BDF2)
+@wp.kernel
+def dual_time_kernel(U: wp.array4d(dtype=wp.float32), Un: wp.array4d(dtype=wp.float32),
+                     Um: wp.array4d(dtype=wp.float32), R: wp.array4d(dtype=wp.float32),
+                     mask: wp.array3d(dtype=wp.float32), a0: float, a1: float, a2: float, idt: float):
+    """Unsteady residual R* = R - (a0 U + a1 U^n + a2 U^(n-1)) / dt for the inner pseudo-time
+    iterations (BDF2: 1.5, -2, 0.5; BDF1: 1, -1, 0)."""
+    i, j, k = wp.tid()
+    if mask[i, j, k] < 0.5:
+        return
+    I = i + 2
+    J = j + 2
+    K = k + 2
+    for c in range(5):
+        R[c, i, j, k] = R[c, i, j, k] - (a0 * U[c, I, J, K] + a1 * Un[c, I, J, K] + a2 * Um[c, I, J, K]) * idt
+
+
+@wp.kernel
+def dual_time_turb_kernel(Kn: wp.array3d(dtype=wp.float32), On: wp.array3d(dtype=wp.float32),
+                          Km: wp.array3d(dtype=wp.float32), Om: wp.array3d(dtype=wp.float32),
+                          Rk: wp.array3d(dtype=wp.float32), Rw: wp.array3d(dtype=wp.float32),
+                          Dk: wp.array3d(dtype=wp.float32), Dw: wp.array3d(dtype=wp.float32),
+                          a0: float, a1: float, a2: float, idt: float):
+    """Physical-time terms for the point-implicit k / omega update: the a0 part joins the
+    implicit destruction coefficient, the old time levels the explicit residual."""
+    i, j, k = wp.tid()
+    I = i + 2
+    J = j + 2
+    K = k + 2
+    Rk[i, j, k] = Rk[i, j, k] - (a1 * Kn[I, J, K] + a2 * Km[I, J, K]) * idt
+    Rw[i, j, k] = Rw[i, j, k] - (a1 * On[I, J, K] + a2 * Om[I, J, K]) * idt
+    Dk[i, j, k] = Dk[i, j, k] + a0 * idt
+    Dw[i, j, k] = Dw[i, j, k] + a0 * idt
+
+
+# ---------------------------------------------------------------- implicit k-omega (Jacobi sweeps)
+@wp.kernel
+def turb_sweep_kernel(W: wp.array4d(dtype=wp.float32), Kt: wp.array3d(dtype=wp.float32),
+                      Om: wp.array3d(dtype=wp.float32), Rk: wp.array3d(dtype=wp.float32),
+                      Rw: wp.array3d(dtype=wp.float32), Dk: wp.array3d(dtype=wp.float32),
+                      Dw: wp.array3d(dtype=wp.float32), dtl: wp.array3d(dtype=wp.float32), vp: Visc,
+                      ix: wp.array(dtype=wp.float32), iy: wp.array(dtype=wp.float32),
+                      iz: wp.array(dtype=wp.float32), active: wp.vec3i, blk: wp.array3d(dtype=wp.int32),
+                      first: int, dKo: wp.array3d(dtype=wp.float32), dOo: wp.array3d(dtype=wp.float32),
+                      dKn: wp.array3d(dtype=wp.float32), dOn: wp.array3d(dtype=wp.float32)):
+    """Jacobi sweep for the backward-Euler k / omega update in pseudo time (step dtl):
+    (1/h + D + a_P / rho) d(rho k)_i = R_i - D (rho k)_i + sum_nb c_nb d(rho k)_nb / rho_nb
+    with the first-order upwind convection + diffusion coefficients of turb_residual_kernel
+    (sigma taken as 1 in the operator) and the destruction coefficient D. Arrays are padded."""
+    i, j, k = wp.tid()
+    I = i + 2
+    J = j + 2
+    K = k + 2
+    if vp.fluid[I, J, K] < 0.5:
+        dKn[I, J, K] = 0.0
+        dOn[I, J, K] = 0.0
+        return
+    rho = W[0, I, J, K]
+    mul = mu_of(vp, qcomp(W, I, J, K, 3, vp.R))
+    mt = vp.mut[I, J, K]
+    aP = float(0.0)
+    sk = float(0.0)
+    sw = float(0.0)
+    for e in range(3):
+        if active[e] != 0:
+            d3, inv, pos = dir_info(ix, iy, iz, e, i, j, k)
+            idx = pos + 2
+            for side in range(2):
+                sg = -1
+                if side == 1:
+                    sg = 1
+                NI = I + sg * d3[0]
+                NJ = J + sg * d3[1]
+                NK = K + sg * d3[2]
+                bi = I
+                bj = J
+                bk = K
+                if side == 0:
+                    bi = NI
+                    bj = NJ
+                    bk = NK
+                if ((blk[bi, bj, bk] >> e) & 1) == 0 and vp.fluid[NI, NJ, NK] > 0.5:
+                    mf = 0.5 * (W[0, I, J, K] * W[1 + e, I, J, K] + W[0, NI, NJ, NK] * W[1 + e, NI, NJ, NK])
+                    dn = coord(vp, e, idx + side) - coord(vp, e, idx + side - 1)
+                    gd = (mul + 0.5 * (mt + vp.mut[NI, NJ, NK])) / dn
+                    outf = wp.max(mf, 0.0)
+                    inf = wp.max(-mf, 0.0)
+                    if side == 0:
+                        outf = wp.max(-mf, 0.0)
+                        inf = wp.max(mf, 0.0)
+                    aP = aP + (outf + gd) * inv
+                    p = pos + sg
+                    if first == 0 and p >= 0 and p < dtl.shape[e]:
+                        c = (inf + gd) * inv / W[0, NI, NJ, NK]
+                        sk = sk + c * dKo[NI, NJ, NK]
+                        sw = sw + c * dOo[NI, NJ, NK]
+    h = dtl[i, j, k]
+    rk = Rk[i, j, k] - Dk[i, j, k] * Kt[I, J, K]
+    rw = Rw[i, j, k] - Dw[i, j, k] * Om[I, J, K]
+    dKn[I, J, K] = (rk + sk) / (1.0 / h + Dk[i, j, k] + aP / rho)
+    dOn[I, J, K] = (rw + sw) / (1.0 / h + Dw[i, j, k] + aP / rho)
+
+
+@wp.kernel
+def turb_apply_kernel(Kt: wp.array3d(dtype=wp.float32), Om: wp.array3d(dtype=wp.float32),
+                      dK: wp.array3d(dtype=wp.float32), dO: wp.array3d(dtype=wp.float32),
+                      W: wp.array4d(dtype=wp.float32), vp: Visc, utau: wp.array3d(dtype=wp.float32),
+                      kmin: float, wmin: float):
+    """rho k, rho omega += update (floored; near-wall cells from the wall function, as in
+    turb_update_kernel)."""
+    i, j, k = wp.tid()
+    I = i + 2
+    J = j + 2
+    K = k + 2
+    if vp.fluid[I, J, K] < 0.5:
+        return
+    rho = W[0, I, J, K]
+    kn = wp.max(Kt[I, J, K] + dK[I, J, K], rho * kmin)
+    wn = wp.max(Om[I, J, K] + dO[I, J, K], rho * wmin)
+    ut = utau[i, j, k]
+    if ut >= 0.0:
+        y = wp.max(vp.dist[I, J, K], 1.0e-6)
+        nu = mu_of(vp, qcomp(W, I, J, K, 3, vp.R)) / rho
+        wv = 6.0 * nu / (BETA1 * y * y)
+        wl = ut / (wp.sqrt(BSTAR) * KAPPA * y)
+        wn = rho * wp.sqrt(wv * wv + wl * wl)
+        if y * ut / nu > 11.0:
+            kn = rho * ut * ut / wp.sqrt(BSTAR)
+    Kt[I, J, K] = kn
+    Om[I, J, K] = wn

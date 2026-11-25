@@ -41,7 +41,7 @@ class Solver:
     def __init__(self, lo, hi, h, freestream, sdf=None, gamma=1.4, bcs="auto", cfl=0.7,
                  limiter="vanleer", shock_threshold=0.5, dtype=torch.float32, device=None,
                  verbose=True, faces=None, backend="auto", thin_sdf=None, thin_box=None,
-                 viscous=None, wall=None, turbulence=None):
+                 viscous=None, wall=None, turbulence=None, alloc=None):
         """
         lo, hi     : domain corners (m)
         h          : cell size, scalar or (hx, hy, hz)
@@ -62,7 +62,12 @@ class Solver:
         turbulence : None or dict(model='sst', k_inf=..., omega_inf=...): k-omega SST with a
                      Spalding wall function on immersed walls and thin walls (needs viscous).
                      Defaults: k_inf = 9e-9 a^2, omega_inf = 1e-6 rho a^2 / mu (NASA TMR).
+        alloc      : optional callable(name, shape) -> tensor for the state arrays (U, W, K, O);
+                     used by rocketcfd.patches to place several grids in one buffer
         """
+        self._alloc = alloc or (lambda name, shape: torch.empty(shape, dtype=dtype, device=self.device))
+        self._iface = None          # interface ghost-cell fill (rocketcfd.patches)
+        self.owned = None           # cells whose surface loads this grid reports (rocketcfd.patches)
         self.gamma, self.cfl, self.limiter = gamma, cfl, limiter
         self.viscous = None
         if viscous is not None:
@@ -138,7 +143,8 @@ class Solver:
             shp[d] = self.n[d]
             self.invw.append(torch.as_tensor(1.0 / w[d], dtype=dtype, device=dev).reshape(shp))
         W0 = self.W_inf_t.reshape(5, 1, 1, 1).expand((5,) + shape).contiguous()
-        self.U = prim_to_cons(W0, gamma)
+        self.U = self._alloc("U", (5,) + shape)
+        self.U.copy_(prim_to_cons(W0, gamma))
         self.t = 0.0
         self.step_count = 0
         self.history = []
@@ -170,7 +176,7 @@ class Solver:
         dev = self.device
         self._wdev = f"cuda:{dev.index or 0}" if dev.type == "cuda" else "cpu"
         shape = self.U.shape[1:]
-        self.W_buf = torch.empty_like(self.U)
+        self.W_buf = self._alloc("W", tuple(self.U.shape))
         self.U1 = self.U.clone()
         self.R_buf = torch.zeros((5,) + self.n, dtype=self.dtype, device=dev)
         self.S_buf = torch.zeros(shape, dtype=torch.int32, device=dev)
@@ -259,8 +265,8 @@ class Solver:
         self.omega_inf = float(tb.get("omega_inf", 1e-6 * rho * a2 / mu))
         shape3 = tuple(self.U.shape[1:])
         if getattr(self, "K_buf", None) is None:
-            self.K_buf = torch.empty(shape3, dtype=self.dtype, device=self.device)
-            self.O_buf = torch.empty(shape3, dtype=self.dtype, device=self.device)
+            self.K_buf = self._alloc("K", shape3)
+            self.O_buf = self._alloc("O", shape3)
         self.K_buf.fill_(rho * self.k_inf)
         self.O_buf.fill_(rho * self.omega_inf)
 
@@ -275,6 +281,8 @@ class Solver:
                 kind = self.bcs[(d, side)]
                 for T, val in ((Kt, rho * self.k_inf), (Om, rho * self.omega_inf)):
                     dst = _sl(T, d, 0, NG) if side == 0 else _sl(T, d, N + NG, N + 2 * NG)
+                    if kind == "interface":
+                        continue
                     if kind == "periodic":
                         dst.copy_(_sl(T, d, N, N + NG) if side == 0 else _sl(T, d, NG, 2 * NG))
                         continue
@@ -474,6 +482,8 @@ class Solver:
             for side in (0, 1):
                 kind = self.bcs[(d, side)]
                 dst = _sl(W, ax, 0, NG) if side == 0 else _sl(W, ax, N + NG, N + 2 * NG)
+                if kind == "interface":
+                    continue                     # filled from the neighbouring grids (patches)
                 if kind == "periodic":
                     dst.copy_(_sl(W, ax, N, N + NG) if side == 0 else _sl(W, ax, NG, 2 * NG))
                 elif kind == "farfield":
@@ -587,6 +597,8 @@ class Solver:
         shape = tuple(self.U.shape[1:])
         wp.launch(K.prim_kernel, dim=shape, inputs=[w[Ukey], self.gamma, self.rho_min, self.p_min, w["W"]],
                   device=self._wdev, stream=self._wp_stream)
+        if self._iface is not None:
+            self._iface(self)
         self._fill_bc(self.W_buf)
         ib = self._wp_ib
         if ib is not None:
@@ -601,12 +613,17 @@ class Solver:
             wp.launch(K.mut_kernel, dim=shape, inputs=[w["W"], w[kk], w[oo], self._vp, self._vp.mut],
                       device=self._wdev, stream=self._wp_stream)
 
-    def _wturb(self, kk, oo, outk, outo, a0, a1, local):
-        """SST residual on stage state (kk, oo) and point-implicit update into (outk, outo)."""
+    def _wturb(self, kk, oo, outk, outo, a0, a1, local, dual=None):
+        """SST residual on stage state (kk, oo) and point-implicit update into (outk, outo).
+        dual = (b0, b1, b2, 1/dt): add the physical-time terms of dual time stepping."""
         wp, K, w = self._wp, self._K, self._w
         wp.launch(K.turb_residual_kernel, dim=self.n,
                   inputs=[w["W"], w[kk], w[oo], w["ix"], w["iy"], w["iz"], self._active_flux, w["blk"], self._vp,
                           w["Rk"], w["Rw"], w["Dk"], w["Dw"], w["utau"]], device=self._wdev, stream=self._wp_stream)
+        if dual is not None:
+            wp.launch(K.dual_time_turb_kernel, dim=self.n,
+                      inputs=[w["Kn"], w["On"], w["Km"], w["Om"], w["Rk"], w["Rw"], w["Dk"], w["Dw"], *dual],
+                      device=self._wdev, stream=self._wp_stream)
         wp.launch(K.turb_update_kernel, dim=self.n,
                   inputs=[w["K"], w["O"], w[kk], w[oo], w["Rk"], w["Rw"], w["Dk"], w["Dw"], w["dt"], w["dtl"],
                           int(local), self._vp, w["W"], w["utau"], a0, a1, 1e-6 * self.k_inf, 1e-3 * self.omega_inf,
@@ -658,6 +675,64 @@ class Solver:
             self._wturb("K1", "O1", "K", "O", 0.5, 0.5, local)
         return self.dt_buf[0].clone(), res
 
+    def _step_implicit(self, order, cfl, sweeps=8, want_res=False, maxrel=0.2, dual=None):
+        """One backward-Euler pseudo-time step (steady runs only): residual at the current state,
+        `sweeps` Jacobi sweeps of the linearised system with local pseudo time steps at CFL `cfl`
+        (DP-LUR), then U += dU limited to `maxrel` relative change in density / pressure.
+        k and omega advance by a point-implicit step at their own local stable step.
+        dual = (b0, b1, b2, 1/dt): inner iteration of dual time stepping (see run_unsteady)."""
+        wp, K, w = self._wp, self._K, self._w
+        if "dU2" not in w:
+            self.dU2_buf = torch.zeros_like(self.U)
+            w["dU2"] = wp.from_torch(self.dU2_buf)
+        self._wprim("U")
+        self._wresidual(order)
+        if dual is not None:
+            wp.launch(K.dual_time_kernel, dim=self.n, inputs=[w["U"], w["Un"], w["Um"], w["R"], w["mask"], *dual],
+                      device=self._wdev, stream=self._wp_stream)
+        res = torch.sqrt(((self.R_buf[0] * self.mask_f) ** 2).sum() / self.n_fluid) if want_res else None
+        if self.turbulence:
+            # implicit k-omega: residual, then Jacobi sweeps at the turbulence's own local
+            # pseudo time step (convective |u| + diffusion) at the same CFL number
+            if "dK2" not in w:
+                self.dK2_buf = torch.zeros_like(self.K_buf)
+                self.dO2_buf = torch.zeros_like(self.O_buf)
+                w.update(dK2=wp.from_torch(self.dK2_buf), dO2=wp.from_torch(self.dO2_buf))
+            wp.launch(K.turb_rate_kernel, dim=self.n,
+                      inputs=[w["W"], w["ix"], w["iy"], w["iz"], self._active_flux, self._vp, float(cfl), w["dtl"]],
+                      device=self._wdev, stream=self._wp_stream)
+            wp.launch(K.turb_residual_kernel, dim=self.n,
+                      inputs=[w["W"], w["K"], w["O"], w["ix"], w["iy"], w["iz"], self._active_flux, w["blk"],
+                              self._vp, w["Rk"], w["Rw"], w["Dk"], w["Dw"], w["utau"]],
+                      device=self._wdev, stream=self._wp_stream)
+            if dual is not None:
+                wp.launch(K.dual_time_turb_kernel, dim=self.n,
+                          inputs=[w["Kn"], w["On"], w["Km"], w["Om"], w["Rk"], w["Rw"], w["Dk"], w["Dw"], *dual],
+                          device=self._wdev, stream=self._wp_stream)
+            tb = (("K1", "O1"), ("dK2", "dO2"))
+            for it in range(sweeps):
+                (ko, oo), (kn, on) = tb[(it + 1) % 2], tb[it % 2]
+                wp.launch(K.turb_sweep_kernel, dim=self.n,
+                          inputs=[w["W"], w["K"], w["O"], w["Rk"], w["Rw"], w["Dk"], w["Dw"], w["dtl"], self._vp,
+                                  w["ix"], w["iy"], w["iz"], self._active_flux, w["blk"], int(it == 0),
+                                  w[ko], w[oo], w[kn], w[on]], device=self._wdev, stream=self._wp_stream)
+            kl, ol = tb[(sweeps - 1) % 2]
+            wp.launch(K.turb_apply_kernel, dim=self.n,
+                      inputs=[w["K"], w["O"], w[kl], w[ol], w["W"], self._vp, w["utau"],
+                              1e-6 * self.k_inf, 1e-3 * self.omega_inf], device=self._wdev, stream=self._wp_stream)
+        bufs = ("U1", "dU2")
+        for it in range(sweeps):
+            src, dst = w[bufs[(it + 1) % 2]], w[bufs[it % 2]]
+            wp.launch(K.implicit_sweep_kernel, dim=self.n,
+                      inputs=[w["U"], w["W"], w["R"], w["ix"], w["iy"], w["iz"], self._active_flux, w["blk"],
+                              w["mask"], self._vp, self.gamma, float(cfl),
+                              0.0 if dual is None else dual[0] * dual[3], int(it == 0), src, dst],
+                      device=self._wdev, stream=self._wp_stream)
+        wp.launch(K.implicit_apply_kernel, dim=self.n,
+                  inputs=[w["U"], w[bufs[(sweeps - 1) % 2]], w["mask"], self.gamma, maxrel],
+                  device=self._wdev, stream=self._wp_stream)
+        return res
+
     def _refresh_tiles(self, frac):
         """Active tiles: those whose largest relative density change per step exceeds `frac`
         times the largest anywhere, plus one tile around them (so changes can propagate)."""
@@ -697,7 +772,8 @@ class Solver:
 
     # -------------------------------------------------------------- driver
     def run(self, nsteps, chunk=100, first_order_steps=200, report=None, steady=False,
-            active_tiles=None, tile_refresh=50, tile_frac=1e-3, local_dt=False, snapshot=None):
+            active_tiles=None, tile_refresh=50, tile_frac=1e-3, local_dt=False, snapshot=None,
+            implicit=False, cfl_max=20.0, cfl_start=1.0, cfl_ramp=300, sweeps=8):
         """Advance nsteps time steps. `report(solver)` is called after every chunk; it can
         return True to stop.
 
@@ -710,7 +786,18 @@ class Solver:
             stretched grids tested it slowed convergence; worth trying with strong stretching).
         Time-accurate runs (steady=False) always update every cell with one global step.
         snapshot = (every_steps, fn): fn(step, t) is called every `every_steps` steps.
+
+        implicit=True (warp backend, steady runs): backward-Euler pseudo-time stepping with
+        DP-LUR Jacobi sweeps and local time steps; the CFL number grows geometrically from
+        `cfl_start` to `cfl_max` over `cfl_ramp` steps. Each step costs about 1.5-2 explicit
+        RK2 steps but converges in far fewer steps, especially on stretched or very fine
+        near-wall grids. `t` does not advance (pseudo time has no physical meaning).
         """
+        if implicit:
+            if self.backend != "warp":
+                raise RuntimeError("the implicit solver needs the warp backend")
+            return self._run_implicit(nsteps, chunk, first_order_steps, report, snapshot,
+                                      cfl_max, cfl_start, cfl_ramp, sweeps)
         steady = steady and self.backend == "warp"
         if active_tiles is None:
             active_tiles = steady
@@ -767,6 +854,112 @@ class Solver:
                 if report and report(self):
                     break                      # the report callback asked to stop (converged)
         self.work_full_steps = work
+        return self
+
+    def _run_implicit(self, nsteps, chunk, first_order_steps, report, snapshot, cfl_max, cfl_start,
+                      cfl_ramp, sweeps):
+        done = 0
+        t0 = time.time()
+        self._tiles_on = False
+        self.active_fraction = 1.0
+        n0 = self.step_count
+        with torch.no_grad():
+            while done < nsteps:
+                k = min(chunk, nsteps - done)
+                for kk in range(k):
+                    it = self.step_count + kk
+                    order = 0.0 if it < first_order_steps else 1.0
+                    ramp = min(1.0, (it - n0) / max(cfl_ramp, 1))
+                    cfl = cfl_start * (cfl_max / cfl_start) ** ramp
+                    r = self._step_implicit(order, cfl, sweeps, want_res=(kk == k - 1))
+                    if r is not None:
+                        res = r
+                    if snapshot is not None and (it + 1) % snapshot[0] == 0:
+                        snapshot[1](it + 1, self.t)
+                res = float(res)
+                self.step_count += k
+                done += k
+                self.history.append((self.step_count, self.t, res))
+                if not np.isfinite(res):
+                    raise FloatingPointError(f"solution diverged at step {self.step_count}")
+                if self.verbose:
+                    el = time.time() - t0
+                    cps = np.prod(self.n) * done / el / 1e6
+                    mem = (f"  GPU mem {torch.cuda.max_memory_allocated(self.device)/2**30:.2f} GB"
+                           if self.device.type == "cuda" else "")
+                    print(f"iter {self.step_count:6d}  CFL {cfl:6.1f}  res(rho) = {res/self.fs['rho']:.3e} 1/s  "
+                          f"[{cps:.1f} Mcell-iters/s]{mem}", flush=True)
+                if report and report(self):
+                    break
+        self.work_full_steps = float(done)
+        return self
+
+    def _dual_shift(self, bdf, dt=None):
+        """Start a physical time step of dual time stepping: U^(n-1) <- U^n <- U (and k, omega).
+        Returns the BDF coefficients and 1/dt for _step_implicit(dual=...)."""
+        wp, w = self._wp, self._w
+        if "Un" not in w:
+            self.Un_buf = self.U.clone()
+            self.Um_buf = self.U.clone()
+            w.update(Un=wp.from_torch(self.Un_buf), Um=wp.from_torch(self.Um_buf))
+            if self.turbulence:
+                for nm in ("Kn", "On", "Km", "Om"):
+                    setattr(self, nm + "_buf", (self.K_buf if nm[0] == "K" else self.O_buf).clone())
+                    w[nm] = wp.from_torch(getattr(self, nm + "_buf"))
+            self._dual_steps = 0
+        self.Um_buf.copy_(self.Un_buf)
+        self.Un_buf.copy_(self.U)
+        if self.turbulence:
+            self.Km_buf.copy_(self.Kn_buf)
+            self.Om_buf.copy_(self.On_buf)
+            self.Kn_buf.copy_(self.K_buf)
+            self.On_buf.copy_(self.O_buf)
+        first = self._dual_steps == 0 or bdf == 1
+        b = (1.0, -1.0, 0.0) if first else (1.5, -2.0, 0.5)
+        self._dual_steps += 1
+        return (b[0], b[1], b[2], 1.0 / (dt if dt is not None else self._dual_dt))
+
+    def run_unsteady(self, nsteps, dt, inner=30, inner_tol=1e-2, cfl=20.0, sweeps=8, order=1.0,
+                     report=None, every=10, snapshot=None, bdf=2):
+        """Time-accurate run with dual time stepping (warp backend): each physical step of
+        size `dt` solves the BDF2 (bdf=1: backward Euler) equations by implicit pseudo-time
+        iterations until the density residual falls by `inner_tol` or `inner` iterations.
+        dt is set by the physics (e.g. ~1/100 of a shedding period), not by the cell size, so
+        fine near-wall cells no longer force tiny steps. report(solver) is called every
+        `every` physical steps and may return True to stop; snapshot = (every_steps, fn)."""
+        if self.backend != "warp":
+            raise RuntimeError("dual time stepping needs the warp backend")
+        self._dual_dt = dt
+        t0 = time.time()
+        self._tiles_on = False
+        iters = 0
+        with torch.no_grad():
+            for n in range(nsteps):
+                dual = self._dual_shift(bdf)
+                r0 = None
+                for m in range(inner):
+                    r = float(self._step_implicit(order, cfl, sweeps, want_res=True, dual=dual))
+                    iters += 1
+                    if not np.isfinite(r):
+                        raise FloatingPointError(f"diverged at physical step {self.step_count}, inner {m}")
+                    r0 = r if r0 is None else r0
+                    if m > 0 and r < inner_tol * r0:
+                        break
+                self.step_count += 1
+                self.t += dt
+                self.last_inner = (m + 1, r / max(r0, 1e-30))
+                if snapshot is not None and self.step_count % snapshot[0] == 0:
+                    snapshot[1](self.step_count, self.t)
+                if (n + 1) % every == 0 or n == nsteps - 1:
+                    self.history.append((self.step_count, self.t, r0))
+                    if self.verbose:
+                        el = time.time() - t0
+                        print(f"step {self.step_count:6d}  t = {self.t:.4e} s  inner {m+1:3d} "
+                              f"(res drop {r/max(r0,1e-30):.1e})  {iters/(n+1):.1f} inner/step  "
+                              f"[{np.prod(self.n)*iters/el/1e6:.1f} Mcell-iters/s]", flush=True)
+                    if report and report(self):
+                        break
+        self.work_full_steps = float(iters)
         return self
 
     def set_freestream(self, freestream, keep_state=False):
@@ -826,8 +1019,12 @@ class Solver:
                     phi=self.phi[NG:-NG, NG:-NG, NG:-NG],
                     x=self.axes[0][NG:-NG], y=self.axes[1][NG:-NG], z=self.axes[2][NG:-NG])
 
-    def loads(self, S_ref, L_ref, x_ref=(0.0, 0.0, 0.0), band=1.5, parts=None):
-        """Integrate surface pressure: -∮ (p - p_inf) n dA via a smoothed delta function.
+    def loads(self, S_ref, L_ref, x_ref=(0.0, 0.0, 0.0), band=1.5, parts=None, friction=True):
+        """Integrate surface pressure: -∮ (p - p_inf) n dA via a smoothed delta function, plus
+        (viscous runs, friction=True) the wall shear -- from the velocity interpolated 1.5 cells
+        out along the wall normal, through the same law of the wall as the solver's wall function
+        when turbulent, mu u_t / y when laminar (thin walls: the adjacent cells). All coefficients,
+        parts and moments include friction; CD_friction / C_friction give its share.
         Returns body-axis force/moment coefficients and wind-axis drag/lift.
         The surface band and its weights are computed once; each call only gathers the
         pressure in the band (a few thousand values) from the device."""
@@ -844,8 +1041,23 @@ class Solver:
             if tf is not None:
                 pa = pflat[tf["a_t"]].double().cpu().numpy()
                 pbb = pflat[tf["b_t"]].double().cpu().numpy()
+            if self.viscous and friction:
+                Wf = Wsrc.reshape(5, -1)
+                nimg = sf["y_img"].shape[0]
+                Wb = [(Wf[:, sf["img_idx"][:, 8 * m:8 * m + 8]] * sf["img_w"][:, 8 * m:8 * m + 8]).sum(-1)
+                      .double().cpu().numpy() for m in range(nimg)]
+                if tf is not None:
+                    Wa_t = Wf[:, tf["a_t"]].double().cpu().numpy()
+                    Wb_t = Wf[:, tf["b_t"]].double().cpu().numpy()
         dp = pb.double().cpu().numpy() - self.W_inf[4]
         dF = sf["wF"] * dp                                  # (3, Nb)
+        F_fric = np.zeros(3)
+        if self.viscous and friction:
+            # wall shear on immersed walls: law of the wall (turbulent) or mu u_t / y (laminar)
+            # at the fluid-side band cells; the smoothed delta puts half its weight there
+            fr = self._shear(Wb, sf["nrm"], sf["y_img"]) * sf["wfr"]
+            dF = dF + fr
+            F_fric = F_fric + fr.sum(1)
         F_ib = dF.sum(1)
         r = sf["pos"] - np.asarray(x_ref, float)[:, None]
         M_ib = np.cross(r.T, dF.T).sum(0)
@@ -856,6 +1068,14 @@ class Solver:
             mag = ((pa - pinf) * tf["fa"] - (pbb - pinf) * tf["fb"]) * tf["area"]
             dFt = np.zeros((3, mag.size))
             dFt[tf["dir"], np.arange(mag.size)] = mag      # the a side pushes the wall toward +d
+            if self.viscous and friction:
+                # shear on both wetted sides of each blocked face (tangential = the other two axes)
+                for Wt, flag, ykey in ((Wa_t, tf["fa"], "ya"), (Wb_t, tf["fb"], "yb")):
+                    nrm = np.zeros((3, mag.size))
+                    nrm[tf["dir"], np.arange(mag.size)] = 1.0
+                    ft = self._shear(Wt, nrm, tf[ykey]) * (tf["area"] * flag)
+                    dFt = dFt + ft
+                    F_fric = F_fric + ft.sum(1)
             F_thin = dFt.sum(1)
             rt = tf["pos"] - np.asarray(x_ref, float)[:, None]
             M_thin = np.cross(rt.T, dFt.T).sum(0)
@@ -901,10 +1121,41 @@ class Solver:
                            CX=float(v[0][0] / qs), CY=float(v[0][1] / qs), CZ=float(v[0][2] / qs))
                    for k, v in part_out.items()}
         return dict(F=F, M=M, F_thin=F_thin, M_thin=M_thin, q_inf=q, parts=parts_c,
+                    F_friction=F_fric, CD_friction=float(F_fric @ e_d / qs),
+                    C_friction=F_fric / qs,
                     C_thin=F_thin / (q * S_ref), Cm_thin=M_thin / (q * S_ref * L_ref),
                     CX=Cf[0], CY=Cf[1], CZ=Cf[2],
                     Cl=Cm[0], Cm=Cm[1], Cn=Cm[2], CD=Cf @ e_d, CL=Cf @ lift_dir,
                     CN=Cf @ cross, CS=Cf @ side, C_roll=Cm[0], C_restore=Cm @ restore_axis)
+
+    def _shear(self, Wc, nrm, y):
+        """Wall shear force per unit area on the wall [Pa] (3, N) from cell states Wc (5, N)
+        at distance y along the wall normal nrm (3, N): along the tangential velocity.
+        Wc, y may be lists of two samples (laminar): u = a y + b y^2 through the no-slip wall."""
+        from .wallfunction import spalding_utau
+        v = self.viscous
+        if isinstance(Wc, (list, tuple)) and len(Wc) == 2 and not self.turbulence:
+            (W1, W2), (y1, y2) = Wc, y
+            T = W1[4] / (W1[0] * v["R"])
+            mu = v["mu"] if v["model"] == "constant" else \
+                v["mu"] * (T / v["T0"]) ** 1.5 * (v["T0"] + v["S"]) / (T + v["S"])
+            u1 = W1[1:4] - (W1[1:4] * nrm).sum(0) * nrm
+            u2 = W2[1:4] - (W2[1:4] * nrm).sum(0) * nrm
+            return mu * (u1 * y2 ** 2 - u2 * y1 ** 2) / (y1 * y2 * (y2 - y1))
+        if isinstance(Wc, (list, tuple)):
+            Wc, y = Wc[0], y[0]
+        rho, vel, p = Wc[0], Wc[1:4], Wc[4]
+        T = p / (rho * v["R"])
+        mu = v["mu"] if v["model"] == "constant" else \
+            v["mu"] * (T / v["T0"]) ** 1.5 * (v["T0"] + v["S"]) / (T + v["S"])
+        ut = vel - (vel * nrm).sum(0) * nrm
+        um = np.maximum(np.linalg.norm(ut, axis=0), 1e-12)
+        if self.turbulence:
+            utau = spalding_utau(um, y, mu / rho)
+            tau = rho * utau ** 2
+        else:
+            tau = mu * um / y
+        return tau * ut / um
 
     def _surface(self, band):
         key = ("surface", band)
@@ -913,7 +1164,9 @@ class Solver:
             wx, wy, wz = self.widths
             hloc = np.minimum(np.minimum(wx[:, None, None], wy[None, :, None]), wz[None, None, :])
             eps = band * hloc
-            idx = np.nonzero(np.abs(phi) < eps)
+            inner_ = np.zeros(phi.shape, bool)            # interior cells only: the padding layers
+            inner_[NG:-NG, NG:-NG, NG:-NG] = True         # repeat the edge (5x on one-cell-thick 2-D grids)
+            idx = np.nonzero((np.abs(phi) < eps) & inner_)
             e = eps[idx]
             delta = (1 + np.cos(np.pi * phi[idx] / e)) / (2 * e)
             # gradient of phi only at band cells (central differences on the padded grid)
@@ -929,9 +1182,51 @@ class Solver:
             g /= np.linalg.norm(g, axis=0) + 1e-30
             dV = wx[idx[0]] * wy[idx[1]] * wz[idx[2]]
             flat = np.ravel_multi_index(idx, phi.shape)
+            ph = phi[idx]
+            if self.owned is not None:
+                dV = dV * self.owned[idx]
+            # wall-shear sample points along the wall normal: 1 and 2 local cells out (laminar:
+            # quadratic fit through the no-slip wall), 1.5 cells out (turbulent: law of the wall)
+            pos = np.stack([self.axes[d][idx[d]] for d in range(3)])
+            fluid_f = self.fluid.ravel()
+
+            def stencil(y_s):
+                xi = pos + (y_s - ph) * g
+                i0, fr = [], []
+                for d in range(3):
+                    c = self.axes[d]
+                    k = np.clip(np.searchsorted(c, xi[d]) - 1, 0, len(c) - 2)
+                    i0.append(k)
+                    fr.append(np.clip((xi[d] - c[k]) / (c[k + 1] - c[k]), 0.0, 1.0))
+                ii = np.zeros((ph.size, 8), np.int64)
+                ww = np.zeros((ph.size, 8))
+                m_ = 0
+                for a_ in (0, 1):
+                    for b_ in (0, 1):
+                        for c_ in (0, 1):
+                            f_ = np.ravel_multi_index((i0[0] + a_, i0[1] + b_, i0[2] + c_), phi.shape)
+                            ii[:, m_] = f_
+                            ww[:, m_] = ((fr[0] if a_ else 1 - fr[0]) * (fr[1] if b_ else 1 - fr[1])
+                                         * (fr[2] if c_ else 1 - fr[2])) * fluid_f[f_]
+                            m_ += 1
+                tw = ww.sum(1)
+                ok = tw > 1e-6
+                ww[ok] /= tw[ok, None]
+                return ii, ww, ok
+
+            y_img = (np.stack([1.0 * hloc[idx], 2.0 * hloc[idx]]) if not self.turbulence
+                     else 1.5 * hloc[idx][None])
+            st_ = [stencil(y_) for y_ in y_img]
+            img_idx = np.concatenate([t_[0] for t_ in st_], 1)
+            img_w = np.concatenate([t_[1] for t_ in st_], 1)
+            ok_img = np.logical_and.reduce([t_[2] for t_ in st_])
             self._surf = dict(wF=-(delta * dV) * g,
                               pos=np.stack([self.axes[d][idx[d]] for d in range(3)]),
-                              flat_t=torch.as_tensor(flat, device=self.device))
+                              flat_t=torch.as_tensor(flat, device=self.device),
+                              nrm=g, phi=ph, wfr=2.0 * delta * dV * (ph > 0) * self.fluid[idx] * ok_img,
+                              y_img=y_img,
+                              img_idx=torch.as_tensor(img_idx, device=self.device),
+                              img_w=torch.as_tensor(img_w, dtype=self.dtype, device=self.device))
             if self.has_thin:
                 interior = np.zeros(phi.shape, bool)
                 interior[NG:-NG, NG:-NG, NG:-NG] = True
@@ -948,6 +1243,8 @@ class Solver:
                     ib_ = tuple(v[keep] for v in ib_)
                     o = [e for e in range(3) if e != d]
                     area = self.widths[o[0]][ia[o[0]]] * self.widths[o[1]][ia[o[1]]]
+                    if self.owned is not None:
+                        area = area * self.owned[ia]
                     pos = np.stack([self.axes[e][ia[e]] for e in range(3)]).astype(float)
                     pos[d] += 0.5 * self.widths[d][ia[d]]
                     A_.append(np.ravel_multi_index(ia, phi.shape))
@@ -957,7 +1254,16 @@ class Solver:
                     PS.append(pos)
                     FA.append(fa[keep].astype(float))
                     FB.append(fb[keep].astype(float))
-                self._surf["thin"] = dict(a_t=torch.as_tensor(np.concatenate(A_), device=self.device),
+                Aall, Ball, Dall = np.concatenate(A_), np.concatenate(B_), np.concatenate(D_)
+                # wall distance of the cells on each side (wall-function distance when turbulent)
+                if getattr(self, "dist_buf", None) is not None and self.turbulence:
+                    dist = self.dist_buf.reshape(-1).cpu().numpy()
+                    ya, yb = dist[Aall], dist[Ball]
+                else:
+                    wa = np.stack([self.widths[d_][np.unravel_index(Aall, phi.shape)[d_]] for d_ in range(3)])
+                    ya = yb = 0.5 * wa[Dall, np.arange(Dall.size)]
+                self._surf["thin"] = dict(ya=np.maximum(ya, 1e-9), yb=np.maximum(yb, 1e-9),
+                                          a_t=torch.as_tensor(np.concatenate(A_), device=self.device),
                                           b_t=torch.as_tensor(np.concatenate(B_), device=self.device),
                                           dir=np.concatenate(D_), area=np.concatenate(AR),
                                           pos=np.concatenate(PS, axis=1), fa=np.concatenate(FA),

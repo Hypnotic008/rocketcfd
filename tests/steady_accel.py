@@ -5,6 +5,8 @@ Runs the same 3-D sphere case (Mach 3, stretched grid) three ways until the load
   local      per-cell time steps
   tiles       global time step, active-tile updating
   local+tiles per-cell time steps and active-tile updating
+  implicit[:CFL]  backward-Euler DP-LUR pseudo-time stepping (work counts each implicit
+              iteration as one step; one costs about 2 explicit steps of wall time)
 and compares the converged loads and the work (cell updates, in full-step units).
 """
 import sys, os, time
@@ -29,8 +31,13 @@ def run(mode, faces, tol=2e-4, max_steps=6000):
         return False
 
     t0 = time.time()
-    s.run(max_steps, chunk=100, first_order_steps=200, report=report,
-          steady=(mode != "baseline"), active_tiles=("tiles" in mode), local_dt=("local" in mode))
+    if mode.startswith("implicit"):
+        cfl_max = float(mode.split(":")[1]) if ":" in mode else 20.0
+        s.run(max_steps, chunk=20, first_order_steps=100, report=report, steady=True, implicit=True,
+              cfl_max=cfl_max, cfl_ramp=100)
+    else:
+        s.run(max_steps, chunk=100, first_order_steps=200, report=report,
+              steady=(mode != "baseline"), active_tiles=("tiles" in mode), local_dt=("local" in mode))
     return dict(steps=s.step_count, work=s.work_full_steps, wall=time.time() - t0,
                 CD=hist[-1][0], CN=hist[-1][1], cells=int(np.prod(s.n)))
 
@@ -40,7 +47,7 @@ if __name__ == "__main__":
                             [Zone((-0.55, -0.55, -0.55), (0.6, 0.55, 0.55), 0.04)], growth=1.12)
     modes = sys.argv[1:] or ["baseline", "tiles", "local", "local+tiles"]
     out = {m: run(m, faces) for m in modes}
-    b = out["baseline"]
+    b = out.get("baseline", next(iter(out.values())))
     print(f"{'mode':12s} {'steps':>6s} {'work':>7s} {'wall s':>7s} {'CD':>8s} {'CN':>8s}  vs baseline")
     for m, r in out.items():
         print(f"{m:12s} {r['steps']:6d} {r['work']:7.0f} {r['wall']:7.1f} {r['CD']:8.4f} {r['CN']:8.4f}  "
