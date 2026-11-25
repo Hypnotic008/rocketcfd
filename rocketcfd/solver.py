@@ -67,7 +67,8 @@ class Solver:
     def __init__(self, lo, hi, h, freestream, sdf=None, gamma=1.4, bcs="auto", cfl=0.7,
                  limiter="koren", shock_threshold=0.5, dtype=torch.float32, device=None,
                  verbose=True, faces=None, backend="auto", thin_sdf=None, thin_box=None,
-                 viscous=None, wall=None, turbulence=None, alloc=None, thin_normals=True, low_mach="auto"):
+                 viscous=None, wall=None, turbulence=None, alloc=None, thin_normals=True, low_mach="auto",
+                 jets=None):
         """
         lo, hi     : domain corners (m)
         h          : cell size, scalar or (hx, hy, hz)
@@ -103,6 +104,12 @@ class Solver:
                      dissipation in slow flow; tests/low_mach_cylinder.py: Mach 0.1 cylinder drag +0.010
                      vs -0.037 without, rear stagnation Cp 1.07 vs 0.69). 'auto' (default) = on for a
                      subsonic freestream only: behind strong shocks it costs ~2 % stagnation pressure
+        jets       : list of rocket-engine exits, each dict(center=(x, y, z), direction=(dx, dy, dz) (the
+                     way the exhaust leaves), radius, mach, p [Pa], T [K]): the solid cells within
+                     ~2.5 cells behind each exit disk hold the exhaust state, so the plume is part of the
+                     flow (landing burns, hot staging, retropropulsion). One perfect gas (the freestream
+                     gamma and R): choose T so the exit velocity mach * sqrt(gamma R T) is right.
+                     self.jet_throttle (0..1) blends from ambient (ignition transients). Warp backend.
         thin_normals : thin-wall faces use the real plate normal for the wall pressure (default);
                      False = axis-aligned mirror (staircase), the earlier behaviour
         alloc      : optional callable(name, shape) -> tensor for the state arrays (U, W, K, O);
@@ -110,10 +117,16 @@ class Solver:
         """
         self._alloc = alloc or (lambda name, shape: torch.empty(shape, dtype=dtype, device=self.device))
         self.thin_normals = thin_normals
+        self.jets = list(jets) if jets else []
+        self.jet_throttle = 1.0
         self.low_mach = low_mach
         # implicit relaxation of the mean flow: 'rb' red-black Gauss-Seidel (default: same
         # convergence as 8 Jacobi sweeps at about half the cost, tests/steady_accel.py) or 'jacobi'
         self.relax = "rb"
+        # residual as face-flux kernels + divergence (each face once, far fewer registers on
+        # the GPU) instead of the fused one-thread-per-cell kernel
+        self.split_residual = True
+        self.face_scratch = None    # optional callable(shape) -> shared scratch tensor (patches)
         self._iface = None          # interface ghost-cell fill (rocketcfd.patches)
         self.owned = None           # cells whose surface loads this grid reports (rocketcfd.patches)
         self.gamma, self.cfl, self.limiter = gamma, cfl, limiter
@@ -269,6 +282,7 @@ class Solver:
                                 device=self._wdev),
                 ratio=wp.array(self.ib["r"].cpu().numpy().astype(np.float32), dtype=wp.float32,
                                device=self._wdev))
+        self._wp_jets = self._setup_jets(wp, K) if self.jets else None
         self._wp_stream = wp.stream_from_torch(torch.cuda.current_stream(dev)) if dev.type == "cuda" else None
         vp = K.Visc()
         v = self.viscous or {}
@@ -313,6 +327,49 @@ class Solver:
         vp.dist = wp.from_torch(self.dist_buf)
         vp.fluid = wp.from_torch(self.fluid_buf)
         self._vp = vp
+
+    def _setup_jets(self, wp, K):
+        """Cells that hold each engine's exhaust state (see the `jets` argument)."""
+        cells, states = [], []
+        g = self.gamma
+        self.jet_cells = []
+        for jt in self.jets:
+            c = np.asarray(jt["center"], float)
+            d = np.asarray(jt["direction"], float)
+            d = d / np.linalg.norm(d)
+            r = float(jt["radius"])
+            Rg = float(jt.get("R", (self.viscous or {}).get("R", 287.05)))
+            # cell size seen along the jet axis at the exit, and a box around the exit disk
+            ic = [int(np.clip(np.searchsorted(self.axes[k], c[k]), 0, len(self.axes[k]) - 1)) for k in range(3)]
+            hd = float(np.sqrt(sum((d[k] * self.widths[k][ic[k]]) ** 2 for k in range(3))))
+            depth = float(jt.get("depth", 2.5 * hd))
+            ext = r + depth + 2 * max(self.widths[k][ic[k]] for k in range(3))
+            rng = [np.flatnonzero(np.abs(self.axes[k] - c[k]) <= ext) for k in range(3)]
+            if any(len(q) == 0 for q in rng):
+                self.jet_cells.append(0)
+                continue
+            X, Y, Z = np.meshgrid(*[self.axes[k][rng[k]] for k in range(3)], indexing="ij")
+            P = np.stack([X - c[0], Y - c[1], Z - c[2]], -1)
+            sa = P @ d
+            rad = np.linalg.norm(P - sa[..., None] * d, axis=-1)
+            ph = self.phi[np.ix_(*rng)]
+            sel = (sa < 0.0) & (sa > -depth) & (rad <= r) & (ph <= 0)
+            ii = np.argwhere(sel)
+            idx = np.stack([rng[k][ii[:, k]] for k in range(3)], -1)
+            T, pe, M = float(jt["T"]), float(jt["p"]), float(jt["mach"])
+            ce = np.sqrt(g * Rg * T)
+            u = M * ce * d
+            q = np.array([pe / (Rg * T), u[0], u[1], u[2], pe], np.float32)
+            cells.append(idx)
+            states.append(np.repeat(q[None], len(idx), 0))
+            self.jet_cells.append(len(idx))
+        if not cells or sum(len(cc) for cc in cells) == 0:
+            return None
+        cells = np.concatenate(cells).astype(np.int32)
+        states = np.concatenate(states).astype(np.float32)
+        return dict(n=len(cells), cells=wp.array(cells, dtype=wp.vec3i, device=self._wdev),
+                    state=wp.array(states, dtype=K.vec5, device=self._wdev),
+                    ambient=K.vec5(*[float(v) for v in self.W_inf]))
 
     def _init_turbulence(self):
         """Freestream k and omega (NASA Turbulence Modeling Resource SST defaults) everywhere."""
@@ -749,6 +806,9 @@ class Solver:
         if ib is not None:
             self._L(K.ib_kernel, ib["n"], [w["W"], ib["ghost"], ib["corner"], ib["weight"],
                                                        ib["normal"], ib["ratio"], int(self.wall == "noslip")])
+        jt = getattr(self, "_wp_jets", None)
+        if jt is not None:
+            self._L(K.jet_kernel, jt["n"], [w["W"], jt["cells"], jt["state"], jt["ambient"], float(self.jet_throttle)])
         self._L(K.shock_kernel, shape, [w["W"], self._active_sensor, self.shock_threshold, w["S"]])
         if self.les and self.les["sgs"] == "vreman":
             self._L(K.vreman_kernel, shape, [w["W"], self._vp, float(self.les["cv"]), self._vp.mut])
@@ -781,7 +841,26 @@ class Solver:
         kind = {"vanleer": 0, "minmod": 1, "koren": 2}[self.limiter] + (4 if lm else 0)
         args = [w["W"], w["S"], w["ix"], w["iy"], w["iz"], self._active_flux, self.gamma, float(order), kind, w["blk"],
                 self._vp]
-        if tiles is None:
+        if tiles is None and self.split_residual:
+            # one direction at a time: face fluxes into a scratch array, then R (+)= their
+            # difference (kernels.FACE_KERNELS / DIV_KERNELS). The scratch can be shared by
+            # several grids (rocketcfd.patches) since grids are updated one after another.
+            if "F" not in w:
+                F = self.face_scratch(tuple(self.W_buf.shape)) if self.face_scratch else torch.empty_like(self.W_buf)
+                self._F_buf = F
+                w["F"] = wp.from_torch(F)
+            visc = 1 if self.viscous else 0
+            first = 1
+            for d in range(3):
+                if self._active_flux[d] != 0:
+                    dims = list(self.n)
+                    dims[d] += 1
+                    self._L(K.FACE_KERNELS[visc][d], tuple(dims), [w["W"], w["S"], w["blk"], self.gamma, float(order),
+                                                                  kind, self._vp, w["F"]])
+                    self._L(K.DIV_KERNELS[visc][d], self.n, [w["W"], w[("ix", "iy", "iz")[d]], self.gamma, w["blk"],
+                                                             self._vp, w["F"], first, w["R"]])
+                    first = 0
+        elif tiles is None:
             self._L(K.residual_kernel, self.n, args + [w["R"]])
         else:
             wp.launch(K.residual_tiles_kernel, dim=tiles.shape[0] * 512, inputs=args + [tiles, w["R"]],

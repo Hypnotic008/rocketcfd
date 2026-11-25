@@ -25,8 +25,36 @@ guessed aero coefficients in CatchSim (`quatsim/aero.py`).
 | Implicit steady solver: backward Euler in pseudo time, matrix-free Rusanov Jacobian, 8 Jacobi sweeps (DP-LUR), local pseudo time steps; k-omega advanced the same way (`--implicit`) | done |
 | Dual time stepping (BDF2 outer steps, implicit inner iterations) for unsteady flows: the time step follows the physics, not the smallest cell | done |
 | Local refinement: patches of finer cells (anisotropic allowed) coupled to a coarse base grid; generator for shells around walls and boxes around the grid fins (`--wall-h`, `--fin-h`) | done |
+| Large-eddy simulation: implicit LES (default) or Vreman subgrid model, equilibrium wall model or wall-resolved (`--les`) | done, Taylor-Green vortex checked |
+| Desktop app: set up, queue and watch runs, 3-D results, plots, animations (`python -m rocketcfd.app`) | done |
+| Cinematic renders and movies (vortex surfaces coloured by Mach, schlieren, LAVA-style) (`python -m rocketcfd.cinematic`) | done |
 
-### What changed in the latest round (solver work, Nov 25)
+### What changed in the latest round (Nov 25, evening)
+
+* **Desktop app** (`python -m rocketcfd.app`, or double-click `rocketcfd_app.bat`): see
+  [Desktop app](#desktop-app) below.
+* **GPU speed**: the residual is now computed as face-flux kernels (one direction each, compiled
+  with the direction fixed) plus a divergence kernel. Compiled for the RTX 4050 (sm_89) the old
+  fused kernel needed 174 registers per thread and a 232-byte spill frame (one 256-thread block
+  per SM, ~17 % occupancy); the new inviscid kernels need 52-63 registers and no spills (viscous
+  80-91). Each face flux is also computed once instead of twice. CPU: 1.9x faster inviscid
+  residual. Results identical to the fused kernel (inviscid bit for bit, viscous to 2.5e-5;
+  `tests/split_residual.py`). `--profile 20` measures it on your GPU.
+* **Patch layout**: candidate patches are tiled on base-grid cells, so snapping no longer pushes
+  neighbouring patches into each other, and under anisotropic cells the depth kept inside a wall
+  follows the wall normal. Inviscid production setup 6.11 M -> 5.50 M cells; the viscous setup with a hull
+  shell (0.25 x 0.03 x 0.03 m) 39 M -> 22 M cells (now fits 6 GB). Mach 3 sphere with patches:
+  +0.43 % from an all-fine grid (+0.81 % with the old layout) at the same patch cell count.
+* **LES** (`--les`, `turbulence=dict(model="les")`): time-accurate, implicit LES by default (the
+  upwind scheme's dissipation is the subgrid model), Vreman model optional, equilibrium wall
+  model. Patch runs advance all grids with one global time step (`run_explicit(time_accurate=True)`).
+  Taylor-Green vortex, Re 1600, 32^3: dissipation peak 0.0117 at t 7.0 (DNS 0.0127 at t 9; a
+  coarse grid peaks early); Vreman over-dissipates here (peak at t 5.5).
+* **Visuals**: `rocketcfd.derived` (schlieren, Q, lambda-2, vorticity, T, Cp, total-pressure ratio),
+  `rocketcfd.cinematic` (stills, orbits, time evolutions in the NASA LAVA style), 3-D snapshots
+  now store the full state (rho, u, v, w, p) for movies.
+
+### Earlier round (solver work, Nov 25)
 
 * **Implicit steady solver** (backward Euler in pseudo time, matrix-free Jacobian, red-black
   Gauss-Seidel relaxation): same answers as the explicit solver in far fewer iterations
@@ -50,7 +78,15 @@ guessed aero coefficients in CatchSim (`quatsim/aero.py`).
 
 ```bash
 git pull
+pip install -r requirements.txt                              # adds PySide6 + pyvistaqt for the app
 python tests/run_checks.py                                   # ~minutes: confirms this machine matches
+# 0. how much faster is the split residual on this GPU? (compare with 0.73 s/step, 0.74 s/iter before)
+python cases/super_heavy_descent.py --h 0.3 --fins parametric --fin-h 0.06 --engine-h 0.06 --aoa 15 --windward 0 --profile 20
+# LES movie of the booster wake (no patches: 1.8 M cells; ~1 flow-through per few minutes)
+python cases/super_heavy_descent.py --h 0.3 --fins parametric --aoa 15 --windward 0 --les --flowthroughs 3 --snapshots 200 --snap-volume 1 --out results/les_wake   # ~1.2 GB of frames
+python -m rocketcfd.cinematic results/les_wake --mode evolve --style lava
+# viscous RANS with a boundary-layer shell (22 M cells, ~4.1 GB)
+python cases/super_heavy_descent.py --h 0.3 --fins parametric --fin-h 0.06 --engine-h 0.06 --turbulent --wall-h 0.25,0.03,0.03 --wall-shell 0.3 --patch-box 32,48,48 --aoa 15 --windward 0 --out results/glide_rans
 # 1. inviscid glide case with local refinement, to compare with the slab-refined result
 #    (CD 3.532, CN 1.616, C_restore +0.011 at 34 M cells)
 python cases/super_heavy_descent.py --h 0.3 --fins parametric --fin-h 0.06 --engine-h 0.06 --aoa 15 --windward 0 --out results/glide_patch
@@ -353,6 +389,36 @@ On a 6 GB laptop RTX 4050, that's about 7 M cells, or h ~ 0.3 m for the full Sup
 (106 x 44 x 44 m). Halving h needs 8x the memory and ~16x the time. Local refinement
 (roadmap 2) and a lower-memory flux loop are how finer grids will fit.
 
+
+## Desktop app
+
+```bash
+pip install -r requirements.txt
+python -m rocketcfd.app            # Windows: double-click rocketcfd_app.bat
+```
+
+| page | what it does |
+|---|---|
+| Setup | case templates (booster descent, aero database, grid fin, validation cases) as grouped forms with an explanation on every field; presets (quick look, glide with fins, viscous RANS, LES movie); grid-size and GPU-memory estimate; speed measurement; save / load setups; shows the equivalent command line |
+| Run | queue of runs executed one after another; live residual and force plots; log; progress and worst-case time left |
+| 3-D results | body coloured by Cp (or metallic), cutting plane in any direction with its own field and contour lines, velocity arrows, iso-surfaces (Q-criterion vortices, sonic surface, ...), streamline tubes, volume rendering (shocks as glowing sheets), backgrounds, camera presets, screenshots; **Cinematic look** button |
+| Plots | convergence history; force breakdown by part with unsteadiness whiskers; filled contour plots of any field on any plane with in-plane streamlines; line probes (CSV export); aero database curves; PNG / SVG / PDF |
+| Animations | play back a run's snapshots; render movies (cinematic evolve / orbit / still, schlieren, streamline particles, slice sweep); built-in player |
+
+Fields available everywhere: Mach, p, rho, T, Cp, numerical schlieren, Q-criterion, lambda-2,
+vorticity, total-pressure ratio, speed (computed on demand from the saved flow).
+
+## Cinematic renders
+
+```bash
+python -m rocketcfd.cinematic results/glide_patch --mode still                 # 1920x1080 PNG
+python -m rocketcfd.cinematic results/glide_patch --mode orbit --style lava    # MP4 camera orbit
+python -m rocketcfd.cinematic results/les_wake --mode evolve                   # flow evolving in time
+```
+
+Styles: `lava` (vortex surfaces coloured by Mach over a greyscale schlieren plane, black
+background), `schlieren`, `mach`, `pressure`. `evolve` needs a run with `--snapshots N
+--snap-volume 1` (or 2 for half the resolution and an eighth of the disk space).
 
 ## Viewing results in 3-D
 

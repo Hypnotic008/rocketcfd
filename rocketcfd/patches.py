@@ -60,38 +60,65 @@ def _snap(pf, base_faces, h):
 
 
 def wall_patches(base_faces, h, shell, sdf=None, thin_sdf=None, box=(32, 64, 64), margin=2,
-                 sample=2, inner=None, thin_box=None, region=None, snap=True, verbose=True):
+                 sample=2, inner=None, thin_box=None, region=None, snap=True, verbose=True, tiling="base"):
     """Patches of cells of size h = (hx, hy, hz) covering the fluid within `shell` metres of
     the walls of `sdf` (and of `thin_sdf`, for thin parts such as grid fins).
 
     The domain is tiled into candidate boxes of `box` patch cells; boxes the walls do not come
     near are skipped using the distance bound of the SDF; each remaining box is shrunk to the
     bounding box of its flagged cells plus `margin` cells (sampled every `sample` cells).
-    `inner` (default: three patch cells) also keeps cells this far inside thick walls, so the
-    patch's immersed-boundary ghost cells and their interpolation stencils are in the patch.
+    `inner` (default: three patch cells along the local wall normal, i.e. 3 |h . n|-ish for
+    anisotropic cells: 3 x 0.03 m under a hull wall with 0.25 x 0.03 x 0.03 m cells, 3 x 0.25 m
+    under an end dome) also keeps cells this far inside thick walls, so the patch's
+    immersed-boundary ghost cells and their interpolation stencils are in the patch.
     thin_sdf may be large (not a distance) away from the thin parts if `thin_box` -- their
     bounding box -- is given. `region` = ((x0, y0, z0), (x1, y1, z1)) limits the patches to a box
     (e.g. the engine end). Returns a list of [xf, yf, zf] face arrays.
+
+    tiling="base" (default): the candidate boxes are groups of base-grid cells (about `box` patch
+    cells each), so snapping a shrunk patch out to base-grid faces never pushes it into its
+    neighbour; "fine": boxes on the fine lattice (the earlier layout: neighbouring patches
+    overlap by up to a base cell after snapping, which for thin anisotropic shells duplicated
+    most cells).
     """
     base_faces = [np.asarray(f, float) for f in base_faces]
     lo = np.array([f[0] for f in base_faces])
     hi = np.array([f[-1] for f in base_faces])
     h = np.broadcast_to(np.asarray(h, float), (3,))
     box = np.broadcast_to(np.asarray(box, int), (3,))
+    normal_inner = inner is None and float(h.max()) > 1.5 * float(h.min())
     if inner is None:
         inner = 3.0 * float(h.max())
     fine = [_lattice(lo[d], hi[d], h[d]) for d in range(3)]
-    nf = [len(f) - 1 for f in fine]
-    starts = [np.arange(0, nf[d], box[d]) for d in range(3)]
+    if tiling == "base" and snap:
+        # tiles of whole base cells: in each direction, groups of base cells about box * h long
+        edges = []
+        for d in range(3):
+            bf = base_faces[d]
+            want = box[d] * h[d]
+            e = [0]
+            while e[-1] < len(bf) - 1:
+                k = e[-1] + 1
+                while k < len(bf) - 1 and bf[k + 1] - bf[e[-1]] <= want + 1e-9:
+                    k += 1
+                e.append(k)
+            edges.append(bf[np.array(e)])
+        tiles = [list(zip(ed[:-1], ed[1:])) for ed in edges]
+    else:
+        nf = [len(f) - 1 for f in fine]
+        st = [np.arange(0, nf[d], box[d]) for d in range(3)]
+        tiles = [[(fine[d][a], fine[d][min(a + box[d], nf[d])]) for a in st[d]] for d in range(3)]
     out = []
     t0 = time.time()
     n_cand = 0
-    for i0 in starts[0]:
-        for j0 in starts[1]:
-            for k0 in starts[2]:
-                i1, j1, k1 = min(i0 + box[0], nf[0]), min(j0 + box[1], nf[1]), min(k0 + box[2], nf[2])
-                b0 = np.array([fine[0][i0], fine[1][j0], fine[2][k0]])
-                b1 = np.array([fine[0][i1], fine[1][j1], fine[2][k1]])
+    # with base tiling the margin is flagged as part of the shell, so a tile holding only margin
+    # cells still gets its patch (the margin would otherwise be cut at tile edges)
+    shell_f = shell + (margin + sample) * float(h.min()) if (tiling == "base" and snap) else shell
+    for tx in tiles[0]:
+        for ty in tiles[1]:
+            for tz in tiles[2]:
+                b0 = np.array([tx[0], ty[0], tz[0]])
+                b1 = np.array([tx[1], ty[1], tz[1]])
                 if region is not None and (np.any(b1 < np.asarray(region[0])) or np.any(b0 > np.asarray(region[1]))):
                     continue
                 c = 0.5 * (b0 + b1)
@@ -111,35 +138,53 @@ def wall_patches(base_faces, h, shell, sdf=None, thin_sdf=None, box=(32, 64, 64)
                 if not near:
                     continue
                 n_cand += 1
-                # sample the box's cell centres (every `sample` cells, plus the last)
-                idx = []
-                for d, (a0, a1) in enumerate(((i0, i1), (j0, j1), (k0, k1))):
-                    ii = np.arange(a0, a1, sample)
-                    if ii[-1] != a1 - 1:
-                        ii = np.append(ii, a1 - 1)
-                    idx.append(ii)
-                cen = [0.5 * (fine[d][idx[d]] + fine[d][idx[d] + 1]) for d in range(3)]
+                # sample the box at about every `sample` fine cells (plus both ends)
+                cen = []
+                for d in range(3):
+                    n_ = max(1, int(round((b1[d] - b0[d]) / h[d])))
+                    c_ = b0[d] + (np.arange(n_) + 0.5) * (b1[d] - b0[d]) / n_
+                    ii = np.arange(0, n_, sample)
+                    if ii[-1] != n_ - 1:
+                        ii = np.append(ii, n_ - 1)
+                    cen.append(c_[ii])
                 X, Y, Z = np.meshgrid(*cen, indexing="ij")
                 flag = np.zeros(X.shape, bool)
                 if sdf is not None:
                     ph = sdf(X, Y, Z)
-                    flag |= (ph > -inner) & (ph < shell)
+                    if normal_inner:
+                        # anisotropic cells: the depth kept inside the wall follows the wall normal
+                        flag |= (ph > -3.0 * float(h.min())) & (ph < shell_f)
+                        cand = (ph > -inner) & (ph <= -3.0 * float(h.min()))
+                        if cand.any():
+                            px, py, pz = X[cand], Y[cand], Z[cand]
+                            e = 0.5 * float(h.min())
+                            gx = sdf(px + e, py, pz) - sdf(px - e, py, pz)
+                            gy = sdf(px, py + e, pz) - sdf(px, py - e, pz)
+                            gz = sdf(px, py, pz + e) - sdf(px, py, pz - e)
+                            gn = np.sqrt(gx * gx + gy * gy + gz * gz) + 1e-30
+                            need = 3.0 * np.sqrt((gx * h[0]) ** 2 + (gy * h[1]) ** 2 + (gz * h[2]) ** 2) / gn
+                            sub = flag[cand]
+                            sub |= ph[cand] > -np.maximum(need, 3.0 * float(h.min()))
+                            flag[cand] = sub
+                    else:
+                        flag |= (ph > -inner) & (ph < shell_f)
                 if thin_sdf is not None:
                     ph = thin_sdf(X, Y, Z)
-                    flag |= np.abs(ph) < shell
+                    flag |= np.abs(ph) < shell_f
                 if region is not None:
                     r0, r1 = np.asarray(region[0]), np.asarray(region[1])
                     flag &= (X >= r0[0]) & (X <= r1[0]) & (Y >= r0[1]) & (Y <= r1[1]) & (Z >= r0[2]) & (Z <= r1[2])
                 if not flag.any():
                     continue
-                rng = []
+                pf = []
                 for d in range(3):
                     ax = tuple(e for e in range(3) if e != d)
                     on = np.flatnonzero(flag.any(axis=ax))
-                    a = max(idx[d][on[0]] - margin - (sample - 1), (i0, j0, k0)[d])
-                    b = min(idx[d][on[-1]] + 1 + margin + (sample - 1), (i1, j1, k1)[d])
-                    rng.append((a, b))
-                out.append([fine[d][rng[d][0]:rng[d][1] + 1].copy() for d in range(3)])
+                    pad = (margin + sample - 0.5) * h[d]
+                    a = max(cen[d][on[0]] - pad, b0[d])
+                    b = min(cen[d][on[-1]] + pad, b1[d])
+                    pf.append(np.linspace(a, b, max(1, int(round((b - a) / h[d]))) + 1))
+                out.append(pf)
     if snap:
         out = _snap(out, base_faces, h)
     if verbose:
@@ -233,6 +278,15 @@ class PatchGrid:
             self._on_bnd.append(on)
             self.grids.append(Solver(None, None, None, freestream, faces=fc, alloc=make_alloc(g),
                                      verbose=False, device=self.device, bcs=self._patch_bcs(g), **kw))
+        # one face-flux scratch array for all grids (they are updated one after another)
+        self._scratch = None
+
+        def scratch(shape):
+            if self._scratch is None:
+                self._scratch = torch.empty(5 * int(sizes.max()), dtype=dtype, device=self.device)
+            return self._scratch[:int(np.prod(shape))].view(shape)
+        for s_ in self.grids:
+            s_.face_scratch = scratch
         # fineness: cell volume of each grid's smallest cells
         self.vol = np.array([float(np.prod(s.h)) for s in self.grids])
         # fineness rank (0 = finest); equal cell sizes are ordered by grid index (later = finer),

@@ -1285,3 +1285,138 @@ def wall_stiff_kernel(W: wp.array4d(dtype=wp.float32), ix: wp.array(dtype=wp.flo
                         if ut > 1.0e-6:
                             acc = acc + 2.0 * tm / (rho * ut) * inv
     out[i, j, k] = acc
+
+
+# ---------------------------------------------------------------- split residual (faces, then divergence)
+# The fused residual_kernel computes every face flux twice (once from each side) and, with all
+# three directions, walls and viscous terms in one thread, needs ~174 registers plus a 232-byte
+# spill frame on sm_89: one 256-thread block per SM (~17 % occupancy) on an RTX 40xx. Here each
+# face flux is computed once, by a kernel specialised for one direction (compile-time constant,
+# so no dynamically indexed vectors) and for inviscid / viscous flow; a light divergence kernel
+# then adds the wall fluxes (thin-wall faces, wall function) and writes R. Same arithmetic as
+# residual_kernel (tests/split_residual.py compares the two).
+
+def _make_face_kernel(D: int, VISC: int):
+    DI = 1 if D == 0 else 0
+    DJ = 1 if D == 1 else 0
+    DK = 1 if D == 2 else 0
+
+    @wp.kernel
+    def face_kernel(W: wp.array4d(dtype=wp.float32), S: wp.array3d(dtype=wp.int32),
+                    blk: wp.array3d(dtype=wp.int32), g: float, order: float, kind: int, vp: Visc,
+                    F: wp.array4d(dtype=wp.float32)):
+        i, j, k = wp.tid()
+        # left cell of the face (padded indices); the right cell is L + e_D
+        I = i + 2 - wp.static(DI)
+        J = j + 2 - wp.static(DJ)
+        K = k + 2 - wp.static(DK)
+        f = vec5()
+        if ((blk[I, J, K] >> wp.static(D)) & 1) == 0:
+            qm = load(W, I - wp.static(DI), J - wp.static(DJ), K - wp.static(DK))
+            qa = load(W, I, J, K)
+            qb = load(W, I + wp.static(DI), J + wp.static(DJ), K + wp.static(DK))
+            qp = load(W, I + wp.static(2 * DI), J + wp.static(2 * DJ), K + wp.static(2 * DK))
+            bLL = (blk[I - wp.static(DI), J - wp.static(DJ), K - wp.static(DK)] >> wp.static(D)) & 1
+            bRR = (blk[I + wp.static(DI), J + wp.static(DJ), K + wp.static(DK)] >> wp.static(D)) & 1
+            hl = wp.max(S[I, J, K], S[I + wp.static(DI), J + wp.static(DJ), K + wp.static(DK)])
+            f = face_flux(qm, qa, qb, qp, wp.static(D), g, order, kind, hl, float(1 - bLL), float(1 - bRR))
+            if wp.static(VISC != 0):
+                wall = int(0)
+                if vp.turb == 1:
+                    if vp.fluid[I, J, K] < 0.5 or vp.fluid[I + wp.static(DI), J + wp.static(DJ), K + wp.static(DK)] < 0.5:
+                        wall = 1
+                if wall == 0:
+                    f = f - visc_flux(W, vp, g, I, J, K, I + wp.static(DI), J + wp.static(DJ), K + wp.static(DK),
+                                      wp.static(D))
+        for c in range(5):
+            F[c, I, J, K] = f[c]
+
+    return face_kernel
+
+
+@wp.func
+def div_dir(W: wp.array4d(dtype=wp.float32), F: wp.array4d(dtype=wp.float32), blk: wp.array3d(dtype=wp.int32),
+            vp: Visc, g: float, q0: vec5, inv: float, I: int, J: int, K: int, di: int, dj: int, dk: int, d: int,
+            visc: int):
+    bL = (blk[I - di, J - dj, K - dk] >> d) & 1
+    bR = (blk[I, J, K] >> d) & 1
+    fl = load(F, I - di, J - dj, K - dk)
+    fr = load(F, I, J, K)
+    if bL != 0:
+        fl = wall_flux_n(q0, d, g, 0, blk[I - di, J - dj, K - dk])
+    if bR != 0:
+        fr = wall_flux_n(q0, d, g, 1, blk[I, J, K])
+    acc = (fl - fr) * inv
+    if visc != 0:
+        wl = bL
+        wr = bR
+        if vp.turb == 1:
+            if vp.fluid[I - di, J - dj, K - dk] < 0.5:
+                wl = 1
+            if vp.fluid[I + di, J + dj, K + dk] < 0.5:
+                wr = 1
+        if wl != 0:
+            vl = vec5()
+            if vp.turb == 1:
+                vl = wallfn_flux(W, vp, I, J, K, d, 0)
+            else:
+                vl = wall_visc(W, vp, I, J, K, d, 0)
+            acc = acc - vl * inv
+        if wr != 0:
+            vr = vec5()
+            if vp.turb == 1:
+                vr = wallfn_flux(W, vp, I, J, K, d, 1)
+            else:
+                vr = wall_visc(W, vp, I, J, K, d, 1)
+            acc = acc + vr * inv
+    return acc
+
+
+def _make_div_kernel(D: int, VISC: int):
+    DI = 1 if D == 0 else 0
+    DJ = 1 if D == 1 else 0
+    DK = 1 if D == 2 else 0
+
+    @wp.kernel
+    def div_kernel(W: wp.array4d(dtype=wp.float32), inv: wp.array(dtype=wp.float32), g: float,
+                   blk: wp.array3d(dtype=wp.int32), vp: Visc, F: wp.array4d(dtype=wp.float32), first: int,
+                   R: wp.array4d(dtype=wp.float32)):
+        """R (+)= this direction's flux difference (first: overwrite)."""
+        i, j, k = wp.tid()
+        I = i + 2
+        J = j + 2
+        K = k + 2
+        q0 = load(W, I, J, K)
+        ii = i
+        if wp.static(D == 1):
+            ii = j
+        if wp.static(D == 2):
+            ii = k
+        acc = div_dir(W, F, blk, vp, g, q0, inv[ii], I, J, K, wp.static(DI), wp.static(DJ), wp.static(DK),
+                      wp.static(D), wp.static(VISC))
+        if first != 0:
+            for c in range(5):
+                R[c, i, j, k] = acc[c]
+        else:
+            for c in range(5):
+                R[c, i, j, k] = R[c, i, j, k] + acc[c]
+
+    return div_kernel
+
+
+FACE_KERNELS = [[_make_face_kernel(d, v) for d in range(3)] for v in (0, 1)]
+DIV_KERNELS = [[_make_div_kernel(d, v) for d in range(3)] for v in (0, 1)]
+
+
+# ---------------------------------------------------------------- engine jets
+@wp.kernel
+def jet_kernel(W: wp.array4d(dtype=wp.float32), cells: wp.array(dtype=wp.vec3i), state: wp.array(dtype=vec5),
+               ambient: vec5, throttle: float):
+    """Nozzle-exit inflow: the solid cells just inside each nozzle exit hold the exhaust state
+    (overriding the immersed-boundary mirror), so the jet flows out through the exit plane.
+    throttle 0..1 blends from the ambient state (ignition / shutdown transients)."""
+    t = wp.tid()
+    c = cells[t]
+    q = ambient + (state[t] - ambient) * throttle
+    for m in range(5):
+        W[m, c[0], c[1], c[2]] = q[m]

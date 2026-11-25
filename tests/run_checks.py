@@ -86,7 +86,13 @@ def check_patch_turbulent():
     return abs(b / a - 1) < 0.02, f"turbulent plate with a patch: friction drag {b:.5f} vs single grid {a:.5f}"
 
 
-CHECKS = dict(backends=check_backends, vortex=check_vortex, shocks=check_shocks, low_mach=check_low_mach,
+def check_split_residual():
+    import split_residual as sr
+    worst = max(sr.compare(kw) for _, kw in sr.cases())
+    return worst < 1e-4, f"split face/divergence residual vs fused kernel: worst relative difference {worst:.1e} (<1e-4)"
+
+
+CHECKS = dict(backends=check_backends, split_residual=check_split_residual, vortex=check_vortex, shocks=check_shocks, low_mach=check_low_mach,
               patch_blasius=check_patch_blasius, patch_sphere=check_patch_sphere, carbuncle=check_carbuncle,
               patch_turbulent=check_patch_turbulent)
 

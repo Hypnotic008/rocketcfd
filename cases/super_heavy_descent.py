@@ -66,6 +66,15 @@ def main(argv=None):
     ap.add_argument("--les", action="store_true",
                     help="unsteady wall-modelled LES (Vreman subgrid model + equilibrium wall model), "
                          "time-accurate explicit steps: unsteady wakes, movies (with --snapshots/--snap-volume)")
+    ap.add_argument("--engines", default="none", choices=["none", "centre", "inner", "all"],
+                    help="engines firing (landing / boostback burns, retropropulsion, plume visuals): "
+                         "centre = 3, inner = 13 (centre + inner ring), all = 33. One perfect gas: the exhaust "
+                         "is air at --exit-T chosen to give the right exit velocity")
+    ap.add_argument("--exit-mach", type=float, default=3.5, help="nozzle exit Mach number")
+    ap.add_argument("--exit-p", type=float, default=80e3, help="nozzle exit pressure [Pa]")
+    ap.add_argument("--exit-T", type=float, default=2200.0,
+                    help="exit temperature [K] for air (2200 K with Mach 3.5 gives ~3300 m/s, Raptor-like)")
+    ap.add_argument("--throttle", type=float, default=1.0, help="0..1, blends the exit state from ambient")
     ap.add_argument("--chines", choices=["all", "tall", "short", "none"], default="all",
                     help="which chines to fit: tall = the raceway-side pair, short = the rudder-side pair")
     ap.add_argument("--implicit", action="store_true",
@@ -187,16 +196,29 @@ def main(argv=None):
             print(f"estimated GPU memory ~{n * per / 2**30:.1f} GB ({what}, ~{per} B/cell); "
                   f"setup needs ~{n * 120 / 2**30:.0f} GB of system RAM")
             return None
+    jets = None
+    if a.engines != "none":
+        from rocketcfd.vehicles.super_heavy import engine_positions
+        n_on = {"centre": 3, "inner": 13, "all": 33}[a.engines]
+        jets = [dict(center=(float(xe), float(y), float(z)), direction=(-1.0, 0.0, 0.0),
+                     radius=0.95 * P.bell_exit_radius, mach=a.exit_mach, p=a.exit_p, T=a.exit_T)
+                for y, z, xe in engine_positions(P)[:n_on]]
+        ve = a.exit_mach * np.sqrt(1.4 * 287.05 * a.exit_T)
+        print(f"{n_on} engines firing: exit Mach {a.exit_mach}, {a.exit_p/1e3:.0f} kPa, {a.exit_T:.0f} K "
+              f"-> {ve:.0f} m/s (forces below include the exit-plane pressure, not the momentum thrust)")
     visc = dict(model="sutherland") if (a.turbulent or a.les) else None
     turb = dict(model="sst") if a.turbulent else (dict(model="les") if a.les else None)
     if patches:
         from rocketcfd.patches import PatchGrid
         runner = PatchGrid(faces, patches, fs, sdf=sdf, cfl=0.7, thin_sdf=thin_sdf, thin_box=thin_box,
-                           viscous=visc, turbulence=turb)
+                           viscous=visc, turbulence=turb, jets=jets)
         s = runner.base
     else:
         s = runner = Solver(lo, hi, a.h, fs, sdf=sdf, cfl=0.7, dtype=dtype, faces=faces, thin_sdf=thin_sdf,
-                            thin_box=thin_box, viscous=visc, turbulence=turb)
+                            thin_box=thin_box, viscous=visc, turbulence=turb, jets=jets)
+    if jets:
+        for g_ in (runner.grids if patches else [runner]):
+            g_.jet_throttle = a.throttle
     if s.n_ib_fallback:
         print(f"note: {s.n_ib_fallback} ghost cells used nearest-fluid fallback (thin features)")
 
