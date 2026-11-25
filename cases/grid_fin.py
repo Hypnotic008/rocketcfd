@@ -48,6 +48,7 @@ def main():
     ap.add_argument("--max-steps", type=int, default=0)
     ap.add_argument("--out", default="results/grid_fin")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--implicit", action="store_true", help="implicit steady solver (much faster)")
     ap.add_argument("--time-accurate", action="store_true",
                     help="global time step, all cells every step (off: local time steps + active tiles)")
     a = ap.parse_args()
@@ -137,8 +138,14 @@ def main():
 
             print(f"=== M {M}  alpha {al} deg  (up to {nmax} steps)", flush=True)
             t1 = time.time()
-            s.run(nmax, chunk=chunk, first_order_steps=(0 if warm else 300), report=report,
-                  steady=not a.time_accurate, local_dt=a.local_dt)
+            if a.implicit:
+                nmax = a.max_steps or 1500
+                chunk = 50
+                s.run(nmax, chunk=chunk, first_order_steps=(0 if warm else 150), report=report, steady=True,
+                      implicit=True, cfl_start=(5.0 if warm else 1.0), cfl_ramp=(60 if warm else 200))
+            else:
+                s.run(nmax, chunk=chunk, first_order_steps=(0 if warm else 300), report=report,
+                      steady=not a.time_accurate, local_dt=a.local_dt)
             if ai == 0:
                 base = s.U.clone()
             ld = s.loads(S_ref=S_ref, L_ref=c_ref, x_ref=(0.0, 0.0, 0.0))
@@ -191,9 +198,11 @@ def main():
                  f"{', plates thinned %g m/side' % off if off else ''}")
     fig.savefig(f"{a.out}/grid_fin_sweep.png", dpi=130)
     if slope:
-        print("\nnormal-force slope dCN/dalpha per rad (fin area):")
+        from rocketcfd.vehicles.grid_fin import cascade_slope
+        print("\nnormal-force slope dCN/dalpha per rad (fin area); supersonic cascade theory = upper bound:")
         for M, sl in slope:
-            print(f"  M {M:4.2f}: {sl:6.3f}")
+            th = f"   theory {float(cascade_slope(M)):6.3f}" if M > 1.2 else ""
+            print(f"  M {M:4.2f}: {sl:6.3f}{th}")
         json.dump(dict(slope=slope), open(f"{a.out}/grid_fin_slope.json", "w"), indent=2)
 
 

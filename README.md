@@ -64,6 +64,10 @@ python cases/validate_cylinder_turbulent.py --dual --patch-h 0.001 --shell 0.06
 | Inviscid cylinder, Mach 0.1 (`tests/low_mach_cylinder.py`) | potential flow: CD 0, rear Cp 1 | low-Mach correction: CD +0.011, rear Cp 1.03; without: CD -0.053, rear Cp 0.69 |
 | Implicit vs explicit, Mach 3 sphere (`tests/steady_accel.py`) | explicit local time step | CD 0.9625 vs 0.9627, 480 vs 2000 steps, 2.5x less wall time (CPU) |
 | Implicit vs explicit, laminar plate (2x coarse grid) | explicit | same Cf (-7.15 %); needs 8 Jacobi sweeps (2 diverge, 4 stall) |
+| Red-black Gauss-Seidel vs Jacobi relaxation | same steady state | Mach 3 sphere CD 0.9591 vs 0.9596 in 89 s vs 140 s; plate: same Cf after the same iterations (default now) |
+| Super Heavy bare body, 0.5 m grid, M 2.82, 5 deg (CPU) | earlier explicit van Leer run | implicit + Koren: CD 2.208, CN 0.205, C_restore -0.051 vs 2.218, 0.207, -0.050 |
+| Solution-adaptive patches, Mach 4 cylinder (`tests/adapt_cylinder.py`) | fine grid, Billig | bow-shock standoff +7.0 % (fine grid +7.4 %, coarse +13.9 %) |
+| Wall patches, Mach 4 cylinder forebody drag (4x finer cells within 0.1 / 0.4 of the wall) | one fine grid (1.2355) | 1.2231 (-1.0 %) / 1.2467 (+0.9 %); coarse alone 1.1526 (-6.7 %). The inviscid wake behind the body stays grid-dependent |
 | Local refinement, laminar plate (`tests/patch_blasius.py`) | one fine grid | friction drag 0.00899 vs 0.00896 (coarse grid alone 0.00967), 68 % of the cells |
 | Local refinement, Mach 3 sphere (`tests/patch_sphere.py`) | one fine grid | CD 0.9666 vs 0.9569 (coarse alone 1.0114), 45 % of the cells |
 | Laminar cylinder Re 100, dual time stepping | St 0.164 | St 0.160 (25 cells/D, 50 steps per period) |
@@ -339,6 +343,11 @@ The viewer adds Q-criterion vortex surfaces (`v`) and friction lines (`l`).
 
 ## Limits of this milestone (read before using numbers)
 
+* **Patch coupling is not conservative** (overlapping-grid style: interpolated ghost layers,
+  averaged covered cells). Forebody loads match a single fine grid to ~1 % when the patch shell is
+  at least a few fine cells thick; keep patch edges out of shocks where possible. Laminar skin
+  friction on curved immersed walls (Re 40 cylinder) is not yet grid-converged (0.44 / 0.33 at
+  h = D/25 / D/50, reference ~0.5); pressure drag is (1.02 / 1.04 vs ~1.0).
 * **Turbulent plate: implicit and explicit converge to different states** (Cf +2.6 % vs -6.2 % from
   White at Re 1e7). Both residuals settle; the likely cause is SST's sensitivity to where the
   boundary layer turns turbulent near the leading edge at low freestream turbulence, which the

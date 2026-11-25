@@ -114,9 +114,12 @@ def build_fin_control(base_csv, deflected, fin_names=("rudder fin", "catch fin 9
     Derivatives are finite differences against `base_csv` at the conditions both contain, per
     radian, for the six body-axis coefficients (CX, CY, CZ, Cl, Cm, Cn) and the fin's own hinge
     coefficient. If only "catch fin 90" was run, "catch fin 270" follows from the mirror symmetry
-    (valid at roll 0 and 180, where the flow is mirror-symmetric too):
-        dF_270 / d delta = -R dF_90 / d delta,  dM_270 / d delta = R dM_90 / d delta,
-        dC_h,270 / d delta = dC_h,90 / d delta.
+    (valid at roll 0 and 180, where the flow is mirror-symmetric too). Each fin's deflection is
+    defined in its own local frame, whose handedness the mirror also flips, so +delta on one
+    catch fin mirrors to +delta on the other:
+        dF_270 / d delta = R dF_90 / d delta,  dM_270 / d delta = -R dM_90 / d delta,
+        dC_h,270 / d delta = -dC_h,90 / d delta.
+    (Checked against a direct catch-fin-270 run: the force derivatives match in sign and size.)
     """
     base = _read(base_csv)
     out = {}
@@ -139,8 +142,10 @@ def build_fin_control(base_csv, deflected, fin_names=("rudder fin", "catch fin 9
         for row in out["catch fin 90"]:
             if row["roll"] % 180.0 != 0.0 and row["aoa"] != 0.0:
                 continue
-            mirrored.append(dict(row, dF=(-R_MIRROR @ np.array(row["dF"])).tolist(),
-                                 dM=(R_MIRROR @ np.array(row["dM"])).tolist(), mirrored_from="catch fin 90"))
+            mirrored.append(dict(row, dF=(R_MIRROR @ np.array(row["dF"])).tolist(),
+                                 dM=(-R_MIRROR @ np.array(row["dM"])).tolist(),
+                                 dC_h=(-row["dC_h"] if row["dC_h"] is not None else None),
+                                 mirrored_from="catch fin 90"))
         out["catch fin 270"] = mirrored
     return dict(description="d(coefficient)/d(deflection) per radian, body axes (CX, CY, CZ) and moments about "
                             "x_ref (Cl, Cm, Cn); deflection = rotation about the fin's outward radial axis",

@@ -176,3 +176,24 @@ def planform_area(P: GridFinParams = GridFinParams()):
     w, r0, c = P.w, P.root_half, P.chamfer
     h_tri = P.z_cross - P.z_root
     return (2 * w) * (P.z_tip - P.z_cross) - c * c + (w + r0) * h_tri
+
+
+def cascade_slope(mach, P: "GridFinParams" = None):
+    """Supersonic linear-theory normal-force slope of the fin (per rad, on planform_area), for
+    incidence about the hinge (z) axis: every plate is a thin supersonic airfoil, lift slope
+    4 / beta on its own area, beta = sqrt(M^2 - 1). The diagonal lattice plates see the
+    crossflow component normal to them (alpha / sqrt 2) and contribute that force's projection
+    (1 / sqrt 2): 2 / beta per unit plate area; the two side edge plates face the crossflow
+    fully: 4 / beta. Lattice plate length per unit planform = 2 / p (two families, spacing p).
+
+    Interference between plates inside a cell (Mach waves reaching the neighbouring plates
+    within the fin depth) and the lower dynamic pressure of a partly choked lattice are
+    neglected, so this is an upper bound, approached at high supersonic Mach (Burkhalter's
+    grid-fin theory adds those effects)."""
+    P = P or GridFinParams()
+    mach = np.asarray(mach, float)
+    beta = np.sqrt(np.maximum(mach ** 2 - 1.0, 1e-6))
+    S = planform_area(P)
+    lattice = 2.0 * S / P.p * P.depth                      # one side, m^2
+    sides = 2.0 * (P.z_tip - P.chamfer - P.z_cross) * P.depth
+    return (2.0 * lattice + 4.0 * sides) / (S * beta)
