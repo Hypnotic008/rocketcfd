@@ -53,6 +53,7 @@ def main():
     a = ap.parse_args()
 
     from rocketcfd import Solver, atmosphere
+    from rocketcfd.convergence import settled
     from rocketcfd.grid import Zone, stretched_faces, describe
     from rocketcfd.vehicles.super_heavy import load_fin_cad, SuperHeavyParams
     from rocketcfd.output import plot_slices
@@ -130,10 +131,8 @@ def main():
                 CN, CA, Ch, Cb = Ft[1] / (q * S_ref), Ft[0] / (q * S_ref), Mt[2] / (q * S_ref * c_ref), Mt[0] / (q * S_ref * b_ref)
                 hist.append((CN, CA, Ch))
                 print(f"   step {sv.step_count:6d}  CN {CN:+.4f}  CA {CA:+.4f}  Ch {Ch:+.5f}  Cb {Cb:+.5f}", flush=True)
-                if len(hist) >= 4 and sv.step_count > nmax / a.flowthroughs:
-                    r = np.array(hist[-4:])
-                    if np.all(np.abs(r - r[-1]).max(0) < a.tol):
-                        return True
+                if sv.step_count > nmax / a.flowthroughs and settled(hist, a.tol):
+                    return True
                 return False
 
             print(f"=== M {M}  alpha {al} deg  (up to {nmax} steps)", flush=True)

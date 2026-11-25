@@ -64,6 +64,7 @@ def main(argv=None):
 
     import torch
     from rocketcfd import Solver, atmosphere
+    from rocketcfd.convergence import settled
     from rocketcfd.vehicles.super_heavy import super_heavy_sdf, v3_params, REFERENCE
     from rocketcfd.output import plot_slices, write_vtk
 
@@ -148,12 +149,11 @@ def main(argv=None):
                          **{f"{k}[{n}]": v[k] for n, v in ld["parts"].items() for k in ("CD", "CN", "C_restore")}))
         print(f"      CD {ld['CD']:.4f}  CL {ld['CL']:+.4f}  CN {ld['CN']:+.4f}  CS {ld['CS']:+.4f}  "
               f"C_restore {ld['C_restore']:+.5f}  C_roll {ld['C_roll']:+.5f}", flush=True)
-        if a.tol > 0 and sv.step_count >= min_steps and len(hist) >= 4:
-            recent = np.array([h[2:] for h in hist[-4:]])
-            change = np.abs(recent - recent[-1]).max(0)
-            change[0] /= max(abs(recent[-1, 0]), 1e-6)          # CD relative, CN / C_restore absolute
-            if np.all(change < a.tol):
-                print(f"      converged: loads changed < {a.tol:g} over the last 3 checks", flush=True)
+        if a.tol > 0 and sv.step_count >= min_steps:
+            vals = [h[2:] for h in hist]
+            tolv = (a.tol * max(abs(hist[-1][2]), 1e-6), a.tol, a.tol)   # CD relative; CN, C_restore absolute
+            if settled(vals, tolv):
+                print(f"      converged: loads steady to {a.tol:g} and not drifting", flush=True)
                 return True
         return False
 
