@@ -127,6 +127,122 @@ def wall_flux(q: vec5, d: int, g: float, own_left: int):
     return riemann(m, q, d, g, 0)
 
 
+# ---------------------------------------------------------------- viscous terms
+@wp.struct
+class Visc:
+    mode: int                      # 0 inviscid, 1 constant viscosity, 2 Sutherland
+    mu0: float
+    T0: float
+    S: float
+    R: float                       # gas constant (T = p / (rho R))
+    Pr: float
+    cx: wp.array(dtype=wp.float32)  # padded cell-centre coordinates
+    cy: wp.array(dtype=wp.float32)
+    cz: wp.array(dtype=wp.float32)
+
+
+@wp.func
+def qcomp(W: wp.array4d(dtype=wp.float32), i: int, j: int, k: int, c: int, R: float):
+    """c = 0, 1, 2: velocity components; c = 3: temperature."""
+    if c < 3:
+        return W[1 + c, i, j, k]
+    return W[4, i, j, k] / (W[0, i, j, k] * R)
+
+
+@wp.func
+def coord(vp: Visc, e: int, idx: int):
+    if e == 0:
+        return vp.cx[idx]
+    if e == 1:
+        return vp.cy[idx]
+    return vp.cz[idx]
+
+
+@wp.func
+def cdiff(W: wp.array4d(dtype=wp.float32), vp: Visc, i: int, j: int, k: int, c: int, e: int):
+    """Central derivative of component c along e at cell (i, j, k) (padded indices)."""
+    di = int(0)
+    dj = int(0)
+    dk = int(0)
+    idx = int(0)
+    if e == 0:
+        di = 1
+        idx = i
+    elif e == 1:
+        dj = 1
+        idx = j
+    else:
+        dk = 1
+        idx = k
+    num = qcomp(W, i + di, j + dj, k + dk, c, vp.R) - qcomp(W, i - di, j - dj, k - dk, c, vp.R)
+    return num / (coord(vp, e, idx + 1) - coord(vp, e, idx - 1))
+
+
+@wp.func
+def face_deriv(W: wp.array4d(dtype=wp.float32), vp: Visc, ia: int, ja: int, ka: int,
+               ib: int, jb: int, kb: int, d: int, c: int, e: int):
+    """Derivative of component c along e on the face between cells A and B (B = A + e_d)."""
+    if e == d:
+        ida = ia
+        idb = ib
+        if d == 1:
+            ida = ja
+            idb = jb
+        elif d == 2:
+            ida = ka
+            idb = kb
+        return (qcomp(W, ib, jb, kb, c, vp.R) - qcomp(W, ia, ja, ka, c, vp.R)) / \
+            (coord(vp, d, idb) - coord(vp, d, ida))
+    return 0.5 * (cdiff(W, vp, ia, ja, ka, c, e) + cdiff(W, vp, ib, jb, kb, c, e))
+
+
+@wp.func
+def mu_of(vp: Visc, T: float):
+    if vp.mode == 1:
+        return vp.mu0
+    return vp.mu0 * wp.pow(T / vp.T0, 1.5) * (vp.T0 + vp.S) / (T + vp.S)
+
+
+@wp.func
+def visc_flux(W: wp.array4d(dtype=wp.float32), vp: Visc, g: float, ia: int, ja: int, ka: int,
+              ib: int, jb: int, kb: int, d: int):
+    """Viscous flux (stress and heat conduction) through the face between A and B = A + e_d."""
+    mu = 0.5 * (mu_of(vp, qcomp(W, ia, ja, ka, 3, vp.R)) + mu_of(vp, qcomp(W, ib, jb, kb, 3, vp.R)))
+    kcond = mu * g * vp.R / ((g - 1.0) * vp.Pr)
+    div = face_deriv(W, vp, ia, ja, ka, ib, jb, kb, d, 0, 0) + face_deriv(W, vp, ia, ja, ka, ib, jb, kb, d, 1, 1) \
+        + face_deriv(W, vp, ia, ja, ka, ib, jb, kb, d, 2, 2)
+    t = wp.vec3()
+    for j in range(3):
+        tj = mu * (face_deriv(W, vp, ia, ja, ka, ib, jb, kb, d, j, d) + face_deriv(W, vp, ia, ja, ka, ib, jb, kb, d, d, j))
+        if j == d:
+            tj = tj - (2.0 / 3.0) * mu * div
+        t[j] = tj
+    uf = wp.vec3(0.5 * (W[1, ia, ja, ka] + W[1, ib, jb, kb]), 0.5 * (W[2, ia, ja, ka] + W[2, ib, jb, kb]),
+                 0.5 * (W[3, ia, ja, ka] + W[3, ib, jb, kb]))
+    en = wp.dot(uf, t) + kcond * face_deriv(W, vp, ia, ja, ka, ib, jb, kb, d, 3, d)
+    return vec5(0.0, t[0], t[1], t[2], en)
+
+
+@wp.func
+def wall_visc(W: wp.array4d(dtype=wp.float32), vp: Visc, i: int, j: int, k: int, d: int, wall_high: int):
+    """Shear on a thin-wall (blocked) face: no-slip, adiabatic; the wall is half a cell away."""
+    mu = mu_of(vp, qcomp(W, i, j, k, 3, vp.R))
+    idx = i
+    if d == 1:
+        idx = j
+    elif d == 2:
+        idx = k
+    half = 0.25 * (coord(vp, d, idx + 1) - coord(vp, d, idx - 1))
+    sgn = 1.0
+    if wall_high != 0:
+        sgn = -1.0
+    t = wp.vec3()
+    for c in range(3):
+        if c != d:
+            t[c] = sgn * mu * W[1 + c, i, j, k] / half
+    return vec5(0.0, t[0], t[1], t[2], 0.0)
+
+
 @wp.kernel
 def prim_kernel(U: wp.array4d(dtype=wp.float32), g: float, rmin: float, pmin: float,
                 W: wp.array4d(dtype=wp.float32)):
@@ -146,7 +262,7 @@ def prim_kernel(U: wp.array4d(dtype=wp.float32), g: float, rmin: float, pmin: fl
 @wp.kernel
 def ib_kernel(W: wp.array4d(dtype=wp.float32), ghost: wp.array(dtype=wp.vec3i),
               corner: wp.array2d(dtype=wp.vec3i), weight: wp.array2d(dtype=wp.float32),
-              normal: wp.array(dtype=wp.vec3)):
+              normal: wp.array(dtype=wp.vec3), noslip: int):
     t = wp.tid()
     q = vec5()
     for m in range(8):
@@ -156,7 +272,10 @@ def ib_kernel(W: wp.array4d(dtype=wp.float32), ghost: wp.array(dtype=wp.vec3i),
             q = q + load(W, c[0], c[1], c[2]) * wm
     n = normal[t]
     vel = wp.vec3(q[1], q[2], q[3])
-    vel = vel - 2.0 * wp.dot(vel, n) * n
+    if noslip != 0:
+        vel = -vel                                   # no-slip: zero velocity at the wall
+    else:
+        vel = vel - 2.0 * wp.dot(vel, n) * n         # slip: reflect the normal component
     gc = ghost[t]
     W[0, gc[0], gc[1], gc[2]] = q[0]
     W[1, gc[0], gc[1], gc[2]] = vel[0]
@@ -195,7 +314,7 @@ def shock_kernel(W: wp.array4d(dtype=wp.float32), active: wp.vec3i, thr: float,
 def cell_residual(W: wp.array4d(dtype=wp.float32), S: wp.array3d(dtype=wp.int32),
                   ix: wp.array(dtype=wp.float32), iy: wp.array(dtype=wp.float32),
                   iz: wp.array(dtype=wp.float32), active: wp.vec3i, g: float, order: float,
-                  kind: int, blk: wp.array3d(dtype=wp.int32), i: int, j: int, k: int):
+                  kind: int, blk: wp.array3d(dtype=wp.int32), vp: Visc, i: int, j: int, k: int):
     """Residual -div(F) of interior cell (i, j, k). blk[i,j,k] bit d set = the face between
     cell (i,j,k) and its +d neighbour is a thin wall."""
     I = i + 2
@@ -242,6 +361,18 @@ def cell_residual(W: wp.array4d(dtype=wp.float32), S: wp.array3d(dtype=wp.int32)
                 fr = face_flux(qm1, q0, qp1, qp2, d, g, order, kind, hl_r,
                                float(1 - bL), float(1 - bRR))
             acc = acc - (fr - fl) * inv
+            if vp.mode != 0:
+                vl = vec5()
+                vr = vec5()
+                if bL != 0:
+                    vl = wall_visc(W, vp, I, J, K, d, 0)
+                else:
+                    vl = visc_flux(W, vp, g, I - di, J - dj, K - dk, I, J, K, d)
+                if bR != 0:
+                    vr = wall_visc(W, vp, I, J, K, d, 1)
+                else:
+                    vr = visc_flux(W, vp, g, I, J, K, I + di, J + dj, K + dk, d)
+                acc = acc + (vr - vl) * inv
     return acc
 
 
@@ -249,9 +380,9 @@ def cell_residual(W: wp.array4d(dtype=wp.float32), S: wp.array3d(dtype=wp.int32)
 def residual_kernel(W: wp.array4d(dtype=wp.float32), S: wp.array3d(dtype=wp.int32),
                     ix: wp.array(dtype=wp.float32), iy: wp.array(dtype=wp.float32),
                     iz: wp.array(dtype=wp.float32), active: wp.vec3i, g: float, order: float,
-                    kind: int, blk: wp.array3d(dtype=wp.int32), R: wp.array4d(dtype=wp.float32)):
+                    kind: int, blk: wp.array3d(dtype=wp.int32), vp: Visc, R: wp.array4d(dtype=wp.float32)):
     i, j, k = wp.tid()
-    acc = cell_residual(W, S, ix, iy, iz, active, g, order, kind, blk, i, j, k)
+    acc = cell_residual(W, S, ix, iy, iz, active, g, order, kind, blk, vp, i, j, k)
     for c in range(5):
         R[c, i, j, k] = acc[c]
 
@@ -271,15 +402,15 @@ def tile_cell(tiles: wp.array(dtype=wp.vec3i), t: int):
 def residual_tiles_kernel(W: wp.array4d(dtype=wp.float32), S: wp.array3d(dtype=wp.int32),
                           ix: wp.array(dtype=wp.float32), iy: wp.array(dtype=wp.float32),
                           iz: wp.array(dtype=wp.float32), active: wp.vec3i, g: float, order: float,
-                          kind: int, blk: wp.array3d(dtype=wp.int32), tiles: wp.array(dtype=wp.vec3i),
-                          R: wp.array4d(dtype=wp.float32)):
+                          kind: int, blk: wp.array3d(dtype=wp.int32), vp: Visc,
+                          tiles: wp.array(dtype=wp.vec3i), R: wp.array4d(dtype=wp.float32)):
     c3 = tile_cell(tiles, wp.tid())
     i = c3[0]
     j = c3[1]
     k = c3[2]
     if i >= R.shape[1] or j >= R.shape[2] or k >= R.shape[3]:
         return
-    acc = cell_residual(W, S, ix, iy, iz, active, g, order, kind, blk, i, j, k)
+    acc = cell_residual(W, S, ix, iy, iz, active, g, order, kind, blk, vp, i, j, k)
     for c in range(5):
         R[c, i, j, k] = acc[c]
 
@@ -298,19 +429,26 @@ def activity_kernel(R: wp.array4d(dtype=wp.float32), W: wp.array4d(dtype=wp.floa
 @wp.kernel
 def rate_kernel(W: wp.array4d(dtype=wp.float32), ix: wp.array(dtype=wp.float32),
                 iy: wp.array(dtype=wp.float32), iz: wp.array(dtype=wp.float32), active: wp.vec3i,
-                mask: wp.array3d(dtype=wp.float32), g: float, rate: wp.array3d(dtype=wp.float32)):
+                mask: wp.array3d(dtype=wp.float32), g: float, vp: Visc, rate: wp.array3d(dtype=wp.float32)):
     i, j, k = wp.tid()
     I = i + 2
     J = j + 2
     K = k + 2
     c = wp.sqrt(g * W[4, I, J, K] / W[0, I, J, K])
     r = float(0.0)
+    s2 = float(0.0)
     if active[0] != 0:
         r = r + (wp.abs(W[1, I, J, K]) + c) * ix[i]
+        s2 = s2 + ix[i] * ix[i]
     if active[1] != 0:
         r = r + (wp.abs(W[2, I, J, K]) + c) * iy[j]
+        s2 = s2 + iy[j] * iy[j]
     if active[2] != 0:
         r = r + (wp.abs(W[3, I, J, K]) + c) * iz[k]
+        s2 = s2 + iz[k] * iz[k]
+    if vp.mode != 0:                 # explicit viscous stability limit
+        mu = mu_of(vp, W[4, I, J, K] / (W[0, I, J, K] * vp.R))
+        r = r + 2.0 * mu / W[0, I, J, K] * wp.max(4.0 / 3.0, g / vp.Pr) * s2
     rate[i, j, k] = r * mask[i, j, k]
 
 

@@ -9,6 +9,7 @@ along them, and a cross-section slice that can be dragged or swept along the boo
   py -m rocketcfd.viewer results\\glide_rudder --movie orbit   MP4: orbit with flowing particles
   py -m rocketcfd.viewer results\\glide_rudder --movie sweep   MP4: slice sweeping engines -> top
   py -m rocketcfd.viewer results\\glide_rudder --movie both
+  py -m rocketcfd.viewer results\\glide_rudder --movie evolve  MP4 of a run's --snapshots
 
 Interactive keys: space = pause/play particles, o = orbit once, k = sweep the slice,
 s = streamlines on/off, f = fins on/off, h = hull transparent/opaque, r = reset view.
@@ -278,7 +279,7 @@ def movie(folder, meta, flow, args):
     pl.set_background("#0d1117", top="#2d3440")
     scene = build_scene(pl, folder, meta, flow, args)
     pl.add_text(title_of(meta), font_size=10, color="white")
-    pl.open_movie(out, framerate=30, quality=8)
+    pl.open_movie(out, framerate=args.fps, quality=8)
     parts = scene["particles"]
     phase = 0.0
 
@@ -304,6 +305,68 @@ def movie(folder, meta, flow, args):
     print(f"wrote {out}")
 
 
+def movie_evolve(folder, meta, args):
+    """Play back the snapshots saved during a run (--snapshots): surface Cp on the hull and
+    Mach on the rudder / tower plane (x-z) and the catch-fin plane (x-y) as the flow develops."""
+    import glob
+    d = os.path.join(folder, "snapshots")
+    mesh = np.load(os.path.join(d, "mesh.npz"))
+    frames = sorted(glob.glob(os.path.join(d, "snap_*.npz")))
+    if not frames:
+        raise SystemExit(f"no snapshots in {d}: run the case with --snapshots N")
+    faces = mesh["faces"]
+    surf = pv.PolyData(mesh["xyz"].astype(float), np.hstack([np.full((len(faces), 1), 3), faces]).astype(np.int64))
+    last = np.load(frames[-1])
+    lim = float(np.percentile(np.abs(last["cp"].astype(float)), 99))
+    surf.point_data["Cp"] = last["cp"].astype(float)
+
+    def plane(a, b, along, fixed):
+        A, B = np.meshgrid(a, b, indexing="ij")
+        P = np.zeros(A.shape + (3,))
+        P[..., 0] = A
+        P[..., along] = B
+        g = pv.StructuredGrid(P[..., 0], P[..., 1], P[..., 2])
+        return g
+    xz = plane(mesh["x"], mesh["z"], 2, "y")
+    xy = plane(mesh["x"], mesh["y"], 1, "z")
+    mmax = float(np.nanpercentile(last["mach_xz"].astype(float), 99.9))
+
+    def set_plane(g, m, solid):
+        m = m.astype(float).copy()
+        m[solid] = np.nan
+        g.point_data["mach"] = m.ravel(order="F")
+
+    out = os.path.join(folder, "animation_evolve.mp4")
+    pl = pv.Plotter(off_screen=True, window_size=(1600, 900))
+    pl.set_background("#0d1117", top="#2d3440")
+    pl.add_mesh(surf, scalars="Cp", cmap="RdBu_r", clim=(-lim, lim), smooth_shading=True,
+                scalar_bar_args=dict(title="Cp", vertical=True, position_x=0.90, position_y=0.55, height=0.35))
+    for m in fin_meshes(meta, args.fin_stl):
+        pl.add_mesh(m, color="#3b3d42", pbr=True, metallic=0.7, roughness=0.35)
+    set_plane(xz, frames and np.load(frames[0])["mach_xz"], mesh["solid_xz"])
+    set_plane(xy, np.load(frames[0])["mach_xy"], mesh["solid_xy"])
+    pl.add_mesh(xz, scalars="mach", cmap="turbo", clim=(0, mmax), nan_opacity=0.0, opacity=0.95,
+                scalar_bar_args=dict(title="Mach", vertical=True, position_x=0.90, position_y=0.08, height=0.35))
+    pl.add_mesh(xy, scalars="mach", cmap="turbo", clim=(0, mmax), nan_opacity=0.0, opacity=0.6, show_scalar_bar=False)
+    pl.add_text(title_of(meta), font_size=10, color="white")
+    label = pl.add_text("", position="lower_left", font_size=10, color="white")
+    pl.camera_position = [(20.0, -75.0, 38.0), (36.0, 0.0, 0.0), (0.0, 0.0, 1.0)]
+    pl.open_movie(out, framerate=args.fps, quality=8)
+    hold = max(1, int(args.fps * 2 / max(1, len(frames))) if len(frames) < args.fps * 2 else 1)
+    for k, fpath in enumerate(frames):
+        fr = np.load(fpath)
+        surf.point_data["Cp"] = fr["cp"].astype(float)
+        set_plane(xz, fr["mach_xz"], mesh["solid_xz"])
+        set_plane(xy, fr["mach_xy"], mesh["solid_xy"])
+        label.SetText(0, f"step {int(fr['step'])}   t = {1000*float(fr['t']):.1f} ms")
+        for _ in range(hold):
+            pl.write_frame()
+    for _ in range(args.fps):                  # hold the final state for a second
+        pl.write_frame()
+    pl.close()
+    print(f"wrote {out} ({len(frames)} snapshots)")
+
+
 def title_of(meta):
     c = meta["condition"]
     w = meta.get("condition_windward", 180.0)
@@ -315,7 +378,9 @@ def title_of(meta):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     ap.add_argument("folder", help="a results folder (loads.json, surface_cp.vtk, flow.vtk)")
-    ap.add_argument("--movie", choices=["orbit", "sweep", "both"], help="record an MP4 instead of opening a window")
+    ap.add_argument("--movie", choices=["orbit", "sweep", "both", "evolve"],
+                    help="record an MP4 instead of opening a window (evolve: play back --snapshots)")
+    ap.add_argument("--fps", type=int, default=30)
     ap.add_argument("--frames", type=int, default=360, help="frames per movie segment (30 fps)")
     ap.add_argument("--stride", type=int, default=1, help="read every n-th flow point (faster, less memory)")
     ap.add_argument("--seeds", type=int, default=16, help="streamline rake size (n x n)")
@@ -324,6 +389,9 @@ def main(argv=None):
     args = ap.parse_args(argv)
     folder = args.folder
     meta = json.load(open(os.path.join(folder, "loads.json")))
+    if args.movie == "evolve":
+        movie_evolve(folder, meta, args)
+        return
     flow = None
     fp = os.path.join(folder, "flow.vtk")
     if not args.no_flow and os.path.exists(fp):

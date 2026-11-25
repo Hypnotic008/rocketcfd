@@ -32,7 +32,7 @@ guessed aero coefficients in CatchSim (`quatsim/aero.py`).
 | Cylinder, Mach 4: surface pressure | modified Newtonian | matches near stagnation, above it further round (expected) |
 | Cylinder, Mach 4, stretched grid (2.8x fewer cells) | uniform-grid result | standoff within 1 %, stagnation pressure -0.5 % |
 | 1 mm flat plate, Mach 2, 5 deg, plate along the grid (thin walls) | shock-expansion theory | face pressures exact to 4 digits; CN -1.7 % |
-| Same plate tilted across the grid (staircase walls) | shock-expansion theory | CN +6.1 % (100 cells/chord), -2.5 % (200 cells/chord) |
+| Same plate tilted across the grid (staircase walls) | shock-expansion theory | CN +10.8 % (100 cells/chord), +7.5 % (200 cells/chord): first-order convergence |
 | Warp kernels vs PyTorch reference (Sod, cylinder, 3-D sphere) | identical numerics | max difference 2e-4 (float32) |
 
 ## Results so far
@@ -207,6 +207,15 @@ The real geometry is always shown: the hull coloured by surface pressure and the
 fins as solid parts. Streamlines are coloured by Mach with particles moving at the local flow
 speed; a slider (or `k`) moves a Mach slice along the booster. Keys: space pause, `o` orbit,
 `k` sweep, `s` streamlines, `f` fins, `h` see-through hull, `r` reset view.
+
+Animations of the flow developing: run a case with `--snapshots 150` (add `--time-accurate` for
+a physically time-accurate movie), then
+
+```bash
+py -m rocketcfd.viewer results\glide_rudder --movie evolve
+```
+
+plays the saved frames: surface Cp on the hull and Mach on the rudder/tower and catch-fin planes.
 
 ## Limits of this milestone (read before using numbers)
 

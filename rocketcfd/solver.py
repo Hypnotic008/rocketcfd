@@ -40,7 +40,8 @@ def _limit(a, b, kind):
 class Solver:
     def __init__(self, lo, hi, h, freestream, sdf=None, gamma=1.4, bcs="auto", cfl=0.7,
                  limiter="vanleer", shock_threshold=0.5, dtype=torch.float32, device=None,
-                 verbose=True, faces=None, backend="auto", thin_sdf=None, thin_box=None):
+                 verbose=True, faces=None, backend="auto", thin_sdf=None, thin_box=None,
+                 viscous=None, wall=None):
         """
         lo, hi     : domain corners (m)
         h          : cell size, scalar or (hx, hy, hz)
@@ -55,8 +56,17 @@ class Solver:
                      represented by blocked cell faces instead of ghost cells, so plates
                      thinner than a cell stay solid. Needs the warp backend.
         thin_box   : ((x0, y0, z0), (x1, y1, z1)) bounding box of the thin parts (speeds up setup)
+        viscous    : None (Euler) or dict(mu=..., model='constant'|'sutherland', T0=273.15, S=110.4,
+                     R=287.05, Pr=0.72). Sutherland defaults are for air (mu=1.716e-5 at 273.15 K).
+        wall       : 'slip' (default for Euler) or 'noslip' (default when viscous) for immersed walls
         """
         self.gamma, self.cfl, self.limiter = gamma, cfl, limiter
+        self.viscous = None
+        if viscous is not None:
+            v = dict(model="sutherland", mu=1.716e-5, T0=273.15, S=110.4, R=287.05, Pr=0.72)
+            v.update(viscous)
+            self.viscous = v
+        self.wall = wall or ("noslip" if self.viscous else "slip")
         self.shock_threshold = shock_threshold
         self.dtype = dtype
         self.device = torch.device(device) if device is not None else default_device()
@@ -128,15 +138,15 @@ class Solver:
 
     def _pick_backend(self, backend):
         if backend == "torch":
-            if self.has_thin:
-                raise RuntimeError("thin walls (thin_sdf) need the warp backend")
+            if self.has_thin or self.viscous or self.wall != "slip":
+                raise RuntimeError("thin walls, viscous terms and no-slip walls need the warp backend")
             return "torch"
         ok = self.dtype == torch.float32
         try:
             import warp  # noqa: F401
         except ImportError:
             ok = False
-        if (backend == "warp" or self.has_thin) and not ok:
+        if (backend == "warp" or self.has_thin or self.viscous or self.wall != "slip") and not ok:
             raise RuntimeError("warp backend (needed for thin walls) needs `pip install warp-lang` and float32")
         return "warp" if ok else "torch"
 
@@ -184,6 +194,17 @@ class Solver:
                 normal=wp.array(self.ib["n"].cpu().numpy().T.astype(np.float32), dtype=wp.vec3,
                                 device=self._wdev))
         self._wp_stream = wp.stream_from_torch(torch.cuda.current_stream(dev)) if dev.type == "cuda" else None
+        vp = K.Visc()
+        v = self.viscous or {}
+        vp.mode = 0 if not v else (1 if v["model"] == "constant" else 2)
+        vp.mu0 = float(v.get("mu", 0.0))
+        vp.T0 = float(v.get("T0", 273.15))
+        vp.S = float(v.get("S", 110.4))
+        vp.R = float(v.get("R", 287.05))
+        vp.Pr = float(v.get("Pr", 0.72))
+        self._centres = [torch.as_tensor(self.axes[d].astype(np.float32), device=dev) for d in range(3)]
+        vp.cx, vp.cy, vp.cz = (wp.from_torch(c_) for c_ in self._centres)
+        self._vp = vp
 
     # ------------------------------------------------------------------ setup
     def _setup_bcs(self, bcs):
@@ -235,16 +256,55 @@ class Solver:
             lo_sl, hi_sl = tuple(lo_sl), tuple(hi_sl)
             Gs = [g_[lo_sl] for g_ in G]
             step = (G[d][hi_sl] - G[d][lo_sl])
+            blocked = ts[lo_sl] | ts[hi_sl]
+            # quarter-point samples along each face segment
+            tq = (0.0, 0.25, 0.5, 0.75, 1.0)
             samples = [pc[lo_sl]]
-            for t in (0.25, 0.5, 0.75):
+            for t in tq[1:-1]:
                 P = list(Gs)
                 P[d] = Gs[d] + t * step
                 samples.append(thin_sdf(*P))
             samples.append(pc[hi_sl])
-            blocked = ts[lo_sl] | ts[hi_sl]
+            for sm in samples:
+                blocked |= sm < 0
+            # Sub-segments that the distance function cannot rule out (phi_a + phi_b < length)
+            # are bisected until the part is found (phi < 0 somewhere) or the piece is short
+            # enough to exclude it. The bare test over-blocks faces that run parallel to a plate
+            # close by, e.g. on stretched cells next to a wall.
+            flat_b = blocked.ravel()
+            Gf = [g_.ravel() for g_ in Gs]
+            stepf = step.ravel()
+            fid, ta, tb, pa, pb = [], [], [], [], []
             for k in range(4):
-                blocked |= (samples[k] < 0) | (samples[k] + samples[k + 1] < 0.25 * step)
-            blocked |= samples[4] < 0
+                sa, sb = samples[k].ravel(), samples[k + 1].ravel()
+                cand = (~flat_b) & (sa + sb < (tq[k + 1] - tq[k]) * stepf)
+                idx_ = np.flatnonzero(cand)
+                fid.append(idx_)
+                ta.append(np.full(idx_.size, tq[k]))
+                tb.append(np.full(idx_.size, tq[k + 1]))
+                pa.append(sa[idx_])
+                pb.append(sb[idx_])
+            fid, ta, tb, pa, pb = map(np.concatenate, (fid, ta, tb, pa, pb))
+            for _level in range(18):
+                keep = ~flat_b[fid]
+                fid, ta, tb, pa, pb = fid[keep], ta[keep], tb[keep], pa[keep], pb[keep]
+                if fid.size == 0:
+                    break
+                tm = 0.5 * (ta + tb)
+                P = [g_[fid] for g_ in Gf]
+                P[d] = P[d] + tm * stepf[fid]
+                pm = thin_sdf(*P)
+                hit = pm < 0
+                flat_b[fid[hit]] = True
+                half = 0.5 * (tb - ta) * stepf[fid]
+                c1 = (~hit) & (pa + pm < half)
+                c2 = (~hit) & (pm + pb < half)
+                fid = np.concatenate([fid[c1], fid[c2]])
+                ta, tb = np.concatenate([ta[c1], tm[c2]]), np.concatenate([tm[c1], tb[c2]])
+                pa, pb = np.concatenate([pa[c1], pm[c2]]), np.concatenate([pm[c1], pb[c2]])
+            if fid.size:                       # still ambiguous after 18 halvings: block (conservative)
+                flat_b[fid] = True
+            blocked = flat_b.reshape(blocked.shape)
             tgt = tuple(slice(r0[e], r1[e] + 1) if e != d else slice(r0[e], r1[e]) for e in range(3))
             self.blk[tgt] |= (blocked.astype(np.int32) << d)
         if self.verbose:
@@ -329,6 +389,16 @@ class Solver:
                 dst = _sl(W, ax, 0, NG) if side == 0 else _sl(W, ax, N + NG, N + 2 * NG)
                 if kind == "periodic":
                     dst.copy_(_sl(W, ax, N, N + NG) if side == 0 else _sl(W, ax, NG, 2 * NG))
+                elif kind in ("wall", "slipwall"):
+                    # mirror the first NG interior layers; no-slip negates all velocity
+                    # components (zero velocity on the boundary face), slip only the normal one
+                    src = _sl(W, ax, NG, 2 * NG) if side == 0 else _sl(W, ax, N, N + NG)
+                    src = torch.flip(src, dims=(ax,)).clone()
+                    if kind == "wall":
+                        src[1:4] = -src[1:4]
+                    else:
+                        src[1 + d] = -src[1 + d]
+                    dst.copy_(src)
                 elif kind == "extrapolate":
                     edge = _sl(W, ax, NG, NG + 1) if side == 0 else _sl(W, ax, N + NG - 1, N + NG)
                     dst.copy_(edge.expand_as(dst))
@@ -399,14 +469,16 @@ class Solver:
         ib = self._wp_ib
         if ib is not None:
             wp.launch(K.ib_kernel, dim=ib["n"], inputs=[w["W"], ib["ghost"], ib["corner"], ib["weight"],
-                                                       ib["normal"]], device=self._wdev, stream=self._wp_stream)
+                                                       ib["normal"], int(self.wall == "noslip")],
+                      device=self._wdev, stream=self._wp_stream)
         wp.launch(K.shock_kernel, dim=shape, inputs=[w["W"], self._active_sensor, self.shock_threshold, w["S"]],
                   device=self._wdev, stream=self._wp_stream)
 
     def _wresidual(self, order, tiles=None):
         wp, K, w = self._wp, self._K, self._w
         kind = 1 if self.limiter == "minmod" else 0
-        args = [w["W"], w["S"], w["ix"], w["iy"], w["iz"], self._active_flux, self.gamma, float(order), kind, w["blk"]]
+        args = [w["W"], w["S"], w["ix"], w["iy"], w["iz"], self._active_flux, self.gamma, float(order), kind, w["blk"],
+                self._vp]
         if tiles is None:
             wp.launch(K.residual_kernel, dim=self.n, inputs=args + [w["R"]],
                       device=self._wdev, stream=self._wp_stream)
@@ -429,7 +501,7 @@ class Solver:
         wp, K, w = self._wp, self._K, self._w
         self._wprim("U")
         wp.launch(K.rate_kernel, dim=self.n, inputs=[w["W"], w["ix"], w["iy"], w["iz"], self._active_flux,
-                                                     w["mask"], self.gamma, w["rate"]],
+                                                     w["mask"], self.gamma, self._vp, w["rate"]],
                   device=self._wdev, stream=self._wp_stream)
         torch.div(self.cfl, self.rate_buf.max(), out=self.dt_buf[0])
         if local:
@@ -483,7 +555,7 @@ class Solver:
 
     # -------------------------------------------------------------- driver
     def run(self, nsteps, chunk=100, first_order_steps=200, report=None, steady=False,
-            active_tiles=None, tile_refresh=50, tile_frac=1e-3, local_dt=False):
+            active_tiles=None, tile_refresh=50, tile_frac=1e-3, local_dt=False, snapshot=None):
         """Advance nsteps time steps. `report(solver)` is called after every chunk; it can
         return True to stop.
 
@@ -495,6 +567,7 @@ class Solver:
           * local_dt=True: every cell advances at its own stable step (off by default: on the
             stretched grids tested it slowed convergence; worth trying with strong stretching).
         Time-accurate runs (steady=False) always update every cell with one global step.
+        snapshot = (every_steps, fn): fn(step, t) is called every `every_steps` steps.
         """
         steady = steady and self.backend == "warp"
         if active_tiles is None:
@@ -529,6 +602,8 @@ class Solver:
                     if r is not None:
                         res = r
                     dt_sum += dt
+                    if snapshot is not None and (self.step_count + kk + 1) % snapshot[0] == 0:
+                        snapshot[1](self.step_count + kk + 1, self.t + float(dt_sum))
                 res = float(res)              # one host sync per chunk
                 self.t += float(dt_sum)
                 self.step_count += k

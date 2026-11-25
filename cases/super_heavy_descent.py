@@ -47,6 +47,10 @@ def main(argv=None):
     ap.add_argument("--growth", type=float, default=1.12, help="max cell-size ratio between neighbours")
     ap.add_argument("--uniform", action="store_true", help="uniform grid at --h everywhere (old behaviour)")
     ap.add_argument("--dry-run", action="store_true", help="print the grid and exit")
+    ap.add_argument("--snapshots", type=int, default=0,
+                    help="save about this many frames over the run for `viewer --movie evolve` "
+                         "(use with --time-accurate for a physically time-accurate movie)")
+    ap.add_argument("--snap-volume", type=int, default=0, help="also save a coarse 3-D Mach field (stride)")
     ap.add_argument("--time-accurate", action="store_true",
                     help="global time step, all cells every step (off: local time steps + active tiles)")
     ap.add_argument("--fins", default="none", choices=["none", "parametric", "cad", "cad_filled"],
@@ -167,7 +171,15 @@ def main(argv=None):
 
     t0 = time.time()
     chunk = max(100, int(round(nsteps / 40 / 50)) * 50)       # ~40 load checks over the max length
-    s.run(nsteps, chunk=chunk, first_order_steps=400, report=report, steady=not a.time_accurate)
+    snap = None
+    if a.snapshots:
+        from rocketcfd.snapshots import SnapshotRecorder
+        rec = SnapshotRecorder(s, a.out, q, p, ((-1.5, -6.6, -6.6), (L + 0.6, 6.6, 6.6)),
+                               volume_stride=a.snap_volume)
+        rec.record(0, 0.0)
+        snap = (max(1, nsteps // a.snapshots), rec.record)
+        print(f"recording a snapshot every {snap[0]} steps into {a.out}/snapshots")
+    s.run(nsteps, chunk=chunk, first_order_steps=400, report=report, steady=not a.time_accurate, snapshot=snap)
     wall = time.time() - t0
 
     ld = s.loads(**REFERENCE, parts=PARTS)
