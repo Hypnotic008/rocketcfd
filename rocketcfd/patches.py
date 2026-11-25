@@ -537,9 +537,12 @@ class PatchGrid:
             K = g._K
             g._L(K.prim_kernel, tuple(g.U.shape[1:]), [g._w["U"], g.gamma, g.rho_min, g.p_min, g._w["W"]])
 
-    def run_explicit(self, steps, chunk=500, report=None, first_order_steps=0):
-        """Explicit SSP-RK2 local-time-step steps on all grids (each grid with its own local steps,
-        coupled every step as in run). Used to finish turbulent runs; see Solver.run."""
+    def run_explicit(self, steps, chunk=500, report=None, first_order_steps=0, time_accurate=False,
+                     snapshot=None):
+        """Explicit SSP-RK2 steps on all grids, coupled every step as in run.
+        time_accurate=False: each cell at its own local time step (steady runs; also used to
+        finish turbulent runs, see Solver.run). True: every grid advances by the same global
+        time step, the smallest stable one over all grids (unsteady runs, LES, movies)."""
         t0 = time.time()
         order_by_size = list(np.argsort(-self.rank))
         done = 0
@@ -547,17 +550,26 @@ class PatchGrid:
         with torch.no_grad():
             while done < steps:
                 k = min(chunk, steps - done)
+                tsum = torch.zeros((), dtype=self.base.dtype, device=self.base.device)
                 for kk in range(k):
                     rs = []
                     order = 0.0 if self.base.step_count + kk < first_order_steps else 1.0
+                    dt = None
+                    if time_accurate:
+                        dt = torch.stack([self.grids[gi]._stable_dt() for gi in order_by_size]).min()
+                        tsum += dt
                     for gi in order_by_size:
                         g = self.grids[gi]
-                        _, r = g._step_warp(order, want_res=(kk == k - 1), local=True)
+                        _, r = g._step_warp(order, want_res=(kk == k - 1), local=not time_accurate, dt_fixed=dt)
                         rs.append((g.n_fluid, r))
                     self._restrict()
+                    if snapshot is not None and (self.base.step_count + kk + 1) % snapshot[0] == 0:
+                        snapshot[1](self.base.step_count + kk + 1, self.base.t + float(tsum))
                 done += k
+                tadd = float(tsum)
                 for s in self.grids:
                     s.step_count += k
+                    s.t += tadd
                 tot = sum(n for n, _ in rs)
                 res = float(torch.sqrt(sum(n * r * r for n, r in rs) / tot))
                 self.history.append((self.base.step_count, res))

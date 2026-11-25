@@ -1,0 +1,223 @@
+"""Case templates for the app: each maps friendly, grouped form fields onto a case script's
+command-line options, with presets for typical uses."""
+from dataclasses import dataclass, field
+from typing import Any, Optional
+
+
+@dataclass
+class Field:
+    key: str                      # command-line flag without the leading dashes
+    label: str
+    kind: str                     # float | int | bool | choice | text | floats
+    default: Any
+    help: str = ""
+    group: str = "General"
+    choices: Optional[list] = None
+    lo: float = -1e12
+    hi: float = 1e12
+    step: float = 0.1
+    decimals: int = 3
+    advanced: bool = False
+    positional: bool = False      # passed as a bare argument, not --key value
+    always: bool = False          # always written to the command line
+
+
+@dataclass
+class Case:
+    name: str
+    script: str                   # path relative to the repository, or "-m module"
+    description: str
+    fields: list
+    presets: dict = field(default_factory=dict)
+    out_key: str = "out"          # field holding the results folder
+    dry_run: bool = False         # supports --dry-run (grid size / memory estimate)
+    profile: bool = False         # supports --profile N
+    gpu_minutes: str = ""
+
+
+def _sh_fields():
+    G1, G2, G3, G4, G5, G6 = ("Flight condition", "Vehicle", "Grid", "Local refinement", "Solver", "Output")
+    return [
+        Field("mach", "Mach number", "float", 2.82, "Freestream Mach number.", G1, lo=0.05, hi=12, step=0.1),
+        Field("alt", "Altitude [m]", "float", 10745.0, "Sets the air density, pressure and temperature (US standard "
+              "atmosphere). Inviscid results depend on Mach only.", G1, lo=0, hi=80000, step=500, decimals=0),
+        Field("aoa", "Angle of attack [deg]", "float", 5.0, "Degrees away from engines-first (0 = falling "
+              "straight down, engines into the wind).", G1, lo=0, hi=90, step=1, decimals=1),
+        Field("windward", "Windward side [deg]", "float", 180.0, "Which side faces the crossflow: 0 = rudder fin, "
+              "90 / 270 = catch fins, 180 = raceway / tall chines.", G1, lo=0, hi=359, step=15, decimals=0),
+        Field("fins", "Grid fins", "choice", "none", "parametric = the V3 grid-fin model as thin walls. Needs "
+              "fine cells near the fins (Fin patch cell size).", G2, choices=["none", "parametric", "cad", "cad_filled"]),
+        Field("fin-deflection", "Fin deflections [deg]", "floats", "0 0 0", "Three numbers: rudder fin, catch fin "
+              "90, catch fin 270.", G2, advanced=True),
+        Field("chines", "Chines", "choice", "all", "Which chines to model.", G2, choices=["all", "tall", "short", "none"]),
+        Field("h", "Cell size near vehicle [m]", "float", 0.5, "Base grid cell size around the booster. 0.3 is a good "
+              "balance; 0.5 for quick looks.", G3, lo=0.02, hi=2, step=0.05),
+        Field("h-far", "Farfield cell size [m]", "float", 0.0, "0 = 4 x the near-vehicle size.", G3, lo=0, hi=10,
+              advanced=True),
+        Field("growth", "Max stretching ratio", "float", 1.12, "Largest size ratio between neighbouring cells.", G3,
+              lo=1.0, hi=1.5, step=0.01, advanced=True),
+        Field("fin-h", "Fin patch cell size [m]", "float", 0.0, "Refinement patches around the grid fins (0 = off). "
+              "0.06 resolves the lattice; turns the implicit solver on.", G4, lo=0, hi=0.5, step=0.01),
+        Field("fin-shell", "Fin patch thickness [m]", "float", 0.3, "How far around the fins to refine.", G4,
+              lo=0.05, hi=2, advanced=True),
+        Field("engine-h", "Engine-end patch cell size [m]", "float", 0.0, "Refinement around the engine bells, thrust "
+              "plate and skirt (0 = off). 0.06 resolves the gaps between the nozzles.", G4, lo=0, hi=0.5, step=0.01),
+        Field("engine-shell", "Engine patch thickness [m]", "float", 0.5, "", G4, lo=0.05, hi=2, advanced=True),
+        Field("wall-h", "Hull shell patch cells hx,hy,hz [m]", "text", "", "Viscous runs: fine cells across the "
+              "hull wall, e.g. 0.25,0.03,0.03 (blank = off).", G4, advanced=True),
+        Field("wall-shell", "Hull shell thickness [m]", "float", 0.45, "", G4, lo=0.05, hi=3, advanced=True),
+        Field("turbulent", "Viscous turbulent (RANS k-omega SST)", "bool", False, "Viscous air with the SST model and "
+              "a wall function. Off = inviscid (Euler).", G5),
+        Field("les", "Unsteady LES (wall-modelled)", "bool", False, "Time-accurate large-eddy simulation with the "
+              "Vreman subgrid model and an equilibrium wall model: for unsteady wakes and movies. Use with "
+              "Snapshots.", G5),
+        Field("implicit", "Implicit solver", "bool", False, "Implicit steady solver: far fewer iterations. "
+              "On automatically with refinement patches.", G5),
+        Field("explicit", "Force explicit (with patches)", "bool", False, "Explicit local time steps on the patch "
+              "grids instead of the implicit solver.", G5, advanced=True),
+        Field("cfl-max", "Implicit CFL", "float", 20.0, "", G5, lo=1, hi=200, step=5, advanced=True),
+        Field("iters", "Max implicit iterations", "int", 4000, "", G5, lo=10, hi=100000, step=500),
+        Field("flowthroughs", "Max flow-throughs (explicit)", "float", 4.0, "Run length for the explicit solver.",
+              G5, lo=0.1, hi=100, step=1, advanced=True),
+        Field("tol", "Convergence tolerance", "float", 5e-4, "Stop when CD, CN, C_restore change less than this "
+              "(0 = never stop early).", G5, lo=0, hi=0.1, step=1e-4, decimals=5),
+        Field("time-accurate", "Time-accurate", "bool", False, "Global time step: physically correct unsteady flow "
+              "(movies). Slower to converge.", G5, advanced=True),
+        Field("snapshots", "Snapshots for movies", "int", 0, "Save this many frames during the run (0 = none).",
+              G6, lo=0, hi=5000, step=50),
+        Field("snap-volume", "3-D snapshot stride", "int", 0, "Also save a coarse 3-D field every n-th cell "
+              "(0 = planes only). Needed for 3-D LAVA-style movies; 2 is a good value.", G6, lo=0, hi=8, step=1),
+        Field("x64", "Double precision", "bool", False, "", G6, advanced=True),
+        Field("out", "Results folder", "text", "results/sh_descent", "", G6, always=True),
+    ]
+
+
+SUPER_HEAVY = Case(
+    "Super Heavy descent - one flight condition",
+    "cases/super_heavy_descent.py",
+    "Unpowered engines-first descent of Super Heavy V3 (hull, chines, 33 engine bells, grid fins). "
+    "Writes forces and moments (CatchSim coefficients), 3-D flow, surface pressure and images.",
+    _sh_fields(),
+    presets={
+        "Quick look (body only, coarse)": dict(h=0.5, fins="none", implicit=True, iters=1500),
+        "Glide with fins (inviscid, patches)": dict(h=0.3, fins="parametric", **{"fin-h": 0.06, "engine-h": 0.06},
+                                                   aoa=15.0, windward=0.0, iters=4000),
+        "Peak-q, viscous RANS": dict(h=0.3, fins="parametric", turbulent=True, **{"fin-h": 0.06, "engine-h": 0.06,
+                                                                                  "wall-h": "0.25,0.03,0.03"}),
+        "Movie: unsteady LES wake": dict(h=0.3, fins="parametric", les=True, **{"time-accurate": True,
+                                         "snapshots": 300, "snap-volume": 2, "fin-h": 0.0}, aoa=15.0,
+                                         windward=0.0),
+    },
+    dry_run=True, profile=True, gpu_minutes="10-60 min on a laptop GPU")
+
+
+AERO_DB = Case(
+    "Aero database - Mach x AoA x roll sweep (CatchSim)",
+    "cases/aero_database.py",
+    "Runs every combination of Mach, angle of attack and roll, warm-starting each from the last, and "
+    "writes aero_db.json for CatchSim. Resumable: re-running skips finished cases.",
+    [
+        Field("mach", "Mach numbers", "floats", "4.0 3.2 2.6 2.0 1.6 1.3 1.1 0.95 0.8 0.6", "Space-separated list.",
+              "Sweep", always=True),
+        Field("aoa", "Angles of attack [deg]", "floats", "0 4 8 12 16 20", "", "Sweep", always=True),
+        Field("roll", "Roll angles [deg]", "floats", "0 90 180", "", "Sweep", always=True),
+        Field("alt", "Altitude [m]", "float", 10745.0, "", "Sweep", lo=0, hi=80000, step=500, decimals=0),
+        Field("h", "Cell size near vehicle [m]", "float", 0.3, "", "Grid", lo=0.05, hi=2, step=0.05),
+        Field("fins", "Grid fins", "choice", "parametric", "", "Grid", choices=["none", "parametric"]),
+        Field("fin-h", "Fin patch cell size [m]", "float", 0.06, "", "Grid", lo=0, hi=0.5, step=0.01),
+        Field("engine-h", "Engine-end patch cell size [m]", "float", 0.06, "", "Grid", lo=0, hi=0.5, step=0.01),
+        Field("turbulent", "Viscous turbulent (RANS)", "bool", False, "", "Solver"),
+        Field("explicit", "Explicit solver", "bool", False, "", "Solver", advanced=True),
+        Field("max-iters", "Max iterations per case", "int", 1500, "", "Solver", lo=50, hi=50000, step=100),
+        Field("tol", "Convergence tolerance", "float", 5e-4, "", "Solver", lo=0, hi=0.1, decimals=5),
+        Field("out", "Results folder", "text", "results/aero_db", "", "Output", always=True),
+    ],
+    presets={
+        "Quick database (12 cases)": dict(mach="2.8 2.0 1.3 0.9", aoa="0 8 16", roll="0 180"),
+        "Full database (180 cases)": {},
+    },
+    dry_run=True, gpu_minutes="hours: about 10-20 min per case")
+
+
+GRID_FIN = Case(
+    "Isolated grid fin - Mach x alpha sweep",
+    "cases/grid_fin.py",
+    "One V3 grid fin in a wind tunnel: normal force slope, drag and hinge moment versus Mach. "
+    "Compares with cascade theory.",
+    [
+        Field("mach", "Mach numbers", "floats", "0.6 0.8 0.9 1.0 1.1 1.3 1.6 2.0 2.8 4.0", "", "Sweep", always=True),
+        Field("alpha", "Angles [deg]", "floats", "0 5 10", "", "Sweep", always=True),
+        Field("h", "Cell size around the fin [m]", "float", 0.025, "", "Grid", lo=0.005, hi=0.2, step=0.005),
+        Field("implicit", "Implicit solver", "bool", True, "", "Solver"),
+        Field("out", "Results folder", "text", "results/grid_fin", "", "Output", always=True),
+    ],
+    presets={"Supersonic only": dict(mach="1.6 2.0 2.8 4.0")}, dry_run=True)
+
+
+CYLINDER = Case(
+    "Validation - cylinder vortex shedding (unsteady)",
+    "cases/validate_cylinder_turbulent.py",
+    "Flow past a circular cylinder: drag and Strouhal number against experiment. Re 100 laminar is "
+    "the classic von Karman street - a good first unsteady case and a nice movie.",
+    [
+        Field("re", "Reynolds number", "float", 1e7, "", "Flow", lo=10, hi=1e9, decimals=0, step=100),
+        Field("mach", "Mach number", "float", 0.3, "", "Flow", lo=0.05, hi=0.8),
+        Field("laminar", "Laminar (no turbulence model)", "bool", False, "Use for Re up to ~180.", "Flow"),
+        Field("h", "Cell size near cylinder [m]", "float", 0.008, "Diameter is 1 m.", "Grid", lo=0.001, hi=0.1,
+              step=0.001, decimals=4),
+        Field("dual", "Dual time stepping", "bool", False, "Implicit inner iterations: larger time steps.", "Solver"),
+        Field("periods", "Shedding periods", "float", 25.0, "", "Solver", lo=1, hi=500, step=5),
+        Field("out", "Results folder", "text", "results", "", "Output", always=True),
+    ],
+    presets={"Re 100 von Karman street": dict(re=100.0, mach=0.2, laminar=True, h=0.02, dual=True)})
+
+
+TGV = Case(
+    "Validation - Taylor-Green vortex (LES)",
+    "tests/taylor_green.py",
+    "Decaying turbulence in a periodic box at Re 1600: the standard benchmark for the LES mode "
+    "(dissipation rate vs the DNS peak).",
+    [
+        Field("n", "Cells per side", "int", 32, "", "Grid", lo=16, hi=256, step=16, positional=True, always=True),
+        Field("t", "End time", "float", 10.0, "", "Solver", lo=1, hi=20, step=1),
+        Field("out", "Results folder", "text", "results/taylor_green", "", "Output", always=True),
+    ])
+
+
+PLATE = Case(
+    "Validation - inclined flat plate (thin wall)",
+    "cases/validate_flat_plate.py",
+    "Supersonic flat plate at incidence against shock-expansion theory: checks the thin-wall model "
+    "used for the grid fins.",
+    [
+        Field("mach", "Mach number", "float", 2.0, "", "Flow", lo=1.1, hi=8),
+        Field("alpha", "Angle [deg]", "float", 5.0, "", "Flow", lo=0, hi=30),
+        Field("h", "Cell size [m]", "float", 0.01, "", "Grid", lo=0.001, hi=0.1, decimals=4),
+        Field("inclined", "Plate inclined to the grid", "bool", False, "", "Grid"),
+        Field("implicit", "Implicit solver", "bool", True, "", "Solver"),
+    ])
+
+
+CASES = [SUPER_HEAVY, AERO_DB, GRID_FIN, CYLINDER, TGV, PLATE]
+
+
+def command_line(case, values):
+    """Arguments (list of str) for the case script from {key: value}."""
+    args = []
+    for f in case.fields:
+        v = values.get(f.key, f.default)
+        if f.kind == "bool":
+            if v:
+                args.append("--" + f.key)
+            continue
+        if not f.always and v == f.default:
+            continue
+        if f.kind == "text" and str(v).strip() == "" and not f.always:
+            continue
+        if f.kind == "floats":
+            vals = str(v).replace(",", " ").split()
+            args += vals if f.positional else ["--" + f.key] + vals
+            continue
+        sv = str(v)
+        args += [sv] if f.positional else ["--" + f.key, sv]
+    return args

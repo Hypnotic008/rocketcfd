@@ -66,7 +66,9 @@ class SnapshotRecorder:
             self.vj = self.jr[::volume_stride]
             self.vk = self.kr[::volume_stride]
             mesh.update(vx=ax[0][self.vi].astype(np.float32), vy=ax[1][self.vj].astype(np.float32),
-                        vz=ax[2][self.vk].astype(np.float32))
+                        vz=ax[2][self.vk].astype(np.float32),
+                        vol_solid=solid[self.vi][:, self.vj][:, :, self.vk], rho_inf=float(solver.W_inf[0]),
+                        gamma=float(solver.gamma))
         np.savez_compressed(os.path.join(self.dir, "mesh.npz"), **mesh)
         self.k = 0
 
@@ -93,6 +95,14 @@ class SnapshotRecorder:
         out = dict(cp=cp, mach_xz=m_xz, mach_xy=m_xy, step=step, t=t)
         if self.vs:
             vi, vj, vk = (torch.as_tensor(a_, device=W.device) for a_ in (self.vi, self.vj, self.vk))
-            out["mach_vol"] = mach[vi][:, vj][:, :, vk].half().cpu().numpy()
+            sub = lambda a_: a_[vi][:, vj][:, :, vk]
+            out["mach_vol"] = sub(mach).half().cpu().numpy()
+            # full state for 3-D movies (rocketcfd.cinematic: Q-criterion, schlieren); float16 is
+            # plenty for pictures. Pressure is stored relative to the freestream to keep precision.
+            out["vol_rho"] = sub(W[0]).half().cpu().numpy()
+            out["vol_u"] = sub(W[1]).half().cpu().numpy()
+            out["vol_v"] = sub(W[2]).half().cpu().numpy()
+            out["vol_w"] = sub(W[3]).half().cpu().numpy()
+            out["vol_dp"] = (sub(W[4]) - self.p_inf).half().cpu().numpy()
         np.savez_compressed(os.path.join(self.dir, f"snap_{self.k:04d}.npz"), **out)
         self.k += 1

@@ -63,6 +63,9 @@ def main(argv=None):
     ap.add_argument("--no-chines", action="store_true", help="remove all four chines (to isolate their effect)")
     ap.add_argument("--turbulent", action="store_true",
                     help="viscous air (Sutherland) with k-omega SST and the wall function (default: inviscid)")
+    ap.add_argument("--les", action="store_true",
+                    help="unsteady wall-modelled LES (Vreman subgrid model + equilibrium wall model), "
+                         "time-accurate explicit steps: unsteady wakes, movies (with --snapshots/--snap-volume)")
     ap.add_argument("--chines", choices=["all", "tall", "short", "none"], default="all",
                     help="which chines to fit: tall = the raceway-side pair, short = the rudder-side pair")
     ap.add_argument("--implicit", action="store_true",
@@ -94,6 +97,10 @@ def main(argv=None):
     ap.add_argument("--out", default="results/sh_descent")
     ap.add_argument("--x64", action="store_true", help="double precision")
     a = ap.parse_args(argv)
+    if a.les:
+        # LES is unsteady: physical time steps, explicit, and the run never stops early (the
+        # reported coefficients are averages over the last quarter of the run)
+        a.time_accurate, a.explicit, a.implicit, a.tol = True, True, False, 0.0
 
     import torch
     from rocketcfd import Solver, atmosphere
@@ -180,8 +187,8 @@ def main(argv=None):
             print(f"estimated GPU memory ~{n * per / 2**30:.1f} GB ({what}, ~{per} B/cell); "
                   f"setup needs ~{n * 120 / 2**30:.0f} GB of system RAM")
             return None
-    visc = dict(model="sutherland") if a.turbulent else None
-    turb = dict(model="sst") if a.turbulent else None
+    visc = dict(model="sutherland") if (a.turbulent or a.les) else None
+    turb = dict(model="sst") if a.turbulent else (dict(model="les") if a.les else None)
     if patches:
         from rocketcfd.patches import PatchGrid
         runner = PatchGrid(faces, patches, fs, sdf=sdf, cfl=0.7, thin_sdf=thin_sdf, thin_box=thin_box,
@@ -195,7 +202,7 @@ def main(argv=None):
 
     # steps for the requested number of flow-throughs (estimated from the freestream)
     cs = c
-    hmin = s.h.min()
+    hmin = min(float(g.h.min()) for g in runner.grids) if (patches and a.time_accurate) else s.h.min()
     dt_est = s.cfl / ((V + cs) / hmin + 2 * (cs + V * np.sin(al)) / hmin)
     nsteps = a.steps or int(a.flowthroughs * (s.hi[0] - s.lo[0]) / V / dt_est)
     nsteps = int(np.ceil(nsteps / 100) * 100)
@@ -255,7 +262,8 @@ def main(argv=None):
         snap = (max(1, nsteps // a.snapshots), rec.record)
         print(f"recording a snapshot every {snap[0]} steps into {a.out}/snapshots")
     if patches and a.explicit:
-        runner.run_explicit(nsteps, chunk=chunk, report=report, first_order_steps=400)
+        runner.run_explicit(nsteps, chunk=chunk, report=report, first_order_steps=400,
+                            time_accurate=a.time_accurate, snapshot=snap)
     elif patches:
         runner.run(nsteps, chunk=chunk, first_order_steps=200, report=report, snapshot=snap,
                    cfl_max=a.cfl_max, cfl_ramp=300)

@@ -88,6 +88,15 @@ class Solver:
         turbulence : None or dict(model='sst', k_inf=..., omega_inf=...): k-omega SST with a
                      Spalding wall function on immersed walls and thin walls (needs viscous).
                      Defaults: k_inf = 9e-9 a^2, omega_inf = 1e-6 rho a^2 / mu (NASA TMR).
+                     Or dict(model='les', sgs='none'|'vreman', cv=0.07, wall_model=True): large-eddy
+                     simulation for time-accurate runs. sgs='none' (default): implicit LES, the
+                     upwind scheme's own dissipation acts as the subgrid model; 'vreman': Vreman (2004)
+                     eddy viscosity on top (tests/taylor_green.py, 32^3: dissipation peak at t 7.0
+                     without, 5.5 with it, DNS 9.0: the model over-dissipates on coarse grids with
+                     this scheme). With wall_model the
+                     equilibrium wall model of wall-modelled LES (Bose & Park 2018): the wall shear
+                     from Spalding's law with the instantaneous velocity of the first cell, as the
+                     RANS wall function. wall_model=False: wall-resolved LES (no-slip walls).
         limiter    : 'koren' (default: kappa = 1/3 MUSCL, third-order upwind-biased where smooth;
                      tests/vortex_order.py), 'vanleer' (the earlier default) or 'minmod'
         low_mach   : Thornber et al. (2008) low-Mach correction of the reconstructed velocities (less
@@ -113,16 +122,23 @@ class Solver:
             v = dict(model="sutherland", mu=1.716e-5, T0=273.15, S=110.4, R=287.05, Pr=0.72)
             v.update(viscous)
             self.viscous = v
-        self.turbulence = None
+        self.turbulence = None          # RANS (k-omega SST) settings
+        self.les = None                 # LES settings
         if turbulence is not None:
             if self.viscous is None:
                 raise ValueError("turbulence needs viscous=...")
-            self.turbulence = dict(model="sst")
-            self.turbulence.update(turbulence)
+            if turbulence.get("model", "sst") == "les":
+                self.les = dict(model="les", sgs="none", cv=0.07, wall_model=True)
+                self.les.update(turbulence)
+            else:
+                self.turbulence = dict(model="sst")
+                self.turbulence.update(turbulence)
+        # wall shear from the law of the wall (RANS wall function / LES equilibrium wall model)
+        self.wallmodel = bool(self.turbulence) or bool(self.les and self.les["wall_model"])
         # With the wall function the wall shear comes from the law of the wall, so immersed-wall
         # ghost cells mirror the velocity as a slip wall (a no-slip mirror would put a spurious
         # steep gradient into the first cell's strain rate and turbulence production).
-        self.wall = wall or ("slip" if self.turbulence else "noslip" if self.viscous else "slip")
+        self.wall = wall or ("slip" if self.wallmodel else "noslip" if self.viscous else "slip")
         self.shock_threshold = shock_threshold
         self.dtype = dtype
         self.device = torch.device(device) if device is not None else default_device()
@@ -203,7 +219,8 @@ class Solver:
             import warp  # noqa: F401
         except ImportError:
             ok = False
-        if (backend == "warp" or self.has_thin or self.viscous or self.wall != "slip" or self.turbulence) and not ok:
+        if (backend == "warp" or self.has_thin or self.viscous or self.wall != "slip" or self.turbulence
+                or self.les) and not ok:
             raise RuntimeError("warp backend (needed for thin walls) needs `pip install warp-lang` and float32")
         return "warp" if ok else "torch"
 
@@ -263,9 +280,11 @@ class Solver:
         vp.Pr = float(v.get("Pr", 0.72))
         self._centres = [torch.as_tensor(self.axes[d].astype(np.float32), device=dev) for d in range(3)]
         vp.cx, vp.cy, vp.cz = (wp.from_torch(c_) for c_ in self._centres)
-        vp.turb = 1 if self.turbulence else 0
+        # turb: 0 laminar, 1 eddy viscosity + law-of-the-wall shear (SST, wall-modelled LES),
+        # 2 eddy viscosity with no-slip walls (wall-resolved LES)
+        vp.turb = 1 if self.wallmodel else (2 if self.les else 0)
         shape3 = tuple(self.U.shape[1:])
-        if self.turbulence:
+        if self.turbulence or self.les:
             dist = np.where(self.phi > 0, self.phi, 0.0).astype(np.float32)
             dist[self.phi >= 1e8] = 1e3
             if getattr(self, "_thin_dist", None) is not None:
@@ -274,6 +293,7 @@ class Solver:
             self.dist_buf = torch.as_tensor(np.maximum(dist, 1e-6), device=dev)
             self.fluid_buf = torch.as_tensor(self.fluid.astype(np.float32), device=dev)
             self.mut_buf = torch.zeros(shape3, dtype=self.dtype, device=dev)
+        if self.turbulence:
             self._init_turbulence()
             for name in ("K1", "O1"):
                 setattr(self, name + "_buf", torch.empty(shape3, dtype=self.dtype, device=dev))
@@ -285,7 +305,7 @@ class Solver:
             self._w.update(K=f(self.K_buf), O=f(self.O_buf), K1=f(self.K1_buf), O1=f(self.O1_buf),
                            Rk=f(self.Rk_buf), Rw=f(self.Rw_buf), Dk=f(self.Dk_buf), Dw=f(self.Dw_buf),
                            utau=f(self.utau_buf))
-        else:
+        if not (self.turbulence or self.les):
             self.dist_buf = torch.ones((1, 1, 1), dtype=self.dtype, device=dev)
             self.fluid_buf = torch.ones((1, 1, 1), dtype=self.dtype, device=dev)
             self.mut_buf = torch.zeros((1, 1, 1), dtype=self.dtype, device=dev)
@@ -730,6 +750,8 @@ class Solver:
             self._L(K.ib_kernel, ib["n"], [w["W"], ib["ghost"], ib["corner"], ib["weight"],
                                                        ib["normal"], ib["ratio"], int(self.wall == "noslip")])
         self._L(K.shock_kernel, shape, [w["W"], self._active_sensor, self.shock_threshold, w["S"]])
+        if self.les and self.les["sgs"] == "vreman":
+            self._L(K.vreman_kernel, shape, [w["W"], self._vp, float(self.les["cv"]), self._vp.mut])
         if self.turbulence:
             kk, oo = (("K", "O") if tkey in (None, "") else (tkey, "O1"))
             self._fill_bc_turb(getattr(self, kk + "_buf"), getattr(self, oo + "_buf"))
@@ -774,16 +796,27 @@ class Solver:
             wp.launch(K.rk_tiles_kernel, dim=tiles.shape[0] * 512, inputs=args + [tiles, w[out]],
                       device=self._wdev, stream=self._wp_stream)
 
-    def _step_warp(self, order, want_res=False, local=False, tiles=None):
+    def _stable_dt(self):
+        """Largest stable global time step (tensor) at the current state."""
+        K, w = self._K, self._w
+        self._wprim("U")
+        self._L(K.rate_kernel, self.n, [w["W"], w["ix"], w["iy"], w["iz"], self._active_flux,
+                                        w["mask"], self.gamma, self._vp, w["rate"]])
+        return self.cfl / self.rate_buf.max()
+
+    def _step_warp(self, order, want_res=False, local=False, tiles=None, dt_fixed=None):
         """SSP-RK2 step. local: per-cell time steps (steady runs only). tiles: update only
-        these 8x8x8 tiles (active-region updating, steady runs only)."""
+        these 8x8x8 tiles (active-region updating, steady runs only). dt_fixed: use this global
+        time step (tensor) instead of this grid's own (time-accurate runs on composite grids)."""
         wp, K, w = self._wp, self._K, self._w
         self._wprim("U")
-        wp.launch(K.rate_kernel, dim=self.n, inputs=[w["W"], w["ix"], w["iy"], w["iz"], self._active_flux,
-                                                     w["mask"], self.gamma, self._vp, w["rate"]],
-                  device=self._wdev, stream=self._wp_stream)
-        torch.div(self.cfl, self.rate_buf.max(), out=self.dt_buf[0])
-        if local:
+        if dt_fixed is not None:
+            self.dt_buf[0].copy_(dt_fixed)
+        else:
+            self._L(K.rate_kernel, self.n, [w["W"], w["ix"], w["iy"], w["iz"], self._active_flux,
+                                            w["mask"], self.gamma, self._vp, w["rate"]])
+            torch.div(self.cfl, self.rate_buf.max(), out=self.dt_buf[0])
+        if local and dt_fixed is None:
             torch.div(self.cfl, torch.clamp(self.rate_buf, min=1e-30), out=self.dtl_buf)
         elif tiles is None and getattr(self, "_tiles_on", False):
             self.dtl_buf.copy_(self.dt_buf[0].expand_as(self.dtl_buf))   # for the activity measure
@@ -1167,6 +1200,10 @@ class Solver:
                 out["k"] = (self.K_buf[sl].double().cpu().numpy()) / rho
                 out["omega"] = (self.O_buf[sl].double().cpu().numpy()) / rho
                 out["mut"] = self.mut_buf[sl].double().cpu().numpy()
+        if self.les and self.backend == "warp":
+            with torch.no_grad():
+                self._wprim("U")
+                out["mut"] = self.mut_buf[(slice(NG, -NG),) * 3].double().cpu().numpy()
         return out
 
     def _fields(self):
@@ -1302,7 +1339,7 @@ class Solver:
         Wc, y may be lists of two samples (laminar): u = a y + b y^2 through the no-slip wall."""
         from .wallfunction import spalding_utau
         v = self.viscous
-        if isinstance(Wc, (list, tuple)) and len(Wc) == 2 and not self.turbulence:
+        if isinstance(Wc, (list, tuple)) and len(Wc) == 2 and not self.wallmodel:
             (W1, W2), (y1, y2) = Wc, y
             T = W1[4] / (W1[0] * v["R"])
             mu = v["mu"] if v["model"] == "constant" else \
@@ -1318,7 +1355,7 @@ class Solver:
             v["mu"] * (T / v["T0"]) ** 1.5 * (v["T0"] + v["S"]) / (T + v["S"])
         ut = vel - (vel * nrm).sum(0) * nrm
         um = np.maximum(np.linalg.norm(ut, axis=0), 1e-12)
-        if self.turbulence:
+        if self.wallmodel:
             utau = spalding_utau(um, y, mu / rho)
             tau = rho * utau ** 2
         else:
@@ -1416,7 +1453,7 @@ class Solver:
 
         p_idx, p_w, _ = stencil(pos, False)
         hloc = np.minimum.reduce([self.widths[d][cell[:, d]] for d in range(3)]) if len(cell) else np.zeros(0)
-        y_img = (np.stack([1.0 * hloc, 2.0 * hloc]) if not self.turbulence else 1.5 * hloc[None])
+        y_img = (np.stack([1.0 * hloc, 2.0 * hloc]) if not self.wallmodel else 1.5 * hloc[None])
         st_ = [stencil(pos + y_ * nrm, True) for y_ in y_img]
         dev = self.device
         self._tri = dict(
@@ -1484,7 +1521,7 @@ class Solver:
                 ww[ok] /= tw[ok, None]
                 return ii, ww, ok
 
-            y_img = (np.stack([1.0 * hloc[idx], 2.0 * hloc[idx]]) if not self.turbulence
+            y_img = (np.stack([1.0 * hloc[idx], 2.0 * hloc[idx]]) if not self.wallmodel
                      else 1.5 * hloc[idx][None])
             st_ = [stencil(y_) for y_ in y_img]
             img_idx = np.concatenate([t_[0] for t_ in st_], 1)
@@ -1526,7 +1563,7 @@ class Solver:
                     FB.append(fb[keep].astype(float))
                 Aall, Ball, Dall = np.concatenate(A_), np.concatenate(B_), np.concatenate(D_)
                 # wall distance of the cells on each side (wall-function distance when turbulent)
-                if getattr(self, "dist_buf", None) is not None and self.turbulence:
+                if getattr(self, "dist_buf", None) is not None and self.wallmodel:
                     dist = self.dist_buf.reshape(-1).cpu().numpy()
                     ya, yb = dist[Aall], dist[Ball]
                 else:

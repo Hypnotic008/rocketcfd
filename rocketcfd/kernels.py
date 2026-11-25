@@ -526,20 +526,20 @@ def cell_residual(W: wp.array4d(dtype=wp.float32), S: wp.array3d(dtype=wp.int32)
                 vr = vec5()
                 wl = bL
                 wr = bR
-                if vp.turb != 0:
+                if vp.turb == 1:
                     if vp.fluid[I - di, J - dj, K - dk] < 0.5:
                         wl = 1
                     if vp.fluid[I + di, J + dj, K + dk] < 0.5:
                         wr = 1
                 if wl != 0:
-                    if vp.turb != 0:
+                    if vp.turb == 1:
                         vl = wallfn_flux(W, vp, I, J, K, d, 0)
                     else:
                         vl = wall_visc(W, vp, I, J, K, d, 0)
                 else:
                     vl = visc_flux(W, vp, g, I - di, J - dj, K - dk, I, J, K, d)
                 if wr != 0:
-                    if vp.turb != 0:
+                    if vp.turb == 1:
                         vr = wallfn_flux(W, vp, I, J, K, d, 1)
                     else:
                         vr = wall_visc(W, vp, I, J, K, d, 1)
@@ -707,6 +707,43 @@ def mut_kernel(W: wp.array4d(dtype=wp.float32), Kt: wp.array3d(dtype=wp.float32)
     f2 = wp.tanh(arg2 * arg2)
     s = wp.sqrt(strain2(W, vp, i, j, k))
     out[i, j, k] = rho * A1 * kk / wp.max(A1 * om, s * f2)
+
+
+@wp.kernel
+def vreman_kernel(W: wp.array4d(dtype=wp.float32), vp: Visc, cv: float, out: wp.array3d(dtype=wp.float32)):
+    """Vreman (2004) subgrid eddy viscosity mu_t = rho c sqrt(B_beta / (a_ij a_ij)) with
+    a_ij = du_j/dx_i, beta_ij = sum_m D_m^2 a_mi a_mj (D_m: local cell width along m). It vanishes
+    in pure shear near walls and in laminar regions without damping functions. c = 0.07 (~2.5 Cs^2)."""
+    i, j, k = wp.tid()
+    if i < 1 or j < 1 or k < 1 or i > W.shape[1] - 2 or j > W.shape[2] - 2 or k > W.shape[3] - 2:
+        out[i, j, k] = 0.0
+        return
+    if vp.fluid[i, j, k] < 0.5:
+        out[i, j, k] = 0.0
+        return
+    a = wp.mat33()
+    for m in range(3):
+        for n in range(3):
+            a[m, n] = cdiff(W, vp, i, j, k, n, m)          # du_n / dx_m
+    dl = wp.vec3(0.5 * (vp.cx[i + 1] - vp.cx[i - 1]), 0.5 * (vp.cy[j + 1] - vp.cy[j - 1]),
+                 0.5 * (vp.cz[k + 1] - vp.cz[k - 1]))
+    aa = float(0.0)
+    for m in range(3):
+        for n in range(3):
+            aa = aa + a[m, n] * a[m, n]
+    b = wp.mat33()
+    for p in range(3):
+        for q in range(3):
+            s = float(0.0)
+            for m in range(3):
+                s = s + dl[m] * dl[m] * a[m, p] * a[m, q]
+            b[p, q] = s
+    bb = b[0, 0] * b[1, 1] - b[0, 1] * b[0, 1] + b[0, 0] * b[2, 2] - b[0, 2] * b[0, 2] \
+        + b[1, 1] * b[2, 2] - b[1, 2] * b[1, 2]
+    nut = float(0.0)
+    if aa > 1.0e-20 and bb > 0.0:
+        nut = cv * wp.sqrt(bb / aa)
+    out[i, j, k] = W[0, i, j, k] * nut
 
 
 @wp.func
