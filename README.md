@@ -145,7 +145,22 @@ Same condition with the **tower side** into the wind (`--windward 180`):
   runs, a consistency check on the comparison.
 * With the rudder side windward the hull beside the fins adds ~+0.05 (rudder fin / pod raising
   the pressure on the hull ahead of them); with the tower side windward it does not.
-* Next: rudder side windward without chines (`--no-chines`) to isolate the chines.
+
+Rudder side windward **without chines** (`--no-chines`):
+
+| | with chines | no chines | chines' effect |
+|---|---|---|---|
+| CN (lift) | 1.616 | 1.482 | +0.134 (+9 %) |
+| CD | 3.532 | 3.483 | +0.05 |
+| restoring moment | +0.011 | +0.085 | **-0.074** |
+| hull restoring moment | -0.034 | +0.035 | -0.069 |
+
+* The chines are lift devices (+9 % normal force) that sit mostly between the engines and the
+  centre of mass, i.e. on the leading half in an engines-first descent, so they cost almost all
+  of the static margin. The fins and the engine end are unchanged (consistency check).
+* Open item: the hot-staging truss is not modelled. In supersonic descent it cannot affect
+  anything upstream of it; its own crossflow load at 15 deg is estimated at a restoring moment of
+  roughly +0.01 (comparable to the margin with chines) and needs viscous flow to be meaningful.
 
 ## Running
 
