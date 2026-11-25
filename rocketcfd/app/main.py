@@ -15,6 +15,9 @@ def main():
     app.setApplicationName("rocketcfd")
     app.setStyle("Fusion")
     app.setStyleSheet(DARK_QSS)
+    icon = os.path.join(os.path.dirname(__file__), "assets", "rocketcfd.png")
+    if os.path.exists(icon):
+        app.setWindowIcon(QtGui.QIcon(icon))
 
     from .setup_page import SetupPage
     from .run_page import RunPage

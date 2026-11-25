@@ -47,7 +47,7 @@ class PlotsPage(QtWidgets.QWidget):
         self.canvases = {}
         for name, builder in (("Convergence", self._tab_conv), ("Forces by part", self._tab_parts),
                               ("Contour plot", self._tab_contour), ("Line probe", self._tab_line),
-                              ("Aero database", self._tab_db)):
+                              ("Aero database", self._tab_db), ("Compare runs", self._tab_cmp)):
             w = QtWidgets.QWidget()
             hl = QtWidgets.QHBoxLayout(w)
             ctl = builder()
@@ -150,6 +150,88 @@ class PlotsPage(QtWidgets.QWidget):
             w.currentTextChanged.connect(lambda *_: self.redraw())
         return lay
 
+    def _tab_cmp(self):
+        lay = QtWidgets.QVBoxLayout()
+        lay.addWidget(QtWidgets.QLabel("Tick the runs to compare:"))
+        self.cmp_list = QtWidgets.QListWidget()
+        self.cmp_list.itemChanged.connect(lambda *_: self.redraw())
+        lay.addWidget(self.cmp_list, 1)
+        f = QtWidgets.QFormLayout()
+        self.cmp_coef = QtWidgets.QComboBox()
+        self.cmp_coef.addItems(["CD", "CN", "C_restore", "CL", "CS", "C_roll"])
+        self.cmp_coef.currentTextChanged.connect(lambda *_: self.redraw())
+        f.addRow("Coefficient", self.cmp_coef)
+        lay.addLayout(f)
+        self.cmp_table = QtWidgets.QTableWidget()
+        self.cmp_table.setMinimumHeight(180)
+        lay.addWidget(self.cmp_table)
+        b = QtWidgets.QPushButton("Copy table")
+        b.clicked.connect(self._copy_table)
+        lay.addWidget(b)
+        return lay
+
+    def _fill_cmp_list(self):
+        if not hasattr(self, "cmp_list"):
+            return
+        checked = {self.cmp_list.item(i).data(QtCore.Qt.UserRole) for i in range(self.cmp_list.count())
+                   if self.cmp_list.item(i).checkState() == QtCore.Qt.Checked}
+        self.cmp_list.blockSignals(True)
+        self.cmp_list.clear()
+        for p in result_folders():
+            if os.path.exists(os.path.join(p, "loads.json")):
+                it = QtWidgets.QListWidgetItem(os.path.relpath(p, RESULTS))
+                it.setData(QtCore.Qt.UserRole, p)
+                it.setFlags(it.flags() | QtCore.Qt.ItemIsUserCheckable)
+                it.setCheckState(QtCore.Qt.Checked if p in checked else QtCore.Qt.Unchecked)
+                self.cmp_list.addItem(it)
+        self.cmp_list.blockSignals(False)
+
+    def _draw_cmp(self, fig, dark):
+        runs = [self.cmp_list.item(i).data(QtCore.Qt.UserRole) for i in range(self.cmp_list.count())
+                if self.cmp_list.item(i).checkState() == QtCore.Qt.Checked]
+        if not runs:
+            return self._msg(fig, dark, "Tick two or more runs on the left.")
+        keys = ["CD", "CL", "CN", "CS", "C_restore", "C_roll"]
+        rows = []
+        for r in runs:
+            m = read_json(os.path.join(r, "loads.json")) or {}
+            av = m.get("averaged") or m.get("coefficients") or {}
+            sd = m.get("averaged_std") or {}
+            c = m.get("condition") or {}
+            g = m.get("grid") or {}
+            rows.append((os.path.relpath(r, RESULTS), av, sd, c, g))
+        cols = ["run", "Mach", "aoa", "cells", "solver"] + keys
+        self.cmp_table.setColumnCount(len(cols))
+        self.cmp_table.setRowCount(len(rows))
+        self.cmp_table.setHorizontalHeaderLabels(cols)
+        for i, (name, av, sd, c, g) in enumerate(rows):
+            vals = [name, f"{c.get('mach', '')}", f"{c.get('aoa_from_engines_first', '')}", f"{g.get('cells', '')}",
+                    f"{g.get('solver', '')}"] + [f"{av[k]:+.4f}" if k in av else "" for k in keys]
+            for j, v in enumerate(vals):
+                self.cmp_table.setItem(i, j, QtWidgets.QTableWidgetItem(v))
+        self.cmp_table.resizeColumnsToContents()
+        k = self.cmp_coef.currentText()
+        ax = style_axes(fig.add_subplot(111), dark)
+        names = [r[0] for r in rows]
+        vals = [r[1].get(k, np.nan) for r in rows]
+        errs = [r[2].get(k, 0.0) for r in rows]
+        y = np.arange(len(rows))
+        ax.barh(y, vals, xerr=errs, color="#5e81ac", ecolor="#d8dee9" if dark else "black", capsize=3)
+        ax.set_yticks(y, names)
+        ax.set_xlabel(k)
+        for yy, v in zip(y, vals):
+            if np.isfinite(v):
+                ax.text(v, yy, f" {v:.4f}", va="center", color="#d8dee9" if dark else "black", fontsize=8)
+        ax.set_title(f"{k} by run (whiskers: unsteadiness)")
+        fig.tight_layout()
+
+    def _copy_table(self):
+        t = self.cmp_table
+        lines = ["\t".join(t.horizontalHeaderItem(j).text() for j in range(t.columnCount()))]
+        for i in range(t.rowCount()):
+            lines.append("\t".join((t.item(i, j).text() if t.item(i, j) else "") for j in range(t.columnCount())))
+        QtWidgets.QApplication.clipboard().setText("\n".join(lines))
+
     # ------------------------------------------------------------------ data
     def refresh(self):
         cur = self.combo.currentData()
@@ -162,6 +244,7 @@ class PlotsPage(QtWidgets.QWidget):
                 self.combo.setCurrentIndex(i)
         if self.combo.count() and self.folder is None:
             self.load(self.combo.currentData())
+        self._fill_cmp_list()
 
     def load(self, folder):
         if not folder:
@@ -220,7 +303,7 @@ class PlotsPage(QtWidgets.QWidget):
         fig.set_facecolor("#1e2228" if dark else "white")
         try:
             getattr(self, "_draw_" + {"Convergence": "conv", "Forces by part": "parts", "Contour plot": "contour",
-                                      "Line probe": "line", "Aero database": "db"}[name])(fig, dark)
+                                      "Line probe": "line", "Aero database": "db", "Compare runs": "cmp"}[name])(fig, dark)
         except Exception as e:                  # noqa: BLE001
             ax = fig.add_subplot(111)
             style_axes(ax, dark)

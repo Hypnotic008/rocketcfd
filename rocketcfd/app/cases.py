@@ -50,6 +50,14 @@ def _sh_fields():
         Field("fin-deflection", "Fin deflections [deg]", "floats", "0 0 0", "Three numbers: rudder fin, catch fin "
               "90, catch fin 270.", G2, advanced=True),
         Field("chines", "Chines", "choice", "all", "Which chines to model.", G2, choices=["all", "tall", "short", "none"]),
+        Field("engines", "Engines firing", "choice", "none", "Rocket plumes from the nozzle exits (landing / boostback "
+              "burn, retropropulsion): centre = 3, inner = 13, all = 33.", G2, choices=["none", "centre", "inner", "all"]),
+        Field("exit-mach", "Nozzle exit Mach", "float", 3.5, "", G2, lo=1.0, hi=8.0, step=0.1, advanced=True),
+        Field("exit-p", "Nozzle exit pressure [Pa]", "float", 80e3, "", G2, lo=1e3, hi=1e6, step=5e3, decimals=0,
+              advanced=True),
+        Field("exit-T", "Exit temperature [K]", "float", 2200.0, "Single-gas model: chosen so the exit velocity is "
+              "Raptor-like (~3300 m/s).", G2, lo=200, hi=4000, step=50, decimals=0, advanced=True),
+        Field("throttle", "Throttle", "float", 1.0, "0..1", G2, lo=0.0, hi=1.0, step=0.05, advanced=True),
         Field("h", "Cell size near vehicle [m]", "float", 0.5, "Base grid cell size around the booster. 0.3 is a good "
               "balance; 0.5 for quick looks.", G3, lo=0.02, hi=2, step=0.05),
         Field("h-far", "Farfield cell size [m]", "float", 0.0, "0 = 4 x the near-vehicle size.", G3, lo=0, hi=10,
@@ -104,6 +112,8 @@ SUPER_HEAVY = Case(
                                                    aoa=15.0, windward=0.0, iters=4000),
         "Peak-q, viscous RANS": dict(h=0.3, fins="parametric", turbulent=True, **{"fin-h": 0.06, "engine-h": 0.06,
                                                                                   "wall-h": "0.25,0.03,0.03"}),
+        "Landing burn plume (3 engines, subsonic)": dict(mach=0.4, alt=2000.0, aoa=0.0, h=0.3, engines="centre",
+                                                         implicit=True, iters=3000, fins="parametric"),
         "Movie: unsteady LES wake": dict(h=0.3, fins="parametric", les=True, **{"time-accurate": True,
                                          "snapshots": 300, "snap-volume": 2, "fin-h": 0.0}, aoa=15.0,
                                          windward=0.0),

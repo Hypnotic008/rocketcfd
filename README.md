@@ -392,6 +392,13 @@ On a 6 GB laptop RTX 4050, that's about 7 M cells, or h ~ 0.3 m for the full Sup
 
 ## Desktop app
 
+**Install on Windows (one click):** download or clone the repository, then double-click
+`packaging\install_windows.bat`. It makes a private Python environment (`.venv`), installs CUDA
+PyTorch and the requirements, checks that the GPU is found, and puts a **rocketcfd** shortcut on
+the desktop. Run it again to update after a `git pull`.
+
+Or in an existing Python environment:
+
 ```bash
 pip install -r requirements.txt
 python -m rocketcfd.app            # Windows: double-click rocketcfd_app.bat
@@ -402,7 +409,7 @@ python -m rocketcfd.app            # Windows: double-click rocketcfd_app.bat
 | Setup | case templates (booster descent, aero database, grid fin, validation cases) as grouped forms with an explanation on every field; presets (quick look, glide with fins, viscous RANS, LES movie); grid-size and GPU-memory estimate; speed measurement; save / load setups; shows the equivalent command line |
 | Run | queue of runs executed one after another; live residual and force plots; log; progress and worst-case time left |
 | 3-D results | body coloured by Cp (or metallic), cutting plane in any direction with its own field and contour lines, velocity arrows, iso-surfaces (Q-criterion vortices, sonic surface, ...), streamline tubes, volume rendering (shocks as glowing sheets), backgrounds, camera presets, screenshots; **Cinematic look** button |
-| Plots | convergence history; force breakdown by part with unsteadiness whiskers; filled contour plots of any field on any plane with in-plane streamlines; line probes (CSV export); aero database curves; PNG / SVG / PDF |
+| Plots | convergence history; force breakdown by part with unsteadiness whiskers; filled contour plots of any field on any plane with in-plane streamlines; line probes (CSV export); aero database curves; compare runs (table + chart of the coefficients of any ticked runs); PNG / SVG / PDF |
 | Animations | play back a run's snapshots; render movies (cinematic evolve / orbit / still, schlieren, streamline particles, slice sweep); built-in player |
 
 Fields available everywhere: Mach, p, rho, T, Cp, numerical schlieren, Q-criterion, lambda-2,
