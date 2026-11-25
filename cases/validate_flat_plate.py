@@ -70,14 +70,23 @@ def main():
     faces[2] = np.array([0.0, h])
     s = Solver(None, None, None, fs, faces=faces, thin_sdf=sdf,
                bcs={(2, 0): "periodic", (2, 1): "periodic"}, cfl=0.7, thin_normals=not a.axis_walls)
-    if a.implicit:
-        s.run(a.iters, chunk=200, first_order_steps=100, steady=True, implicit=True, cfl_ramp=100)
-    else:
-        s.run(3000, chunk=500, first_order_steps=300)
-    ld = s.loads(S_ref=1.0 * h, L_ref=1.0, x_ref=(0.0, 0.0, 0.0))
     q = 0.5 * G * M**2
-    # force on the plate is pushed from the high-pressure (lower) side: CN along +normal
-    CN = ld["F_thin"] @ normal / (q * h)
+    cns = []
+
+    def report(sv):
+        ld_ = sv.loads(S_ref=1.0 * h, L_ref=1.0, x_ref=(0.0, 0.0, 0.0))
+        cns.append(ld_["F_thin"] @ normal / (q * h))
+        return False
+
+    if a.implicit:
+        s.run(a.iters, chunk=50, first_order_steps=100, steady=True, implicit=True, cfl_ramp=100, report=report)
+    else:
+        s.run(3000, chunk=100, first_order_steps=300, report=report)
+    # force on the plate is pushed from the high-pressure (lower) side: CN along +normal;
+    # averaged over the last third of the checks (the staircase can keep the flow unsteady)
+    tail = np.array(cns[-max(3, len(cns) // 3):])
+    CN = float(tail.mean())
+    print(f"  CN over the last {len(tail)} checks: mean {CN:.4f}, std {tail.std():.4f}, min {tail.min():.4f}, max {tail.max():.4f}")
     p_low, p_up = oblique_p(M, al), pm_p(M, al)
     CN_exact = (p_low - p_up) / q
     print(f"flat plate, M {M}, alpha {a.alpha} deg, h {h}, {'inclined (staircase)' if a.inclined else 'grid-aligned'}")

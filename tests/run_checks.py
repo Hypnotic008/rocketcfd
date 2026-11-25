@@ -57,8 +57,32 @@ def check_backends():
         (r.stdout.strip().splitlines()[-1] if r.stdout.strip() else r.stderr.strip()[-200:])
 
 
+def check_carbuncle():
+    import carbuncle as cb
+    so, ps, asym, _ = cb.run(8.0)
+    return abs(so) < 0.05 and abs(ps) < 0.03 and asym < 0.05, (f"Mach 8 cylinder: standoff {100*so:+.1f} %, "
+                                                              f"stagnation pressure {100*ps:+.1f} %, shock asymmetry {asym:.3f} m")
+
+
+def check_patch_turbulent():
+    import patch_turbulent_plate as pt
+    from rocketcfd import Solver
+    from rocketcfd.patches import PatchGrid
+    single = Solver(None, None, None, pt.FS, faces=pt.faces(0.0016), **pt.KW)
+    single.run(2000, chunk=500, first_order_steps=200, steady=True, implicit=True, cfl_ramp=200)
+    bf = pt.faces(0.0064)
+    yf = np.round(np.arange(-0.0336, 0.0336 + 1e-9, 0.0016), 10)
+    xf = bf[0][(bf[0] >= -0.1 - 1e-9) & (bf[0] <= 1.1 + 1e-9)]
+    pg = PatchGrid(bf, [[xf, yf, bf[2]]], pt.FS, **pt.KW)
+    pg.verbose = False
+    pg.run(2000, chunk=500, first_order_steps=200, cfl_ramp=200)
+    a, b = pt.drag(single), pt.drag(pg)
+    return abs(b / a - 1) < 0.02, f"turbulent plate with a patch: friction drag {b:.5f} vs single grid {a:.5f}"
+
+
 CHECKS = dict(backends=check_backends, vortex=check_vortex, shocks=check_shocks, low_mach=check_low_mach,
-              patch_blasius=check_patch_blasius, patch_sphere=check_patch_sphere)
+              patch_blasius=check_patch_blasius, patch_sphere=check_patch_sphere, carbuncle=check_carbuncle,
+              patch_turbulent=check_patch_turbulent)
 
 if __name__ == "__main__":
     names = sys.argv[1:] or list(CHECKS)

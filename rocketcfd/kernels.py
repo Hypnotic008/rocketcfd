@@ -971,7 +971,8 @@ def inv_at(ix: wp.array(dtype=wp.float32), iy: wp.array(dtype=wp.float32), iz: w
 def implicit_sweep_kernel(U: wp.array4d(dtype=wp.float32), W: wp.array4d(dtype=wp.float32),
                           R: wp.array4d(dtype=wp.float32), ix: wp.array(dtype=wp.float32),
                           iy: wp.array(dtype=wp.float32), iz: wp.array(dtype=wp.float32), active: wp.vec3i,
-                          blk: wp.array3d(dtype=wp.int32), mask: wp.array3d(dtype=wp.float32), vp: Visc,
+                          blk: wp.array3d(dtype=wp.int32), mask: wp.array3d(dtype=wp.float32),
+                          wst: wp.array3d(dtype=wp.float32), vp: Visc,
                           g: float, cfl: float, ddiag: float, first: int, color: int,
                           dUo: wp.array4d(dtype=wp.float32), dUn: wp.array4d(dtype=wp.float32)):
     """One Jacobi sweep of the backward-Euler system (1/dt + dF/dU) dU = R with a matrix-free,
@@ -1024,7 +1025,7 @@ def implicit_sweep_kernel(U: wp.array4d(dtype=wp.float32), W: wp.array4d(dtype=w
                             dF = flux_of_cons(un + du, d, g) - flux_of_cons(un, d, g)
                             ln = lam_speed(W, vp, g, ni + 2, nj + 2, nk + 2, d, inv_at(ix, iy, iz, d, p))
                             off = off + (float(sg) * dF - du * ln) * (0.5 * inv)
-    dg = s / cfl + s + ddiag
+    dg = s / cfl + s + ddiag + wst[i, j, k]
     for c in range(5):
         dUn[c, I, J, K] = (R[c, i, j, k] - off[c]) / dg
 
@@ -1204,3 +1205,39 @@ def turb_apply_kernel(Kt: wp.array3d(dtype=wp.float32), Om: wp.array3d(dtype=wp.
             kn = rho * ut * ut / wp.sqrt(BSTAR)
     Kt[I, J, K] = kn
     Om[I, J, K] = wn
+
+
+@wp.kernel
+def wall_stiff_kernel(W: wp.array4d(dtype=wp.float32), ix: wp.array(dtype=wp.float32),
+                      iy: wp.array(dtype=wp.float32), iz: wp.array(dtype=wp.float32), active: wp.vec3i,
+                      blk: wp.array3d(dtype=wp.int32), vp: Visc, out: wp.array3d(dtype=wp.float32)):
+    """Implicit diagonal of the wall-function shear (turbulent walls) per unit time: the law-of-
+    the-wall stress grows roughly as u^2, so d(shear force / volume) / d(rho u) ~ 2 tau / (rho u_t)
+    per wall face, times the face's share |n . e_d| and 1/dx. Without it the explicit wall shear
+    makes near-wall cells overshoot at large pseudo time steps."""
+    i, j, k = wp.tid()
+    I = i + 2
+    J = j + 2
+    K = k + 2
+    acc = float(0.0)
+    if vp.fluid[I, J, K] > 0.5:
+        rho = W[0, I, J, K]
+        for d in range(3):
+            if active[d] != 0:
+                e, inv, pos = dir_info(ix, iy, iz, d, i, j, k)
+                for side in range(2):
+                    wall = int(0)
+                    if side == 0:
+                        if ((blk[I - e[0], J - e[1], K - e[2]] >> d) & 1) != 0 or vp.fluid[I - e[0], J - e[1], K - e[2]] < 0.5:
+                            wall = 1
+                    else:
+                        if ((blk[I, J, K] >> d) & 1) != 0 or vp.fluid[I + e[0], J + e[1], K + e[2]] < 0.5:
+                            wall = 1
+                    if wall != 0:
+                        f = wallfn_flux(W, vp, I, J, K, d, side)
+                        tm = wp.sqrt(f[1] * f[1] + f[2] * f[2] + f[3] * f[3])
+                        ut = wp.sqrt(W[1, I, J, K] * W[1, I, J, K] + W[2, I, J, K] * W[2, I, J, K]
+                                     + W[3, I, J, K] * W[3, I, J, K])
+                        if ut > 1.0e-6:
+                            acc = acc + 2.0 * tm / (rho * ut) * inv
+    out[i, j, k] = acc

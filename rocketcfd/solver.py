@@ -436,11 +436,11 @@ class Solver:
         """Store the plate normal of every cell that owns a blocked face in bits 8-31 of its
         blocked-face word (3 x 8-bit components, ~0.5 deg), and in bit 3 + d whether the face
         toward +d may use it: the wall flux then takes the velocity normal to the real plate
-        (kernels.wall_flux_n). Normal = gradient of thin_sdf at the cell centre. A face really
-        crosses a plate when the gradients in the cells on its two sides point in opposite
-        directions (away from the plate on each side); next to a plate edge, tooth tip or
-        junction they do not (they point away from the edge), and such faces keep the axis
-        mirror -- with the edge-pointing normal the wall would read the oncoming flow as impact."""
+        (kernels.wall_flux_n). Normal = gradient of thin_sdf at the cell centre. Only faces whose
+        normal is within ~70 deg of the face axis (|n_d| >= 0.3) use it -- the diagonal grid-fin
+        lattice (|n_d| = 0.71) does. Next to a plate edge or tooth tip the gradient points toward
+        the edge, along the flow, and the wall would read the oncoming flow as an impact (the
+        isolated fin diverged); shallow staircase steps keep the axis mirror as well."""
         cells = np.nonzero(self.blk & 7)
         if cells[0].size == 0:
             return
@@ -471,12 +471,8 @@ class Solver:
             fa = np.nonzero((self.blk >> d) & 1)
             if fa[0].size == 0:
                 continue
-            fb = list(fa)
-            fb[d] = np.minimum(fa[d] + 1, self.blk.shape[d] - 1)
-            fb = tuple(fb)
             ga, oka = grad_at(fa)
-            gb, okb = grad_at(fb)
-            valid = oka & okb & ((ga * gb).sum(0) < -0.5)
+            valid = oka & (np.abs(ga[d]) >= 0.3)
             self.blk[tuple(v[valid] for v in fa)] |= np.int32(1 << (3 + d))
             n_valid += int(valid.sum())
         self.n_thin_normals = n_valid
@@ -806,8 +802,16 @@ class Solver:
                               1e-6 * self.k_inf, 1e-3 * self.omega_inf])
         bufs = ("U1", "dU2")
         dd = 0.0 if dual is None else dual[0] * dual[3]
+        if "wst" not in w:
+            self.wst_buf = torch.zeros(self.n, dtype=self.dtype, device=self.device)
+            w["wst"] = wp.from_torch(self.wst_buf)
+        if self.turbulence and getattr(self, "wall_stiffness", False):
+            # implicit diagonal of the wall-function shear (optional: tested on the flat plate, it
+            # did not change where the implicit k-omega path settles)
+            self._L(K.wall_stiff_kernel, self.n, [w["W"], w["ix"], w["iy"], w["iz"], self._active_flux, w["blk"],
+                                                  self._vp, w["wst"]])
         common = [w["U"], w["W"], w["R"], w["ix"], w["iy"], w["iz"], self._active_flux, w["blk"], w["mask"],
-                  self._vp, self.gamma, float(cfl), dd]
+                  w["wst"], self._vp, self.gamma, float(cfl), dd]
         if self.relax == "rb":
             # red-black Gauss-Seidel: a Jacobi start, then in-place half sweeps by colour; converges
             # per sweep about twice as fast as Jacobi, so `sweeps` Jacobi-equivalents -> sweeps / 2
