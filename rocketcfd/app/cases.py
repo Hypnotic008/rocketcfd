@@ -95,6 +95,10 @@ def _sh_fields():
               G6, lo=0, hi=5000, step=50),
         Field("snap-volume", "3-D snapshot stride", "int", 0, "Also save a coarse 3-D field every n-th cell "
               "(0 = planes only). Needed for 3-D LAVA-style movies; 2 is a good value.", G6, lo=0, hi=8, step=1),
+        Field("probes", "Probe points", "bool", False, "Record pressure and velocity every step at points in the "
+              "wake, beside the hull, behind the fins and at the engine end (Plots -> Probes: history and "
+              "spectrum). For unsteady / LES runs.", G6),
+        Field("probe-points", "Extra probe points", "text", "", 'e.g. "75,0,0; 80,0,3" (x,y,z in m)', G6, advanced=True),
         Field("x64", "Double precision", "bool", False, "", G6, advanced=True),
         Field("out", "Results folder", "text", "results/sh_descent", "", G6, always=True),
     ]
@@ -115,7 +119,7 @@ SUPER_HEAVY = Case(
         "Landing burn plume (3 engines, subsonic)": dict(mach=0.4, alt=2000.0, aoa=0.0, h=0.3, engines="centre",
                                                          implicit=True, iters=3000, fins="parametric"),
         "Movie: unsteady LES wake": dict(h=0.3, fins="parametric", les=True, **{"time-accurate": True,
-                                         "snapshots": 300, "snap-volume": 2, "fin-h": 0.0}, aoa=15.0,
+                                         "snapshots": 200, "snap-volume": 1, "fin-h": 0.0, "probes": True}, aoa=15.0,
                                          windward=0.0),
     },
     dry_run=True, profile=True, gpu_minutes="10-60 min on a laptop GPU")

@@ -54,6 +54,11 @@ def main(argv=None):
                     help="save about this many frames over the run for `viewer --movie evolve` "
                          "(use with --time-accurate for a physically time-accurate movie)")
     ap.add_argument("--snap-volume", type=int, default=0, help="also save a coarse 3-D Mach field (stride)")
+    ap.add_argument("--probes", action="store_true",
+                    help="record rho, u, v, w, p every step at a default set of points (wake, leeward hull, "
+                         "fins, engine end) into probes.npz: time histories / spectra of unsteady runs")
+    ap.add_argument("--probe-points", default="", help='extra probe points "x,y,z; x,y,z" [m] (implies --probes)')
+    ap.add_argument("--probe-every", type=int, default=1, help="record the probes every n steps")
     ap.add_argument("--time-accurate", action="store_true",
                     help="global time step, all cells every step (off: local time steps + active tiles)")
     ap.add_argument("--fins", default="none", choices=["none", "parametric", "cad", "cad_filled"],
@@ -275,14 +280,41 @@ def main(argv=None):
     chunk = max(100, int(round(nsteps / 40 / 50)) * 50)       # ~40 load checks over the max length
     if a.implicit:
         chunk = 50
-    snap = None
+    hooks = []
     if a.snapshots:
         from rocketcfd.snapshots import SnapshotRecorder
         rec = SnapshotRecorder(s, a.out, q, p, ((-1.5, -6.6, -6.6), (L + 0.6, 6.6, 6.6)),
                                volume_stride=a.snap_volume)
         rec.record(0, 0.0)
-        snap = (max(1, nsteps // a.snapshots), rec.record)
-        print(f"recording a snapshot every {snap[0]} steps into {a.out}/snapshots")
+        hooks.append((max(1, nsteps // a.snapshots), rec.record))
+        print(f"recording a snapshot every {hooks[-1][0]} steps into {a.out}/snapshots")
+    prb = None
+    if a.probes or a.probe_points:
+        from rocketcfd.probes import ProbeRecorder
+        lee = -np.array([np.cos(tw), np.sin(tw)])           # leeward direction in the y-z plane
+        Rb = P.radius
+        pts = {"wake 3 m behind the top": (L + 3.0, 0.0, 0.0), "wake 10 m behind the top": (L + 10.0, 0.0, 0.0),
+               "leeward hull, mid": (40.0, *(lee * (Rb + 2.0))), "leeward hull, near top": (62.0, *(lee * (Rb + 2.0))),
+               "behind rudder fin": (P.fin_x_center + 1.5, 0.0, Rb + 3.0),
+               "behind catch fin 90": (P.fin_x_center + 1.5, -(Rb + 3.0), 0.0),
+               "engine end, centre": (-1.5, 0.0, 0.0), "skirt edge, leeward": (1.5, *(lee * (Rb + 0.8)))}
+        for k_, txt in enumerate(t_ for t_ in a.probe_points.split(";") if t_.strip()):
+            pts[f"user {k_ + 1}"] = tuple(float(v) for v in txt.split(","))
+        prb = ProbeRecorder(runner, list(pts.values()), a.out, names=list(pts), every=a.probe_every)
+        hooks.append((a.probe_every, prb.record))
+        print(f"probes: {len(pts)} points every {a.probe_every} steps -> {a.out}/probes.npz"
+              + (f" ({len(prb.missing)} outside the grid)" if len(prb.missing) else ""))
+    snap = None
+    if hooks:
+        def _hook(step, t_):
+            for every, fn in hooks:
+                if step % every == 0:
+                    fn(step, t_)
+        import math
+        per = 0
+        for e_, _ in hooks:
+            per = math.gcd(per, int(e_))
+        snap = (max(per, 1), _hook)
     if patches and a.explicit:
         runner.run_explicit(nsteps, chunk=chunk, report=report, first_order_steps=400,
                             time_accurate=a.time_accurate, snapshot=snap)
@@ -296,6 +328,8 @@ def main(argv=None):
         s.run(nsteps, chunk=chunk, first_order_steps=400, report=report, steady=not a.time_accurate,
               snapshot=snap)
     wall = time.time() - t0
+    if prb is not None:
+        prb.save()
 
     ld = runner.loads(**REFERENCE, parts=PARTS)
     sa = np.sin(al)

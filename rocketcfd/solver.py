@@ -127,6 +127,7 @@ class Solver:
         # the GPU) instead of the fused one-thread-per-cell kernel
         self.split_residual = True
         self.face_scratch = None    # optional callable(shape) -> shared scratch tensor (patches)
+        self.cache_lam = True       # implicit sweeps read cached spectral radii (lam_kernel)
         self._iface = None          # interface ghost-cell fill (rocketcfd.patches)
         self.owned = None           # cells whose surface loads this grid reports (rocketcfd.patches)
         self.gamma, self.cfl, self.limiter = gamma, cfl, limiter
@@ -957,20 +958,32 @@ class Solver:
             # did not change where the implicit k-omega path settles)
             self._L(K.wall_stiff_kernel, self.n, [w["W"], w["ix"], w["iy"], w["iz"], self._active_flux, w["blk"],
                                                   self._vp, w["wst"]])
-        common = [w["U"], w["W"], w["R"], w["ix"], w["iy"], w["iz"], self._active_flux, w["blk"], w["mask"],
-                  w["wst"], self._vp, self.gamma, float(cfl), dd]
+        if self.cache_lam:
+            # spectral radii once per iteration (they do not change during the sweeps)
+            if "lam" not in w:
+                self.lam_buf = torch.empty((3,) + tuple(self.n), dtype=self.dtype, device=self.device)
+                w["lam"] = wp.from_torch(self.lam_buf)
+            self._L(K.lam_kernel, self.n, [w["W"], w["ix"], w["iy"], w["iz"], self._active_flux, self._vp,
+                                           self.gamma, w["lam"]])
+            sweep = K.implicit_sweep_lam_kernel
+            common = [w["U"], w["lam"], w["R"], w["ix"], w["iy"], w["iz"], self._active_flux, w["blk"], w["mask"],
+                      w["wst"], self.gamma, float(cfl), dd]
+        else:
+            sweep = K.implicit_sweep_kernel
+            common = [w["U"], w["W"], w["R"], w["ix"], w["iy"], w["iz"], self._active_flux, w["blk"], w["mask"],
+                      w["wst"], self._vp, self.gamma, float(cfl), dd]
         if self.relax == "rb":
             # red-black Gauss-Seidel: a Jacobi start, then in-place half sweeps by colour; converges
             # per sweep about twice as fast as Jacobi, so `sweeps` Jacobi-equivalents -> sweeps / 2
-            self._L(K.implicit_sweep_kernel, self.n, common + [1, -1, w["U1"], w["U1"]])
+            self._L(sweep, self.n, common + [1, -1, w["U1"], w["U1"]])
             for it in range(max(1, (sweeps + 1) // 2) - 1):
                 for col in (0, 1):
-                    self._L(K.implicit_sweep_kernel, self.n, common + [0, col, w["U1"], w["U1"]])
+                    self._L(sweep, self.n, common + [0, col, w["U1"], w["U1"]])
             last = "U1"
         else:
             for it in range(sweeps):
                 src, dst = w[bufs[(it + 1) % 2]], w[bufs[it % 2]]
-                self._L(K.implicit_sweep_kernel, self.n, common + [int(it == 0), -1, src, dst])
+                self._L(sweep, self.n, common + [int(it == 0), -1, src, dst])
             last = bufs[(sweeps - 1) % 2]
         self._L(K.implicit_apply_kernel, self.n, [w["U"], w[last], w["mask"], self.gamma, maxrel])
         return res

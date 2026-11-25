@@ -47,7 +47,8 @@ class PlotsPage(QtWidgets.QWidget):
         self.canvases = {}
         for name, builder in (("Convergence", self._tab_conv), ("Forces by part", self._tab_parts),
                               ("Contour plot", self._tab_contour), ("Line probe", self._tab_line),
-                              ("Aero database", self._tab_db), ("Compare runs", self._tab_cmp)):
+                              ("Aero database", self._tab_db), ("Compare runs", self._tab_cmp),
+                              ("Probes", self._tab_probe)):
             w = QtWidgets.QWidget()
             hl = QtWidgets.QHBoxLayout(w)
             ctl = builder()
@@ -169,6 +170,86 @@ class PlotsPage(QtWidgets.QWidget):
         b.clicked.connect(self._copy_table)
         lay.addWidget(b)
         return lay
+
+    def _tab_probe(self):
+        lay = QtWidgets.QFormLayout()
+        self.pr_point = QtWidgets.QComboBox()
+        self.pr_var = QtWidgets.QComboBox()
+        self.pr_var.addItems(["p", "Cp", "u", "v", "w", "rho", "speed"])
+        self.pr_skip = QtWidgets.QDoubleSpinBox()
+        self.pr_skip.setRange(0, 0.95)
+        self.pr_skip.setSingleStep(0.05)
+        self.pr_skip.setValue(0.25)
+        self.pr_skip.setToolTip("Fraction of the run left out of the spectrum (start-up transient)")
+        self.pr_len = QtWidgets.QDoubleSpinBox()
+        self.pr_len.setRange(0.1, 1000.0)
+        self.pr_len.setValue(9.0)
+        self.pr_len.setToolTip("Length for the Strouhal number St = f L / V (booster diameter 9 m)")
+        for w in (self.pr_point, self.pr_var, self.pr_skip, self.pr_len):
+            (w.currentTextChanged if isinstance(w, QtWidgets.QComboBox) else w.valueChanged).connect(
+                lambda *_: self.redraw())
+        lay.addRow("Point", self.pr_point)
+        lay.addRow("Quantity", self.pr_var)
+        lay.addRow("Skip start", self.pr_skip)
+        lay.addRow("Length for St [m]", self.pr_len)
+        lay.addRow(QtWidgets.QLabel("Run a case with 'probes' on\n(--probes) to record these."))
+        return lay
+
+    def _probe_data(self):
+        path = os.path.join(self.folder or "", "probes.npz")
+        if not os.path.exists(path):
+            return None
+        d = np.load(path)
+        names = [str(n) for n in d["names"]]
+        if self.pr_point.count() != len(names) or self.pr_point.itemText(0) != names[0]:
+            self.pr_point.blockSignals(True)
+            self.pr_point.clear()
+            self.pr_point.addItems(names)
+            self.pr_point.blockSignals(False)
+        return d, names
+
+    def _draw_probe(self, fig, dark):
+        pd = self._probe_data()
+        if pd is None:
+            return self._msg(fig, dark, "No probes.npz here: run with probes on (--probes).")
+        d, names = pd
+        i = max(self.pr_point.currentIndex(), 0)
+        t = np.asarray(d["t"], float)
+        W = np.asarray(d["data"], float)[:, i, :]
+        var = self.pr_var.currentText()
+        c = (self.meta.get("condition") or {})
+        V = c.get("V", 1.0)
+        if var == "speed":
+            y = np.sqrt(W[:, 1] ** 2 + W[:, 2] ** 2 + W[:, 3] ** 2)
+        elif var == "Cp":
+            y = (W[:, 4] - c.get("p", W[0, 4])) / (0.5 * c.get("rho", W[0, 0]) * V * V)
+        else:
+            y = W[:, ["rho", "u", "v", "w", "p"].index(var)]
+        ax1 = style_axes(fig.add_subplot(2, 1, 1), dark)
+        ax1.plot(t, y, color="#88c0d0", lw=0.9)
+        ax1.set_xlabel("time [s]")
+        ax1.set_ylabel(var)
+        ax1.set_title(f"{names[i]}  ({', '.join(f'{v:.1f}' for v in d['points'][i])} m)")
+        k0 = int(self.pr_skip.value() * len(t))
+        ax2 = style_axes(fig.add_subplot(2, 1, 2), dark)
+        if len(t) - k0 > 32 and np.all(np.isfinite(y[k0:])):
+            from scipy.signal import welch
+            dt = np.median(np.diff(t[k0:]))
+            # resample onto a uniform time axis (the step can vary slightly)
+            tu = np.arange(t[k0], t[-1], dt)
+            yu = np.interp(tu, t[k0:], y[k0:])
+            f, P = welch(yu - yu.mean(), fs=1.0 / dt, nperseg=min(len(yu), 1024))
+            ax2.loglog(f[1:], P[1:], color="#ebcb8b", lw=1.0)
+            ax2.set_xlabel("frequency [Hz]")
+            ax2.set_ylabel(f"PSD of {var}")
+            j = int(np.argmax(P[1:])) + 1
+            St = f[j] * self.pr_len.value() / max(V, 1e-9)
+            ax2.axvline(f[j], color="#bf616a", ls="--", lw=1)
+            ax2.set_title(f"spectrum: peak {f[j]:.2f} Hz (St = f L / V = {St:.3f}); rms {np.std(yu):.4g}")
+        else:
+            ax2.text(0.5, 0.5, "too few samples for a spectrum", transform=ax2.transAxes, ha="center",
+                     color="#d8dee9" if dark else "black")
+        fig.tight_layout()
 
     def _fill_cmp_list(self):
         if not hasattr(self, "cmp_list"):
@@ -303,7 +384,8 @@ class PlotsPage(QtWidgets.QWidget):
         fig.set_facecolor("#1e2228" if dark else "white")
         try:
             getattr(self, "_draw_" + {"Convergence": "conv", "Forces by part": "parts", "Contour plot": "contour",
-                                      "Line probe": "line", "Aero database": "db", "Compare runs": "cmp"}[name])(fig, dark)
+                                      "Line probe": "line", "Aero database": "db", "Compare runs": "cmp",
+                                      "Probes": "probe"}[name])(fig, dark)
         except Exception as e:                  # noqa: BLE001
             ax = fig.add_subplot(111)
             style_axes(ax, dark)

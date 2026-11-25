@@ -1075,6 +1075,93 @@ def implicit_sweep_kernel(U: wp.array4d(dtype=wp.float32), W: wp.array4d(dtype=w
 
 
 @wp.kernel
+def lam_kernel(W: wp.array4d(dtype=wp.float32), ix: wp.array(dtype=wp.float32), iy: wp.array(dtype=wp.float32),
+               iz: wp.array(dtype=wp.float32), active: wp.vec3i, vp: Visc, g: float,
+               lam: wp.array4d(dtype=wp.float32)):
+    """Spectral radius (as a speed, lam_speed) of every interior cell along each direction, for
+    implicit_sweep_lam_kernel."""
+    i, j, k = wp.tid()
+    I = i + 2
+    J = j + 2
+    K = k + 2
+    lam[0, i, j, k] = 0.0
+    lam[1, i, j, k] = 0.0
+    lam[2, i, j, k] = 0.0
+    if active[0] != 0:
+        lam[0, i, j, k] = lam_speed(W, vp, g, I, J, K, 0, ix[i])
+    if active[1] != 0:
+        lam[1, i, j, k] = lam_speed(W, vp, g, I, J, K, 1, iy[j])
+    if active[2] != 0:
+        lam[2, i, j, k] = lam_speed(W, vp, g, I, J, K, 2, iz[k])
+
+
+@wp.kernel
+def implicit_sweep_lam_kernel(U: wp.array4d(dtype=wp.float32), lam: wp.array4d(dtype=wp.float32),
+                          R: wp.array4d(dtype=wp.float32), ix: wp.array(dtype=wp.float32),
+                          iy: wp.array(dtype=wp.float32), iz: wp.array(dtype=wp.float32), active: wp.vec3i,
+                          blk: wp.array3d(dtype=wp.int32), mask: wp.array3d(dtype=wp.float32),
+                          wst: wp.array3d(dtype=wp.float32),
+                          g: float, cfl: float, ddiag: float, first: int, color: int,
+                          dUo: wp.array4d(dtype=wp.float32), dUn: wp.array4d(dtype=wp.float32)):
+    """implicit_sweep_kernel with the spectral radii lam[d] (lam_kernel) read from a cache made
+    once per iteration instead of recomputed in every sweep (same arithmetic).
+
+    One Jacobi sweep of the backward-Euler system (1/dt + dF/dU) dU = R with a matrix-free,
+    first-order Rusanov Jacobian (data-parallel LU relaxation, Wright, Candler & Bose 1996):
+
+        D dU_i = R_i - sum_d 1/dx [ 0.5 (dF(i+1) - lam(i+1) dU(i+1)) - 0.5 (dF(i-1) + lam(i-1) dU(i-1)) ]
+
+    with D = (1 + 1/cfl) sum_d lam_d / dx_d, i.e. the local pseudo time step dt = cfl / sum(lam/dx).
+    dF(n) = F(U_n + dU_n) - F(U_n) is the exact flux change. Boundary, wall and thin-wall
+    neighbours are treated explicitly (no coupling). first = 1 starts from dU = 0.
+    ddiag adds a0 / dt_phys to the diagonal in dual time stepping (0 for steady runs).
+    color = 0 / 1: red-black Gauss-Seidel half sweep in place (dUo is dUn; only cells with
+    (i + j + k) % 2 == color are updated, from their neighbours of the other colour); -1: Jacobi."""
+    i, j, k = wp.tid()
+    if color >= 0 and (i + j + k) % 2 != color:
+        return
+    I = i + 2
+    J = j + 2
+    K = k + 2
+    if mask[i, j, k] < 0.5:
+        for c in range(5):
+            dUn[c, I, J, K] = 0.0
+        return
+    s = float(0.0)
+    off = vec5()
+    for d in range(3):
+        if active[d] != 0:
+            e, inv, pos = dir_info(ix, iy, iz, d, i, j, k)
+            s = s + lam[d, i, j, k] * inv
+            if first == 0:
+                for side in range(2):
+                    sg = 1
+                    if side == 1:
+                        sg = -1
+                    p = pos + sg
+                    if p >= 0 and p < mask.shape[d]:
+                        ni = i + sg * e[0]
+                        nj = j + sg * e[1]
+                        nk = k + sg * e[2]
+                        bi = I
+                        bj = J
+                        bk = K
+                        if sg < 0:
+                            bi = I - e[0]
+                            bj = J - e[1]
+                            bk = K - e[2]
+                        if ((blk[bi, bj, bk] >> d) & 1) == 0 and mask[ni, nj, nk] > 0.5:
+                            du = cons_at(dUo, ni + 2, nj + 2, nk + 2)
+                            un = cons_at(U, ni + 2, nj + 2, nk + 2)
+                            dF = flux_of_cons(un + du, d, g) - flux_of_cons(un, d, g)
+                            ln = lam[d, ni, nj, nk]
+                            off = off + (float(sg) * dF - du * ln) * (0.5 * inv)
+    dg = s / cfl + s + ddiag + wst[i, j, k]
+    for c in range(5):
+        dUn[c, I, J, K] = (R[c, i, j, k] - off[c]) / dg
+
+
+@wp.kernel
 def implicit_apply_kernel(U: wp.array4d(dtype=wp.float32), dU: wp.array4d(dtype=wp.float32),
                           mask: wp.array3d(dtype=wp.float32), g: float, maxrel: float):
     """U += dU on fluid cells, scaled down where density or pressure would change by more than
