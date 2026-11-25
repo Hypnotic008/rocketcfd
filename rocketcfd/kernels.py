@@ -167,6 +167,8 @@ def wall_flux_n(q: vec5, d: int, g: float, own_left: int, b: int):
     plate lying obliquely across the grid (a staircase of blocked faces) does not see the
     flow sliding along it as an impact. Pressure only, along the face axis; summed over a
     staircase of faces this gives p * A * n. Falls back to the axis mirror without a normal."""
+    if ((b >> (3 + d)) & 1) == 0:
+        return wall_flux(q, d, g, own_left)       # no reliable plate normal for this face
     n = blk_normal(b)
     ln = wp.length(n)
     if ln < 0.5:
@@ -414,14 +416,40 @@ def spalding_utau(u: float, y: float, nu: float):
 @wp.func
 def wallfn_flux(W: wp.array4d(dtype=wp.float32), vp: Visc, i: int, j: int, k: int, d: int, wall_high: int):
     """Wall shear from the law of the wall on a face between fluid cell (i,j,k) and a wall
-    (immersed-boundary ghost cell or thin plate) normal to e_d."""
+    (immersed-boundary ghost cell or thin plate) across the face normal e_d.
+
+    The wall's own normal n comes from the gradient of the wall-distance field; the shear acts
+    along the velocity tangential to that wall, and each face of a staircase carries the share
+    |n . e_d| of it, so the faces of a stepped wall add up to tau * A along the real wall (an
+    axis-aligned wall gives n = e_d and the plain formula)."""
     rho = W[0, i, j, k]
     nu = mu_of(vp, qcomp(W, i, j, k, 3, vp.R)) / rho
-    ut2 = float(0.0)
-    for c in range(3):
-        if c != d:
-            ut2 = ut2 + W[1 + c, i, j, k] * W[1 + c, i, j, k]
-    ut_mag = wp.sqrt(ut2)
+    gn = wp.vec3()
+    for e in range(3):
+        di = int(0)
+        dj = int(0)
+        dk = int(0)
+        idx = i
+        if e == 0:
+            di = 1
+        elif e == 1:
+            dj = 1
+            idx = j
+        else:
+            dk = 1
+            idx = k
+        span = coord(vp, e, idx + 1) - coord(vp, e, idx - 1)
+        if span > 0.0:
+            gn[e] = (vp.dist[i + di, j + dj, k + dk] - vp.dist[i - di, j - dj, k - dk]) / span
+    gl = wp.length(gn)
+    n = wp.vec3()
+    if gl > 0.5 and gl < 2.0:
+        n = gn / gl
+    else:
+        n[d] = 1.0
+    u = wp.vec3(W[1, i, j, k], W[2, i, j, k], W[3, i, j, k])
+    ut = u - wp.dot(u, n) * n
+    ut_mag = wp.length(ut)
     y = wp.max(vp.dist[i, j, k], 1.0e-6)
     tau = float(0.0)
     if ut_mag > 1.0e-12:
@@ -430,10 +458,8 @@ def wallfn_flux(W: wp.array4d(dtype=wp.float32), vp: Visc, i: int, j: int, k: in
     sgn = 1.0
     if wall_high != 0:
         sgn = -1.0
-    t = wp.vec3()
-    for c in range(3):
-        if c != d:
-            t[c] = sgn * tau * W[1 + c, i, j, k]
+    share = wp.abs(n[d])
+    t = sgn * tau * share * ut
     return vec5(0.0, t[0], t[1], t[2], 0.0)
 
 

@@ -537,9 +537,53 @@ class PatchGrid:
             K = g._K
             g._L(K.prim_kernel, tuple(g.U.shape[1:]), [g._w["U"], g.gamma, g.rho_min, g.p_min, g._w["W"]])
 
+    def run_explicit(self, steps, chunk=500, report=None):
+        """Explicit SSP-RK2 local-time-step steps on all grids (each grid with its own local steps,
+        coupled every step as in run). Used to finish turbulent runs; see Solver.run."""
+        t0 = time.time()
+        order_by_size = list(np.argsort(-self.rank))
+        done = 0
+        self._prime()
+        with torch.no_grad():
+            while done < steps:
+                k = min(chunk, steps - done)
+                for kk in range(k):
+                    rs = []
+                    for gi in order_by_size:
+                        g = self.grids[gi]
+                        _, r = g._step_warp(1.0, want_res=(kk == k - 1), local=True)
+                        rs.append((g.n_fluid, r))
+                    self._restrict()
+                done += k
+                for s in self.grids:
+                    s.step_count += k
+                tot = sum(n for n, _ in rs)
+                res = float(torch.sqrt(sum(n * r * r for n, r in rs) / tot))
+                self.history.append((self.base.step_count, res))
+                if not np.isfinite(res):
+                    raise FloatingPointError(f"diverged at step {self.base.step_count}")
+                if self.verbose:
+                    print(f"step {self.base.step_count:6d}  (explicit)  res(rho) = {res/self.base.fs['rho']:.3e} 1/s  "
+                          f"{time.time()-t0:.0f} s", flush=True)
+                if report and report(self):
+                    break
+        return self
+
     def run(self, iters, chunk=50, first_order_steps=200, report=None, cfl_max=20.0, cfl_start=1.0,
-            cfl_ramp=300, sweeps=8, snapshot=None):
-        """Implicit pseudo-time iterations on all grids together (see Solver.run(implicit=True))."""
+            cfl_ramp=300, sweeps=8, snapshot=None, explicit_finish=None):
+        """Implicit pseudo-time iterations on all grids together (see Solver.run(implicit=True)),
+        followed for turbulent runs by explicit local-time-step steps (explicit_finish, default
+        3 x iters; the implicit k-omega path settles a few per cent off the steady state)."""
+        self._implicit_run(iters, chunk, first_order_steps, report, cfl_max, cfl_start, cfl_ramp, sweeps, snapshot)
+        nfin = explicit_finish if explicit_finish is not None else (3 * iters if self.base.turbulence else 0)
+        if nfin:
+            start = self.base.step_count
+            fin_report = None if report is None else (lambda sv: (sv.step_count - start >= nfin // 3) and report(sv))
+            self.run_explicit(nfin, chunk=max(chunk, 500), report=fin_report)
+        return self
+
+    def _implicit_run(self, iters, chunk, first_order_steps, report, cfl_max, cfl_start, cfl_ramp, sweeps,
+                      snapshot):
         t0 = time.time()
         done = 0
         order_by_size = list(np.argsort(-self.rank))     # coarse to fine: patches see this iteration's base

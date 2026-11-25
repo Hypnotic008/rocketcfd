@@ -53,7 +53,8 @@ python cases/validate_cylinder_turbulent.py --dual --patch-h 0.001 --shell 0.06
 | Cylinder, Mach 4: surface pressure | modified Newtonian | matches near stagnation, above it further round (expected) |
 | Cylinder, Mach 4, stretched grid (2.8x fewer cells) | uniform-grid result | standoff within 1 %, stagnation pressure -0.5 % |
 | 1 mm flat plate, Mach 2, 5 deg, plate along the grid (thin walls) | shock-expansion theory | face pressures exact to 4 digits; CN -1.7 % |
-| Same plate tilted across the grid (staircase of blocked faces) | shock-expansion theory | with the plate normal in the wall flux (default): CN +6.1 % (100 cells/chord), +0.4 % (200); axis-mirror staircase (old): +7.1 %, +2.4 % (implicit, converged) |
+| Same plate tilted across the grid (staircase of blocked faces) | shock-expansion theory | with the plate normal in the wall flux (default, only on faces whose two cells lie on opposite sides of a plate): CN -2.4 % (100 cells/chord); axis-mirror staircase (old): +7.1 %. Using the normal at plate edges too gave +6.1 % but made the grid fin diverge |
+| NACA 0012, Mach 0.8, 1.25 deg (`tests/naca0012.py`) | Euler references (AGARD AR-211) CL 0.35-0.36, CD 0.022-0.023 | shock at x/c 0.63 (ref ~0.62); CL 0.288, CD 0.018 at 250 cells/chord: thin sharp trailing edges lose lift with ghost-cell walls (both surfaces share the ghost cells there) |
 | Warp kernels vs PyTorch reference (Sod, cylinder, 3-D sphere) | identical numerics | max difference 2e-4 (float32) |
 | Viscous shear wave, periodic box (`tests/viscous_shearwave.py`) | exact decay exp(-nu k^2 t) | effective / set viscosity 0.999 (64 cells), 0.987 (16) |
 | Laminar flat plate, Mach 0.4, Re 1e5 (`cases/validate_blasius.py`) | Blasius | skin friction -0.5 % (0.2 < x < 0.8 m), velocity profile within 0.7 % of U |
@@ -290,6 +291,17 @@ the centre of mass, plus CatchSim's pitch damping). It reads `aero_db.json`; the
 mirror symmetry fills roll angles 180-360. `tests/catchsim_dropin_check.py <out dir>` checks it
 reproduces every computed case.
 
+Pitch damping: the table also carries a quasi-steady `cm_q` per Mach (each region of the vehicle
+sees its incidence change by q l / V when pitching: cm_q = 2 sum CN_a (l / L)^2, CatchSim's
+normalisation), used by `cfd_restoring_moment` unless one is given. On the coarse test grid it
+comes out ~0.5-0.7 against CatchSim's guessed 12; check it on the GPU database before relying on it
+(lag terms are not included).
+
+Fin control: run the sweep again with one fin deflected (`--fin-deflection 0 10 0` for a catch fin,
+`10 0 0` for the rudder) and combine with `cases/fin_control_export.py`; `CFDFinControl` in the
+drop-in gives control forces, moments and hinge moments per fin deflection (the other catch fin
+follows from the mirror symmetry).
+
 ### Checking a machine
 
 ```bash
@@ -350,10 +362,14 @@ The viewer adds Q-criterion vortex surfaces (`v`) and friction lines (`l`).
   at least a few fine cells thick; keep patch edges out of shocks where possible. Laminar skin
   friction on curved immersed walls (Re 40 cylinder) is not yet grid-converged (0.44 / 0.33 at
   h = D/25 / D/50, reference ~0.5); pressure drag is (1.02 / 1.04 vs ~1.0).
-* **Turbulent plate: implicit and explicit converge to different states** (Cf +2.6 % vs -6.2 % from
-  White at Re 1e7). Both residuals settle; the likely cause is SST's sensitivity to where the
-  boundary layer turns turbulent near the leading edge at low freestream turbulence, which the
-  path to convergence can change. Unresolved; check before trusting viscous drag to better than ~10 %.
+* **Turbulent runs: the implicit k-omega path does not land on the steady state.** On the flat
+  plate the implicit solver settles at Cf -1 % (Koren; +2.6 % with van Leer) from White, and the
+  explicit solver continued from that state moves it to -6.3 %, where explicit runs from scratch
+  also end. So the explicit result is the steady state and the implicit one is not (cause not
+  found yet: the equations at the fixed point are the same). `Solver.run(implicit=True)` therefore
+  finishes turbulent runs with explicit local-time-step steps (`explicit_finish`, default 3x the
+  implicit iterations, stopping early on the same convergence test). Inviscid and laminar implicit
+  runs agree with explicit ones.
 * **Experimental grid-fin data not yet used.** The wind-tunnel reports with isolated grid-fin normal
   force vs Mach (e.g. Washington & Miller 1993; DTIC ADA383925 / ADA388765; the Orion LAS grid-fin
   tests on NTRS) could not be downloaded from the development container. Validating the fin model

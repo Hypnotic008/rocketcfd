@@ -434,33 +434,52 @@ class Solver:
 
     def _pack_thin_normals(self, thin_sdf):
         """Store the plate normal of every cell that owns a blocked face in bits 8-31 of its
-        blocked-face word (3 x 8-bit components, ~0.5 deg): the wall flux then uses the velocity
-        normal to the real plate (kernels.wall_flux_n). Normal = gradient of thin_sdf at the
-        cell centre; none where the gradient is ill-defined (|grad| < 0.5, e.g. on a plate's
-        mid-plane or at junctions), which falls back to the axis mirror."""
+        blocked-face word (3 x 8-bit components, ~0.5 deg), and in bit 3 + d whether the face
+        toward +d may use it: the wall flux then takes the velocity normal to the real plate
+        (kernels.wall_flux_n). Normal = gradient of thin_sdf at the cell centre. A face really
+        crosses a plate when the gradients in the cells on its two sides point in opposite
+        directions (away from the plate on each side); next to a plate edge, tooth tip or
+        junction they do not (they point away from the edge), and such faces keep the axis
+        mirror -- with the edge-pointing normal the wall would read the oncoming flow as impact."""
         cells = np.nonzero(self.blk & 7)
         if cells[0].size == 0:
             return
-        X = [self.axes[d][cells[d]] for d in range(3)]
-        hl = np.minimum.reduce([self.widths[d][cells[d]] for d in range(3)])
-        eps = 0.05 * hl
-        grad = []
-        for d in range(3):
-            P = list(X)
-            P[d] = X[d] + eps
-            fp = np.asarray(thin_sdf(*P), float)
-            P[d] = X[d] - eps
-            fm = np.asarray(thin_sdf(*P), float)
-            grad.append((fp - fm) / (2 * eps))
-        gv = np.stack(grad)
-        mag = np.linalg.norm(gv, axis=0)
-        ok = (mag > 0.5) & (mag < 2.0)
-        gv = gv / np.maximum(mag, 1e-30)
-        qv = np.clip(np.round(gv * 127.0).astype(np.int64) + 128, 1, 255)
-        code = (qv[0] | (qv[1] << 8) | (qv[2] << 16)) * ok
+
+        def grad_at(idx):
+            X = [self.axes[d][idx[d]] for d in range(3)]
+            hl = np.minimum.reduce([self.widths[d][idx[d]] for d in range(3)])
+            eps = 0.05 * hl
+            gr = []
+            for d in range(3):
+                P = list(X)
+                P[d] = X[d] + eps
+                fp = np.asarray(thin_sdf(*P), float)
+                P[d] = X[d] - eps
+                fm = np.asarray(thin_sdf(*P), float)
+                gr.append((fp - fm) / (2 * eps))
+            gv = np.stack(gr)
+            mag = np.linalg.norm(gv, axis=0)
+            return gv / np.maximum(mag, 1e-30), (mag > 0.5) & (mag < 2.0)
+
+        gA, okA = grad_at(cells)
+        qv = np.clip(np.round(gA * 127.0).astype(np.int64) + 128, 1, 255)
+        code = (qv[0] | (qv[1] << 8) | (qv[2] << 16)) * okA
         packed = ((code << 8) & 0xFFFFFFFF).astype(np.uint32).view(np.int32)
         self.blk[cells] |= packed
-        self.n_thin_normals = int(ok.sum())
+        n_valid = 0
+        for d in range(3):
+            fa = np.nonzero((self.blk >> d) & 1)
+            if fa[0].size == 0:
+                continue
+            fb = list(fa)
+            fb[d] = np.minimum(fa[d] + 1, self.blk.shape[d] - 1)
+            fb = tuple(fb)
+            ga, oka = grad_at(fa)
+            gb, okb = grad_at(fb)
+            valid = oka & okb & ((ga * gb).sum(0) < -0.5)
+            self.blk[tuple(v[valid] for v in fa)] |= np.int32(1 << (3 + d))
+            n_valid += int(valid.sum())
+        self.n_thin_normals = n_valid
 
     def _setup_ib(self):
         phi = self.phi
@@ -845,7 +864,7 @@ class Solver:
     # -------------------------------------------------------------- driver
     def run(self, nsteps, chunk=100, first_order_steps=200, report=None, steady=False,
             active_tiles=None, tile_refresh=50, tile_frac=1e-3, local_dt=False, snapshot=None,
-            implicit=False, cfl_max=20.0, cfl_start=1.0, cfl_ramp=300, sweeps=8):
+            implicit=False, cfl_max=20.0, cfl_start=1.0, cfl_ramp=300, sweeps=8, explicit_finish=None):
         """Advance nsteps time steps. `report(solver)` is called after every chunk; it can
         return True to stop.
 
@@ -868,8 +887,23 @@ class Solver:
         if implicit:
             if self.backend != "warp":
                 raise RuntimeError("the implicit solver needs the warp backend")
-            return self._run_implicit(nsteps, chunk, first_order_steps, report, snapshot,
-                                      cfl_max, cfl_start, cfl_ramp, sweeps)
+            self._run_implicit(nsteps, chunk, first_order_steps, report, snapshot,
+                               cfl_max, cfl_start, cfl_ramp, sweeps)
+            # Turbulent runs: the implicit k-omega path settles a few per cent away from the
+            # steady state the explicit scheme reaches from the same start (flat plate: Cf -1 %
+            # vs -6 % from White). Finish with explicit local-time-step steps, which then move
+            # it there in a fraction of the explicit-only cost. Default: on for turbulent runs.
+            nfin = explicit_finish if explicit_finish is not None else (nsteps * 3 if self.turbulence else 0)
+            if nfin:
+                if self.verbose:
+                    print(f"explicit finish: up to {nfin} local-time-step steps", flush=True)
+                start = self.step_count
+                # the report's convergence test is already met at the switch: do at least a third
+                fin_report = None if report is None else \
+                    (lambda sv: (sv.step_count - start >= nfin // 3) and report(sv))
+                return self.run(nfin, chunk=max(chunk, 500), first_order_steps=0, report=fin_report,
+                                steady=True, active_tiles=False, local_dt=True, snapshot=snapshot)
+            return self
         steady = steady and self.backend == "warp"
         if active_tiles is None:
             active_tiles = steady

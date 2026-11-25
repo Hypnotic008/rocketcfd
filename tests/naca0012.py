@@ -43,15 +43,17 @@ def polygon_sdf(poly):
     return sdf
 
 
-def run(h=0.004, M=0.8, alpha=1.25, iters=3000):
+def run(h=0.004, M=0.8, alpha=1.25, iters=3000, low_mach="auto", body="ib"):
     G = 1.4
     a = np.radians(alpha)
     fs = dict(rho=G, u=M * np.cos(a), v=M * np.sin(a), w=0.0, p=1.0)
     faces = [axis_faces(-20.0, 21.0, 60 * h, [(-0.08, 1.08, h)], 1.08),
              axis_faces(-20.0, 20.0, 60 * h, [(-0.12, 0.12, h)], 1.08), np.array([0.0, h])]
-    s = Solver(None, None, None, fs, sdf=polygon_sdf(naca_polygon()), faces=faces,
-               bcs={(2, 0): "periodic", (2, 1): "periodic"}, verbose=False)
-    print(f"{int(np.prod(s.n))} cells, h {h}", flush=True)
+    geo = dict(sdf=polygon_sdf(naca_polygon())) if body == "ib" else \
+        dict(thin_sdf=polygon_sdf(naca_polygon()), thin_box=((-0.02, -0.08, -1.0), (1.02, 0.08, 1.0)))
+    s = Solver(None, None, None, fs, faces=faces, **geo,
+               bcs={(2, 0): "periodic", (2, 1): "periodic"}, verbose=False, low_mach=low_mach)
+    print(f"{int(np.prod(s.n))} cells, h {h}, low_mach {low_mach}", flush=True)
     s.run(iters, chunk=500, first_order_steps=200, steady=True, implicit=True, cfl_ramp=200)
     ld = s.loads(S_ref=1.0 * h, L_ref=1.0, x_ref=(0.25, 0.0, 0.0))
     # lift / drag in wind axes (loads' CL uses the body x axis as reference; recompute)
@@ -71,6 +73,8 @@ def run(h=0.004, M=0.8, alpha=1.25, iters=3000):
 
 if __name__ == "__main__":
     h = float(sys.argv[1]) if len(sys.argv) > 1 else 0.004
-    CL, CD, xs, res = run(h)
-    print(f"NACA 0012 M 0.8 a 1.25 (h {h}): CL {CL:.4f} (ref 0.35-0.36)  CD {CD:.4f} (ref 0.022-0.023)  "
+    lm = {"on": True, "off": False}.get(sys.argv[2], "auto") if len(sys.argv) > 2 else "auto"
+    body = sys.argv[3] if len(sys.argv) > 3 else "ib"
+    CL, CD, xs, res = run(h, low_mach=lm, body=body)
+    print(f"NACA 0012 M 0.8 a 1.25 (h {h}, low_mach {lm}, {body} wall): CL {CL:.4f} (ref 0.35-0.36)  CD {CD:.4f} (ref 0.022-0.023)  "
           f"upper shock x/c {xs:.2f} (ref ~0.62)  final res {res:.2e}", flush=True)

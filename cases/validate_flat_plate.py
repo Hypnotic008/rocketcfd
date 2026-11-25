@@ -41,6 +41,7 @@ def main():
     ap.add_argument("--inclined", action="store_true")
     ap.add_argument("--axis-walls", action="store_true", help="old staircase wall flux (no plate normal)")
     ap.add_argument("--implicit", action="store_true")
+    ap.add_argument("--iters", type=int, default=800)
     a = ap.parse_args()
     M, al, h = a.mach, np.radians(a.alpha), a.h
     t = 0.001
@@ -70,7 +71,7 @@ def main():
     s = Solver(None, None, None, fs, faces=faces, thin_sdf=sdf,
                bcs={(2, 0): "periodic", (2, 1): "periodic"}, cfl=0.7, thin_normals=not a.axis_walls)
     if a.implicit:
-        s.run(800, chunk=200, first_order_steps=100, steady=True, implicit=True, cfl_ramp=100)
+        s.run(a.iters, chunk=200, first_order_steps=100, steady=True, implicit=True, cfl_ramp=100)
     else:
         s.run(3000, chunk=500, first_order_steps=300)
     ld = s.loads(S_ref=1.0 * h, L_ref=1.0, x_ref=(0.0, 0.0, 0.0))
