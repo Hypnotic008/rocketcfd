@@ -60,7 +60,7 @@ def _snap(pf, base_faces, h):
 
 
 def wall_patches(base_faces, h, shell, sdf=None, thin_sdf=None, box=(32, 64, 64), margin=2,
-                 sample=2, inner=None, thin_box=None, region=None, snap=True, verbose=True, tiling="base"):
+                 sample=2, inner=None, thin_box=None, region=None, snap=True, verbose=True, tiling=None):
     """Patches of cells of size h = (hx, hy, hz) covering the fluid within `shell` metres of
     the walls of `sdf` (and of `thin_sdf`, for thin parts such as grid fins).
 
@@ -81,6 +81,9 @@ def wall_patches(base_faces, h, shell, sdf=None, thin_sdf=None, box=(32, 64, 64)
     overlap by up to a base cell after snapping, which for thin anisotropic shells duplicated
     most cells).
     """
+    if tiling is None:
+        import os
+        tiling = os.environ.get("ROCKETCFD_PATCH_TILING", "base")
     base_faces = [np.asarray(f, float) for f in base_faces]
     lo = np.array([f[0] for f in base_faces])
     hi = np.array([f[-1] for f in base_faces])
@@ -628,13 +631,32 @@ class PatchGrid:
                 res = float(torch.sqrt(sum(n * r * r for n, r in rs) / tot))
                 self.history.append((self.base.step_count, res))
                 if not np.isfinite(res):
-                    raise FloatingPointError(f"diverged at step {self.base.step_count}")
+                    raise FloatingPointError(f"diverged at step {self.base.step_count}: {self.where_bad()}")
                 if self.verbose:
                     print(f"step {self.base.step_count:6d}  (explicit)  res(rho) = {res/self.base.fs['rho']:.3e} 1/s  "
                           f"{time.time()-t0:.0f} s", flush=True)
                 if report and report(self):
                     break
         return self
+
+    def where_bad(self):
+        """First grid / cell with a non-finite or non-physical state (for divergence messages)."""
+        out = []
+        for gi, g in enumerate(self.grids):
+            with torch.no_grad():
+                U = g.U[:, NG:-NG, NG:-NG, NG:-NG]
+                bad = ~torch.isfinite(U).all(0) | (U[0] <= 0)
+                if g.turbulence:
+                    bad |= ~torch.isfinite(g.K_buf[NG:-NG, NG:-NG, NG:-NG]) | ~torch.isfinite(g.O_buf[NG:-NG, NG:-NG, NG:-NG])
+                bad &= g.update_mask
+                n = int(bad.sum())
+                if n:
+                    idx = torch.nonzero(bad)[0].tolist()
+                    xyz = [float(g.axes[d][idx[d] + NG]) for d in range(3)]
+                    ph = float(g.phi[idx[0] + NG, idx[1] + NG, idx[2] + NG])
+                    out.append(f"grid {gi} ({'base' if gi == 0 else 'patch'}, h {tuple(np.round(g.h, 3))}): {n} bad cells, "
+                               f"first at ({xyz[0]:.2f}, {xyz[1]:.2f}, {xyz[2]:.2f}) m, wall distance {ph:.3f} m")
+        return "; ".join(out[:4]) or "no bad cells found"
 
     def run(self, iters, chunk=50, first_order_steps=200, report=None, cfl_max=20.0, cfl_start=1.0,
             cfl_ramp=300, sweeps=8, snapshot=None, explicit_finish=None):

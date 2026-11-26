@@ -126,7 +126,7 @@ class Solver:
         self.relax = "rb"
         # residual as face-flux kernels + divergence (each face once, far fewer registers on
         # the GPU) instead of the fused one-thread-per-cell kernel
-        self.split_residual = True
+        self.split_residual = os.environ.get("ROCKETCFD_FUSED_RESIDUAL", "") != "1"
         self.face_scratch = None    # optional callable(shape) -> shared scratch tensor (patches)
         self.cache_lam = True       # implicit sweeps read cached spectral radii (lam_kernel)
         # implicit turbulent runs: pseudo-time CFL cap in wall-function cells (None = off)
