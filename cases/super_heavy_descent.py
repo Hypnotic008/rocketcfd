@@ -98,6 +98,9 @@ def main(argv=None):
                     help="local refinement: a shell of patches around the hull with cells hx,hy,hz [m], "
                          "e.g. 0.25,0.03,0.03 (fine across the wall, long along the booster). Implies --implicit")
     ap.add_argument("--wall-shell", type=float, default=0.45, help="thickness of the refined hull shell [m]")
+    ap.add_argument("--wall-aft", action="store_true",
+                    help="extend the hull shell over the engine end too (default: it starts just above the "
+                         "skirt; refine the engine end with --engine-h)")
     ap.add_argument("--fin-h", type=float, default=0.0,
                     help="local refinement: patches of this cell size [m] around the grid fins only, "
                          "e.g. 0.03 (replaces --h-fins slab refinement). Implies --implicit")
@@ -184,8 +187,14 @@ def main(argv=None):
         if a.wall_h:
             hw = tuple(float(v) for v in a.wall_h.split(","))
             hw = hw * 3 if len(hw) == 1 else hw
-            print(f"hull shell patches ({hw} m cells within {a.wall_shell} m of the hull):")
-            patches += wall_patches(faces, hw, a.wall_shell, sdf=sdf, box=pbox)
+            # The shell starts just above the engine section: around the bells it would sit in
+            # the stagnation region behind the bow shock, with its coarse/fine interface across
+            # the shock layer (an explicit LES with 0.1 m hull patches diverged there). The
+            # engine end has its own patches (--engine-h); --wall-aft keeps the old full shell.
+            reg = None if a.wall_aft else ((P.skirt_bottom_x + 1.0, -1e9, -1e9), (1e9, 1e9, 1e9))
+            print(f"hull shell patches ({hw} m cells within {a.wall_shell} m of the hull"
+                  + ("" if a.wall_aft else f", x > {P.skirt_bottom_x + 1.0:.2f} m") + "):")
+            patches += wall_patches(faces, hw, a.wall_shell, sdf=sdf, box=pbox, region=reg)
         if a.engine_h:
             R_eng = P.radius + 1.0
             reg = ((-2.0, -R_eng, -R_eng), (P.skirt_bottom_x + 1.0, R_eng, R_eng))
