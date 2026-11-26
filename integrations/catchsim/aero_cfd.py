@@ -90,6 +90,16 @@ class CFDAeroDatabase:
         mirrored = r > 180.0
         if mirrored:
             r = 360.0 - r
+        # Beyond the last computed incidence (a landing burn leans the booster up to ~30 deg
+        # off the relative wind; the tables stop at 20): crossflow terms keep growing like
+        # sin(alpha), the axial force like cos(alpha), from the last computed column, instead of
+        # freezing there.
+        a_max = float(self.aoa[-1])
+        beyond = float(aoa_deg) > a_max and 0.0 < a_max < 90.0
+        k_cross = (np.sin(np.radians(min(float(aoa_deg), 90.0))) / np.sin(np.radians(a_max))
+                   if beyond else 1.0)
+        k_axial = (np.cos(np.radians(min(float(aoa_deg), 90.0))) / np.cos(np.radians(a_max))
+                   if beyond else 1.0)
         im = _interp_axis(self.mach, mach)
         ia = _interp_axis(self.aoa, aoa_deg)
         ir = _interp_axis(self.roll, r)
@@ -103,6 +113,12 @@ class CFDAeroDatabase:
                         if w > 0.0:
                             v += w * T[i, j, l]
             out[k] = v
+        if beyond:
+            for k in out:
+                if k in ("CN", "CS", "Cl", "C_cross", "C_restore"):
+                    out[k] *= k_cross
+                elif k == "CX":
+                    out[k] *= k_axial
         if mirrored:
             for k in list(out):
                 if k in self.sign:
