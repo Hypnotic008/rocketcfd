@@ -52,6 +52,10 @@ guessed aero coefficients in CatchSim (`quatsim/aero.py`).
   model. Patch runs advance all grids with one global time step (`run_explicit(time_accurate=True)`).
   Taylor-Green vortex, Re 1600, 32^3: dissipation peak 0.0117 at t 7.0 (DNS 0.0127 at t 9; a
   coarse grid peaks early); Vreman over-dissipates here (peak at t 5.5).
+* **Fixed: implicit turbulent runs now converge to the steady state** (one k-omega sweep per
+  iteration at pseudo-time CFL <= 5; flat plate Cf -6.1 % vs the explicit -6.2 %, where the old
+  implicit path stalled at -1 %). The explicit finishing steps are no longer needed (RANS runs are
+  ~4x shorter).
 * **Fixed: explicit k-omega SST steps on patch grids diverged.** Base cells covered by a patch had a
   ~1e30 s local time step in the explicit turbulence update (their rate is masked to 0), which put
   them at k = R_k / D_k; this blew up within two steps on the booster with a hull shell and would
@@ -65,8 +69,8 @@ guessed aero coefficients in CatchSim (`quatsim/aero.py`).
 
 * **Implicit steady solver** (backward Euler in pseudo time, matrix-free Jacobian, red-black
   Gauss-Seidel relaxation): same answers as the explicit solver in far fewer iterations
-  (sphere 2.5-4x less wall time on CPU; most gain on thin near-wall cells). Turbulent runs finish
-  with explicit steps (see limits).
+  (sphere 2.5-4x less wall time on CPU; most gain on thin near-wall cells). Turbulent runs now
+  converge implicitly too (Nov 26, see limits).
 * **Dual time stepping** for unsteady flow (vortex shedding): the time step follows the physics.
 * **Local refinement patches**: fine cells only where needed (engine end, grid fins, boundary-
   layer shells, shocks), snapped to the base grid; forebody loads within 0.03 % of an all-fine grid.
@@ -107,7 +111,7 @@ python -m rocketcfd.cinematic results/landing_burn --mode orbit --style plume
 #    d) Starship re-entry
 python cases/starship_reentry.py --h 0.3 --out results/reentry
 python -m rocketcfd.cinematic results/reentry --mode orbit --style mach
-# 4. viscous RANS with a boundary-layer shell (22 M cells, ~4.1 GB; finishes with explicit steps)
+# 4. viscous RANS with a boundary-layer shell (22 M cells, ~4.1 GB)
 python cases/super_heavy_descent.py --h 0.3 --fins parametric --fin-h 0.06 --engine-h 0.06 --turbulent --wall-h 0.25,0.03,0.03 --wall-shell 0.3 --patch-box 32,48,48 --aoa 15 --windward 0 --restart results/glide_patch2 --out results/glide_rans
 # 5. isolated grid fin Mach sweep with the current numerics
 python cases/grid_fin.py --implicit --h 0.025 --out results/grid_fin_v2
@@ -153,7 +157,7 @@ All of these are also in the app (`python -m rocketcfd.app`), as case templates 
 | Laminar cylinder Re 100, dual time stepping | St 0.164, Cd 1.33 | St 0.160 (25 cells/D, 50 steps per period, 15 inner iterations); with 40 steps and 12 inner iterations St 0.137 and Cd 1.336, the same with a refinement patch: use the defaults (80 / 20) |
 | Laminar cylinder Re 40, steady (immersed no-slip wall) | Dennis & Chang: Cd 1.52 | Cd 1.486 / 1.561 at D/25 / D/50 (tangential velocity extrapolated through the wall, triangulated loads; before: 1.464 / 1.372, moving away) |
 | Flat-nosed body, Mach 3, front face exactly on a cell face / between (`flat-face` test) | the same body, other grids | CD 1.61 / 1.62 (loads: triangulated surface); an intermediate ghost-cell change that scaled the normal velocity let the flow through the face (CD 0.03) and was reverted |
-| Turbulent plate Re 1e7, implicit (`--implicit`) | White Cf | +2.6 % (explicit, converged: -6.2 %): two different converged SST states, see limits |
+| Turbulent plate Re 1e7, implicit (`--implicit`) | White Cf | -6.1 % (explicit, converged: -6.2 %), 2800 iterations; with patches: friction drag 0.00611 = single grid |
 | CatchSim drop-in vs the sweep it reads (`tests/catchsim_dropin_check.py`) | the computed cases | identical to 1e-15; mirror rule and centre-of-mass transfer exact |
 
 ## Results so far
@@ -562,18 +566,12 @@ The viewer adds Q-criterion vortex surfaces (`v`) and friction lines (`l`).
   at least a few fine cells thick; keep patch edges out of shocks where possible. Laminar skin
   friction on curved immersed walls: total drag now converges (Re 40 cylinder 1.585 / 1.527 vs 1.52),
   but the split between friction (0.56 / 0.44) and pressure (1.03 / 1.09) still moves with the grid.
-* **Turbulent runs: the implicit k-omega path does not land on the steady state.** On the flat
-  plate the implicit solver settles at Cf -1 % (Koren; +2.6 % with van Leer) from White, and the
-  explicit solver continued from that state moves it to -6.3 %, where explicit runs from scratch
-  also end. So the explicit result is the steady state and the implicit one is not. Diagnosed
-  further (Nov 25): the implicit residual stalls about two orders down (0.3 from 14 at CFL 20, 0.17
-  at CFL 5) and where it settles depends on the CFL number, so it is an iteration that does not
-  converge, not a second steady state; the largest residuals sit in the wall-function cells and the
-  near wake behind the trailing edge. Neither an implicit wall-shear diagonal (`wall_stiffness`) nor
-  a wall-cell CFL cap (`cfl_wall`) removes the stall. `Solver.run(implicit=True)` therefore
-  finishes turbulent runs with explicit local-time-step steps (`explicit_finish`, default 3x the
-  implicit iterations, stopping early on the same convergence test). Inviscid and laminar implicit
-  runs agree with explicit ones.
+* **Turbulent implicit runs (fixed Nov 26).** With 8 coupled k-omega sweeps per iteration at the
+  mean-flow CFL, the implicit solver stalled in a CFL-dependent state a few per cent off the steady
+  state (flat plate: Cf -1 % from White against the explicit -6.3 %). k-omega now takes one
+  point-implicit sweep per iteration at a pseudo-time CFL of at most 5 (`Solver.turb_sweeps`,
+  `turb_cfl_max`): the implicit run converges to the explicit answer (Cf -6.1 %, 2800 iterations)
+  and turbulent runs no longer need the explicit finishing steps (`explicit_finish` default 0).
 * **LES is for unsteady pictures and trends, not yet for numbers.** Implicit LES relies on the
   upwind scheme's dissipation; on the Taylor-Green vortex at 32^3 the dissipation peak comes early
   (t 7.0 vs 9.0). The wall model takes the first cell's velocity (no matching point further out:

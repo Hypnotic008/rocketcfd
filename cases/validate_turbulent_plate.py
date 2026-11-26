@@ -49,6 +49,9 @@ def main():
     ap.add_argument("--out", default="results")
     ap.add_argument("--implicit", action="store_true", help="implicit steady solver (DP-LUR)")
     ap.add_argument("--cfl-max", type=float, default=20.0)
+    ap.add_argument("--no-finish", action="store_true", help="implicit: no explicit finishing steps")
+    ap.add_argument("--turb-sweeps", type=int, default=1, help="implicit k-omega sweeps per iteration")
+    ap.add_argument("--turb-cfl", type=float, default=0.0, help="implicit: cap on the k-omega pseudo-time CFL (0 = solver default, 5)")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     T, p, R, g = 288.15, 101325.0, 287.05, 1.4
@@ -80,8 +83,11 @@ def main():
 
     t0 = time.time()
     if a.implicit:
+        s.turb_sweeps = a.turb_sweeps
+        if a.turb_cfl:
+            s.turb_cfl_max = a.turb_cfl
         s.run(min(a.max_steps, 20000), chunk=100, first_order_steps=200, report=report, steady=True,
-              implicit=True, cfl_max=a.cfl_max, cfl_ramp=300)
+              implicit=True, cfl_max=a.cfl_max, cfl_ramp=300, explicit_finish=0 if a.no_finish else None)
     else:
         s.run(a.max_steps, chunk=2000, first_order_steps=500, report=report, steady=True, active_tiles=False)
     wall = time.time() - t0

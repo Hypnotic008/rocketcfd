@@ -684,10 +684,10 @@ class PatchGrid:
     def run(self, iters, chunk=50, first_order_steps=200, report=None, cfl_max=20.0, cfl_start=1.0,
             cfl_ramp=300, sweeps=8, snapshot=None, explicit_finish=None):
         """Implicit pseudo-time iterations on all grids together (see Solver.run(implicit=True)),
-        followed for turbulent runs by explicit local-time-step steps (explicit_finish, default
-        3 x iters; the implicit k-omega path settles a few per cent off the steady state)."""
+        optionally followed by explicit local-time-step steps (explicit_finish, default none: the
+        implicit k-omega path converges to the steady state since one sweep at CFL <= 5 is used)."""
         self._implicit_run(iters, chunk, first_order_steps, report, cfl_max, cfl_start, cfl_ramp, sweeps, snapshot)
-        nfin = explicit_finish if explicit_finish is not None else (3 * iters if self.base.turbulence else 0)
+        nfin = explicit_finish if explicit_finish is not None else 0
         if nfin:
             start = self.base.step_count
             fin_report = None if report is None else (lambda sv: (sv.step_count - start >= nfin // 3) and report(sv))

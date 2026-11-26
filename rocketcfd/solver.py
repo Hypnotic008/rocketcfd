@@ -131,6 +131,12 @@ class Solver:
         self.cache_lam = True       # implicit sweeps read cached spectral radii (lam_kernel)
         # implicit turbulent runs: pseudo-time CFL cap in wall-function cells (None = off)
         self.cfl_wall = None
+        # implicit k-omega: one point-implicit sweep per iteration at a pseudo-time CFL of at most 5.
+        # With 8 coupled sweeps at the mean-flow CFL (the earlier default) the iteration stalled in a
+        # CFL-dependent state a few per cent off the steady state (turbulent flat plate: Cf -1 % vs
+        # the explicit -6.3 %); with these settings it converges to the explicit answer (-6.1 %).
+        self.turb_sweeps = 1
+        self.turb_cfl_max = 5.0
         self._iface = None          # interface ghost-cell fill (rocketcfd.patches)
         self.owned = None           # cells whose surface loads this grid reports (rocketcfd.patches)
         self.gamma, self.cfl, self.limiter = gamma, cfl, limiter
@@ -949,18 +955,20 @@ class Solver:
                 self.dK2_buf = torch.zeros_like(self.K_buf)
                 self.dO2_buf = torch.zeros_like(self.O_buf)
                 w.update(dK2=wp.from_torch(self.dK2_buf), dO2=wp.from_torch(self.dO2_buf))
-            self._L(K.turb_rate_kernel, self.n, [w["W"], w["ix"], w["iy"], w["iz"], self._active_flux, self._vp, float(cfl), w["dtl"]])
+            cfl_t = min(float(cfl), float(self.turb_cfl_max)) if self.turb_cfl_max else float(cfl)
+            self._L(K.turb_rate_kernel, self.n, [w["W"], w["ix"], w["iy"], w["iz"], self._active_flux, self._vp, cfl_t, w["dtl"]])
             self._L(K.turb_residual_kernel, self.n, [w["W"], w["K"], w["O"], w["ix"], w["iy"], w["iz"], self._active_flux, w["blk"],
                               self._vp, w["Rk"], w["Rw"], w["Dk"], w["Dw"], w["utau"]])
             if dual is not None:
                 self._L(K.dual_time_turb_kernel, self.n, [w["Kn"], w["On"], w["Km"], w["Om"], w["Rk"], w["Rw"], w["Dk"], w["Dw"], *dual])
             tb = (("K1", "O1"), ("dK2", "dO2"))
-            for it in range(sweeps):
+            tsw = self.turb_sweeps or sweeps
+            for it in range(tsw):
                 (ko, oo), (kn, on) = tb[(it + 1) % 2], tb[it % 2]
                 self._L(K.turb_sweep_kernel, self.n, [w["W"], w["K"], w["O"], w["Rk"], w["Rw"], w["Dk"], w["Dw"], w["dtl"], self._vp,
                                   w["ix"], w["iy"], w["iz"], self._active_flux, w["blk"], int(it == 0),
                                   w[ko], w[oo], w[kn], w[on]])
-            kl, ol = tb[(sweeps - 1) % 2]
+            kl, ol = tb[(tsw - 1) % 2]
             self._L(K.turb_apply_kernel, self.n, [w["K"], w["O"], w[kl], w[ol], w["W"], self._vp, w["utau"],
                               1e-6 * self.k_inf, 1e-3 * self.omega_inf])
         bufs = ("U1", "dU2")
@@ -1075,7 +1083,7 @@ class Solver:
             # steady state the explicit scheme reaches from the same start (flat plate: Cf -1 %
             # vs -6 % from White). Finish with explicit local-time-step steps, which then move
             # it there in a fraction of the explicit-only cost. Default: on for turbulent runs.
-            nfin = explicit_finish if explicit_finish is not None else (nsteps * 3 if self.turbulence else 0)
+            nfin = explicit_finish if explicit_finish is not None else 0
             if nfin:
                 if self.verbose:
                     print(f"explicit finish: up to {nfin} local-time-step steps", flush=True)
