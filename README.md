@@ -81,28 +81,34 @@ guessed aero coefficients in CatchSim (`quatsim/aero.py`).
 ```bash
 git pull
 pip install -r requirements.txt                              # adds PySide6 + pyvistaqt for the app
-python tests/run_checks.py                                   # ~minutes: confirms this machine matches
-# 0. how much faster is the split residual on this GPU? (compare with 0.73 s/step, 0.74 s/iter before)
+python tests/run_checks.py                                   # ~minutes: confirms this machine matches (10 checks)
+# 0. speed of the new kernels on this GPU (before: 0.73 s per explicit step, 0.74 s per implicit iteration)
 python cases/super_heavy_descent.py --h 0.3 --fins parametric --fin-h 0.06 --engine-h 0.06 --aoa 15 --windward 0 --profile 20
-# LES movie of the booster wake (no patches: 1.8 M cells; ~1 flow-through per few minutes)
-python cases/super_heavy_descent.py --h 0.3 --fins parametric --aoa 15 --windward 0 --les --flowthroughs 3 --snapshots 200 --snap-volume 1 --out results/les_wake   # ~1.2 GB of frames
-python -m rocketcfd.cinematic results/les_wake --mode evolve --style lava
-# viscous RANS with a boundary-layer shell (22 M cells, ~4.1 GB)
-python cases/super_heavy_descent.py --h 0.3 --fins parametric --fin-h 0.06 --engine-h 0.06 --turbulent --wall-h 0.25,0.03,0.03 --wall-shell 0.3 --patch-box 32,48,48 --aoa 15 --windward 0 --out results/glide_rans
-# 1. inviscid glide case with local refinement, to compare with the slab-refined result
-#    (CD 3.532, CN 1.616, C_restore +0.011 at 34 M cells)
-python cases/super_heavy_descent.py --h 0.3 --fins parametric --fin-h 0.06 --engine-h 0.06 --aoa 15 --windward 0 --out results/glide_patch
-# 2. the same, finer (grid convergence of the patch setup)
-python cases/super_heavy_descent.py --h 0.25 --fins parametric --fin-h 0.04 --engine-h 0.04 --aoa 15 --windward 0 --out results/glide_patch_fine
-# 3. a quick aero database, then the full one (overnight) -> aero_db.json for CatchSim
+# 1. inviscid glide with patches (5.5 M cells now; compare with the run made before this update)
+python cases/super_heavy_descent.py --h 0.3 --fins parametric --fin-h 0.06 --engine-h 0.06 --aoa 15 --windward 0 --out results/glide_patch2
+# 2. quick aero database, then the full one (overnight) -> aero_db.json for CatchSim
 python cases/aero_database.py --mach 2.8 2.0 1.3 0.9 --aoa 0 8 16 --roll 0 180 --out results/db_quick
 python cases/aero_database.py --out results/aero_db
-# 4. isolated grid fin Mach sweep with the current numerics (the fin table below predates them);
-#    prints the supersonic cascade-theory slope next to each result
+# 3. pictures and movies
+#    a) LES of the booster wake (1.8 M cells), started from the steady glide run, with probes
+python cases/super_heavy_descent.py --h 0.3 --fins parametric --aoa 15 --windward 0 --les --flowthroughs 3 --snapshots 200 --snap-volume 1 --probes --restart results/glide_patch2 --out results/les_wake
+python -m rocketcfd.cinematic results/les_wake --mode evolve --style lava
+#    b) hot staging (4.8 M cells, 0.25 s)
+python cases/hot_staging.py --h 0.4 --ring-h 0.1 --time 0.25 --snapshots 150 --snap-volume 1 --probes --out results/hot_staging
+python -m rocketcfd.cinematic results/hot_staging --mode evolve --style plume
+#    c) landing burn (4.3 M cells)
+python cases/super_heavy_descent.py --mach 0.4 --alt 2000 --aoa 0 --h 0.3 --fins parametric --engines centre --engine-h 0.1 --plume-h 0.15 --upstream 45 --out results/landing_burn
+python -m rocketcfd.cinematic results/landing_burn --mode orbit --style plume
+#    d) Starship re-entry
+python cases/starship_reentry.py --h 0.3 --out results/reentry
+python -m rocketcfd.cinematic results/reentry --mode orbit --style mach
+# 4. viscous RANS with a boundary-layer shell (22 M cells, ~4.1 GB; finishes with explicit steps)
+python cases/super_heavy_descent.py --h 0.3 --fins parametric --fin-h 0.06 --engine-h 0.06 --turbulent --wall-h 0.25,0.03,0.03 --wall-shell 0.3 --patch-box 32,48,48 --aoa 15 --windward 0 --restart results/glide_patch2 --out results/glide_rans
+# 5. isolated grid fin Mach sweep with the current numerics
 python cases/grid_fin.py --implicit --h 0.025 --out results/grid_fin_v2
-# 5. viscous: does SST separate from a smooth cylinder once the boundary layer is resolved?
-python cases/validate_cylinder_turbulent.py --dual --patch-h 0.001 --shell 0.06
 ```
+
+All of these are also in the app (`python -m rocketcfd.app`), as case templates and presets.
 
 ### Validation
 
@@ -474,6 +480,18 @@ the engines light; the booster's centre-engine plumes at the far end.
 The plume-to-ambient pressure ratio at staging altitude is ~10^4: the density / pressure floors keep
 the run going and the near-field (interstage, dome, vents) is the meaningful part; the outer plume
 expanding into near vacuum is qualitative. One gas (see Engine plumes).
+
+## Starship re-entry
+
+`cases/starship_reentry.py`: the ship alone, belly first at high angle of attack (default Mach 8,
+55 km, 65 deg), flaps out; steady implicit inviscid solution, axial / normal force and pitching
+moment. One perfect gas: above Mach ~6 real air dissociates, so the shock layer here is too hot
+and stands off too far; shapes, pressures and moments are first-order.
+
+```bash
+python cases/starship_reentry.py --mach 8 --alt 55000 --aoa 65 --h 0.3 --out results/reentry
+python -m rocketcfd.cinematic results/reentry --mode orbit --style mach
+```
 
 ## Restarts
 

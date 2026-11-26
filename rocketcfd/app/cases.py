@@ -255,7 +255,26 @@ HOT_STAGING = Case(
     dry_run=True, gpu_minutes="minutes (quick test) to ~1-2 h (movie)")
 
 
-CASES = [SUPER_HEAVY, AERO_DB, HOT_STAGING, GRID_FIN, CYLINDER, TGV, PLATE]
+REENTRY = Case(
+    "Starship re-entry - belly first at high angle of attack",
+    "cases/starship_reentry.py",
+    "Starship falling belly-first (~65 deg angle of attack), flaps out: bow shock, shock layer and wake; "
+    "normal / axial force and pitching moment. One perfect gas: shock-layer temperatures above Mach ~6 "
+    "are too high.",
+    [
+        Field("mach", "Mach number", "float", 8.0, "", "Flight condition", lo=1.5, hi=30, step=1),
+        Field("alt", "Altitude [m]", "float", 55000.0, "", "Flight condition", lo=0, hi=90000, step=1000, decimals=0),
+        Field("aoa", "Angle of attack [deg]", "float", 65.0, "", "Flight condition", lo=0, hi=90, step=5),
+        Field("h", "Cell size near the ship [m]", "float", 0.5, "", "Grid", lo=0.05, hi=2, step=0.05),
+        Field("iters", "Max implicit iterations", "int", 3000, "", "Solver", lo=50, hi=50000, step=500),
+        Field("cfl-max", "Implicit CFL", "float", 10.0, "", "Solver", lo=1, hi=100, step=5, advanced=True),
+        Field("out", "Results folder", "text", "results/reentry", "", "Output", always=True),
+    ],
+    presets={"Quick look (1 m cells)": dict(h=1.0, iters=800), "Standard (0.3 m)": dict(h=0.3)},
+    dry_run=True, gpu_minutes="5-30 min")
+
+
+CASES = [SUPER_HEAVY, AERO_DB, HOT_STAGING, REENTRY, GRID_FIN, CYLINDER, TGV, PLATE]
 
 
 def command_line(case, values):
