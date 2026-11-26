@@ -191,6 +191,14 @@ class AnimPage(QtWidgets.QWidget):
         self.files = sorted(glob.glob(os.path.join(sd, "snap_*.npz")))
         self.mesh = dict(np.load(os.path.join(sd, "mesh.npz"))) if os.path.exists(os.path.join(sd, "mesh.npz")) else None
         self.slider.setRange(0, max(len(self.files) - 1, 0))
+        if self.files:                    # colour range from the last frame
+            last = np.load(self.files[-1])
+            m = np.asarray(last["mach_xz"], np.float32)
+            m = m[np.isfinite(m)]
+            if m.size:
+                self.vmax.blockSignals(True)
+                self.vmax.setValue(float(np.round(np.percentile(m, 99.5), 1)) or 1.0)
+                self.vmax.blockSignals(False)
         self.slider.setValue(0)
         self._frame(0)
         self._list_movies()
