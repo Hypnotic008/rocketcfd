@@ -52,7 +52,8 @@ def main(argv=None):
     R = S.radius
     lo = (-30.0, -30.0, -40.0)
     hi = (L + 20.0, 30.0, 25.0)
-    zones = [Zone((-1.0, -R - 4.5, -R - 1.5), (L + 1.0, R + 4.5, R + 3.0), a.h, "ship")]
+    # refined zone holding the bow shock off the belly (+z) and the near wake on the lee side (-z)
+    zones = [Zone((-4.0, -R - 5.0, -R - 7.0), (L + 4.0, R + 5.0, R + 6.0), a.h, "ship + shock layer")]
     faces = stretched_faces(lo, hi, 4 * a.h, zones, growth=a.growth)
     print(describe(faces))
     if a.dry_run:
