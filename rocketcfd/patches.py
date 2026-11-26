@@ -616,6 +616,10 @@ class PatchGrid:
         with torch.no_grad():
             while done < steps:
                 k = min(chunk, steps - done)
+                # early in a run (and right after the switch to second order) check every 50
+                # steps, so a divergence is caught while the bad region is still small and local
+                if self.base.step_count < max(2000, first_order_steps + 600):
+                    k = min(k, 50)
                 tsum = torch.zeros((), dtype=self.base.dtype, device=self.base.device)
                 for kk in range(k):
                     rs = []
@@ -675,7 +679,13 @@ class PatchGrid:
                                      f"{tuple(int(v) for v in ijk)} of {tuple(mt.shape)}, rho k {float(g.K_buf[ijk]):.3g}, "
                                      f"rho omega {float(g.O_buf[ijk]):.3g}, phi {float(g.phi[ijk]):.2f}")
                 if n:
-                    idx = torch.nonzero(bad)[0].tolist()
+                    # where the bad cells are (bounding box): the first index in array order
+                    # only shows a corner once the whole grid has gone bad
+                    nz = torch.nonzero(bad)
+                    lo_ = [float(g.axes[d][int(nz[:, d].min()) + NG]) for d in range(3)]
+                    hi_ = [float(g.axes[d][int(nz[:, d].max()) + NG]) for d in range(3)]
+                    kinds.append("box " + " .. ".join("(" + ", ".join(f"{v:.2f}" for v in b) + ")" for b in (lo_, hi_)))
+                    idx = nz[0].tolist()
                     xyz = [float(g.axes[d][idx[d] + NG]) for d in range(3)]
                     ph = float(g.phi[idx[0] + NG, idx[1] + NG, idx[2] + NG])
                     out.append(f"grid {gi} ({'base' if gi == 0 else 'patch'}, h {tuple(np.round(g.h, 3))}): {n} bad cells, "
