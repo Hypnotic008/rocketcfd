@@ -90,7 +90,7 @@ guessed aero coefficients in CatchSim (`quatsim/aero.py`).
 ```bash
 git pull
 pip install -r requirements.txt                              # adds PySide6 + pyvistaqt for the app
-python tests/run_checks.py                                   # ~minutes: confirms this machine matches (10 checks)
+python tests/run_checks.py                                   # ~minutes: confirms this machine matches (9 checks)
 # 0. speed of the new kernels on this GPU (before: 0.73 s per explicit step, 0.74 s per implicit iteration)
 python cases/super_heavy_descent.py --h 0.3 --fins parametric --fin-h 0.06 --engine-h 0.06 --aoa 15 --windward 0 --profile 20
 # 1. inviscid glide with patches (5.5 M cells now; compare with the run made before this update)
