@@ -45,11 +45,20 @@ def frame_coefficients(row, roll_deg):
                 CD=row["CD"])
 
 
-def build_database(csv_path, reference, fin_names=("rudder fin", "catch fin 90", "catch fin 270")):
-    rows = []
+def build_database(csv_path, reference, fin_names=("rudder fin", "catch fin 90", "catch fin 270"),
+                   max_cd_scatter=None):
+    """max_cd_scatter: drop cases whose drag fluctuated by more than this fraction of its mean over
+    the averaging window (unsteady, e.g. bow-shock / base buzz at high Mach and low incidence);
+    their cells are filled from the angle-of-attack trend at the nearest Mach that has them."""
+    rows, rejected = [], []
     with open(csv_path) as fh:
         for r in csv.DictReader(fh):
-            rows.append({k: (float(v) if v not in ("", None) and k != "converged" else v) for k, v in r.items()})
+            row = {k: (float(v) if v not in ("", None) and k != "converged" else v) for k, v in r.items()}
+            if (max_cd_scatter is not None and row.get("CD_std") not in (None, "")
+                    and abs(row["CD_std"]) > max_cd_scatter * abs(row["CD"])):
+                rejected.append((row["mach"], row["aoa"], row["roll"]))
+                continue
+            rows.append(row)
     mach = sorted({r["mach"] for r in rows})
     aoa = sorted({r["aoa"] for r in rows})
     roll = sorted({r["roll"] for r in rows if r["aoa"] > 0} or {0.0})
@@ -71,14 +80,28 @@ def build_database(csv_path, reference, fin_names=("rudder fin", "catch fin 90",
                 if hk in r and r[hk] not in ("", None):
                     tab[hk][i, j, k] = r[hk]
             conv[i, j, k] = str(r.get("converged", "True")) in ("True", "1", "1.0")
-    # fill holes along the angle-of-attack axis (nearest computed incidence at that Mach / roll)
+    # fill holes: from the angle-of-attack trend at the nearest Mach that has both incidences
+    # (anchored on this Mach's nearest computed incidence); where no neighbour helps, the
+    # nearest computed incidence at this Mach / roll
+    filled = []
     for key, T in tab.items():
+        T0 = T.copy()
         for i in range(shape[0]):
             for k in range(shape[2]):
-                col = T[i, :, k]
+                col = T0[i, :, k]
                 ok = np.isfinite(col)
-                if ok.any() and not ok.all():
-                    T[i, :, k] = np.interp(aoa, np.array(aoa)[ok], col[ok])
+                if not ok.any() or ok.all():
+                    continue
+                for j in np.flatnonzero(~ok):
+                    jr = np.flatnonzero(ok)[np.argmin(np.abs(np.array(aoa)[ok] - aoa[j]))]
+                    v = np.nan
+                    for i2 in sorted(range(shape[0]), key=lambda q: abs(mach[q] - mach[i])):
+                        if i2 != i and np.isfinite(T0[i2, j, k]) and np.isfinite(T0[i2, jr, k]):
+                            v = col[jr] + (T0[i2, j, k] - T0[i2, jr, k])
+                            break
+                    T[i, j, k] = v if np.isfinite(v) else col[jr]
+                    if key == "CD":
+                        filled.append((mach[i], aoa[j], roll[k]))
     # quasi-steady pitch damping (CatchSim's cm_q, positive = damping) from the region breakdown:
     # pitching at rate q changes the incidence of a region at lever arm l (from x_ref) by q l / V,
     # so with that region's normal-force slope CN_a: dM = -CN_a (q l / V) l q_inf S, i.e.
@@ -104,7 +127,23 @@ def build_database(csv_path, reference, fin_names=("rudder fin", "catch fin 90",
                 lever = cr / cn                              # l / L
                 tot += 2.0 * (cn / sa) * lever ** 2
             cmq[i, k] = tot
+    # each fin's own lift slope (per radian of its local incidence, on S_ref): at roll 0 / 180 the
+    # crossflow lies in the catch fins' plane of action, so their normal force over sin(aoa) at the
+    # smallest incidence. Deflecting a fin about its hinge changes its local incidence the same way,
+    # so this is also a first estimate of the per-fin control derivative (until deflected-fin
+    # sweeps give the real one).
+    fin_slope = []
+    for m in mach:
+        vals = []
+        for r in rows:
+            if r["mach"] == m and r["aoa"] > 0 and r["roll"] in (0.0, 180.0):
+                cn = [r.get(f"CN[{n}]") for n in fin_names[1:]]
+                if all(c not in (None, "") for c in cn):
+                    vals.append((r["aoa"], np.mean(np.abs(cn)) / np.sin(np.radians(r["aoa"]))))
+        fin_slope.append(min(vals)[1] if vals else None)
     return dict(
+        fin_cn_alpha=dict(mach=mach, per_rad=fin_slope,
+                          note="one fin's normal-force slope on S_ref per radian of its local incidence"),
         cm_q_quasi_steady=np.where(np.isfinite(cmq), cmq, None).tolist(),
         description="Super Heavy V3 aerodynamic coefficients from rocketcfd (see rocketcfd/catchsim_export.py "
                     "for axes and signs). Inviscid unless noted.",
@@ -116,6 +155,8 @@ def build_database(csv_path, reference, fin_names=("rudder fin", "catch fin 90",
         tables={k: np.where(np.isfinite(v), v, None).tolist() for k, v in tab.items()},
         converged=conv.tolist(),
         mirror_sign=MIRROR_SIGN,
+        rejected_unsteady=rejected,
+        filled=filled,
     )
 
 
