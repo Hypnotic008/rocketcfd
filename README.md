@@ -444,6 +444,15 @@ python -m rocketcfd.cinematic results/glide_patch --mode orbit --style lava    #
 python -m rocketcfd.cinematic results/les_wake --mode evolve                   # flow evolving in time
 ```
 
+Flow movies with the full 3-D model (high-resolution body + the grid fins at their deflections):
+
+```bash
+python -m rocketcfd.cinematic results/les_wake --mode flow                  # tracer streaks past the hull and through the fins, coloured by Mach
+python -m rocketcfd.cinematic results/les_wake --mode flow --camera fins    # close-up of the grid fins
+python -m rocketcfd.cinematic results/les_wake --mode schlieren             # side-on schlieren film, no model (--plane xy for the other plane)
+python -m rocketcfd.cinematic results/glide_patch --mode flow-orbit         # streaks on a steady result
+```
+
 Styles: `lava` (vortex surfaces coloured by Mach over a greyscale schlieren plane, black
 background), `schlieren`, `mach`, `pressure`, `plume` (hot exhaust as a glowing temperature volume
 and a hot-gas surface coloured by Mach, over schlieren). `evolve` needs a run with `--snapshots N

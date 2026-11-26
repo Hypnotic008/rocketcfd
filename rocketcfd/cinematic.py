@@ -295,7 +295,12 @@ def render_evolve(folder, out, style="lava", width=1920, height=1080, fps=30, q=
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("folder")
-    ap.add_argument("--mode", choices=["still", "orbit", "evolve"], default="still")
+    ap.add_argument("--mode", choices=["still", "orbit", "evolve", "schlieren", "flow", "flow-orbit"], default="still",
+                    help="schlieren: 2-D side-on schlieren film of the snapshots (no model); flow: the 3-D model "
+                         "with tracer streaks through the recorded flow; flow-orbit: the same on a steady result")
+    ap.add_argument("--plane", choices=["xz", "xy"], default="xz", help="schlieren: plane through the axis")
+    ap.add_argument("--camera", choices=["three-quarter", "fins"], default="three-quarter", help="flow: framing")
+    ap.add_argument("--no-vortices", action="store_true", help="flow: tracer streaks only")
     ap.add_argument("--style", choices=STYLES, default="lava")
     ap.add_argument("--out", default=None, help="output file (default: in the results folder)")
     ap.add_argument("--width", type=int, default=1920)
@@ -307,8 +312,15 @@ def main(argv=None):
     ap.add_argument("--title", default=None)
     a = ap.parse_args(argv)
     ext = "png" if a.mode == "still" else "mp4"
-    out = a.out or os.path.join(a.folder, f"cinematic_{a.mode}_{a.style}.{ext}")
-    if a.mode == "still":
+    tag = a.style if a.mode in ("still", "orbit", "evolve") else (a.plane if a.mode == "schlieren" else a.camera)
+    out = a.out or os.path.join(a.folder, f"cinematic_{a.mode}_{tag}.{ext}")
+    prog = lambda i, n: print(f"frame {i}/{n}", flush=True)
+    if a.mode == "schlieren":
+        render_schlieren2d(a.folder, out, a.plane, a.width, a.height, a.fps, title=a.title, progress=prog)
+    elif a.mode in ("flow", "flow-orbit"):
+        render_flow(a.folder, out, a.width, a.height, a.fps, a.q, a.title, a.frames,
+                    "evolve" if a.mode == "flow" else "orbit", prog, not a.no_vortices, a.camera)
+    elif a.mode == "still":
         render_still(a.folder, out, a.style, a.width, a.height, a.q, a.title)
     elif a.mode == "orbit":
         render_orbit(a.folder, out, a.style, a.width, a.height, a.frames, a.fps, a.q, a.title)
@@ -316,6 +328,293 @@ def main(argv=None):
         render_evolve(a.folder, out, a.style, a.width, a.height, a.fps, a.q, a.title, a.every,
                       progress=lambda i, n: print(f"frame {i}/{n}", flush=True))
     print(f"wrote {out}")
+
+
+
+
+# ---------------------------------------------------------------- vehicle model for movies
+def vehicle_meshes(meta=None, h=0.06):
+    """High-resolution booster body (cached STL, made once from the geometry) plus the grid fins at
+    their deflections (rocketcfd.viewer.fin_meshes). Returns (body, [fins])."""
+    from .viewer import fin_meshes
+    root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "results")
+    os.makedirs(root, exist_ok=True)
+    path = os.path.join(root, f"_body_v3_h{h:g}.stl")
+    if not os.path.exists(path):
+        from .vehicles.super_heavy import super_heavy_sdf, v3_params
+        from .output import write_stl_chunked
+        P = v3_params(fin_model="none")
+        print(f"building the body model ({h} m, once) -> {path}", flush=True)
+        write_stl_chunked(lambda X, Y, Z: super_heavy_sdf(X, Y, Z, P), (-0.8, -6.2, -6.2), (P.length + 0.2, 6.2, 6.2), h, path)
+    body = pv.read(path).smooth(n_iter=15)
+    fins = fin_meshes(meta or {"fins": {"model": "parametric"}})
+    return body, fins
+
+
+def add_vehicle(pl, body, fins, color="#c9ced6"):
+    pl.add_mesh(body, color=color, ambient=0.22, diffuse=0.75, specular=0.5, specular_power=30, smooth_shading=True)
+    for f in fins:
+        pl.add_mesh(f, color="#9aa2ad", ambient=0.25, diffuse=0.7, specular=0.3)
+
+
+# ---------------------------------------------------------------- 2-D schlieren movie (no model)
+def render_schlieren2d(folder, out, plane="xz", width=1920, height=1080, fps=30, k=6.0, h_img=0.06,
+                       title=None, progress=None):
+    """Side-on numerical schlieren of the recorded 3-D snapshots, like a wind-tunnel schlieren film:
+    density gradient on the plane through the axis, dark = steep; the vehicle is a black silhouette."""
+    import imageio.v2 as iio
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from scipy.interpolate import RegularGridInterpolator
+    sd = os.path.join(folder, "snapshots")
+    mesh = dict(np.load(os.path.join(sd, "mesh.npz")))
+    if "vx" not in mesh:
+        raise SystemExit("needs 3-D snapshots: run with --snapshots N --snap-volume 1")
+    files = sorted(glob.glob(os.path.join(sd, "snap_*.npz")))
+    x, y, z = mesh["vx"].astype(float), mesh["vy"].astype(float), mesh["vz"].astype(float)
+    if plane == "xz":
+        j = int(np.argmin(np.abs(y)))
+        a_ax, b_ax, take = x, z, (lambda A: A[:, j, :])
+    else:
+        j = int(np.argmin(np.abs(z)))
+        a_ax, b_ax, take = x, y, (lambda A: A[:, :, j])
+    solid = take(mesh["vol_solid"]).astype(float)
+    # uniform image grid (the solver grid is stretched)
+    A = np.arange(a_ax[0], a_ax[-1], h_img)
+    B = np.arange(b_ax[0], b_ax[-1], h_img)
+    AA, BB = np.meshgrid(A, B, indexing="ij")
+    pts = np.stack([AA.ravel(), BB.ravel()], -1)
+    mask = RegularGridInterpolator((a_ax, b_ax), solid, bounds_error=False, fill_value=0.0)(pts).reshape(AA.shape) > 0.5
+
+    def grad_image(snap):
+        # gradient on the solver grid (no interpolation overshoot at shocks), then linear resampling
+        rho = take(snap["vol_rho"].astype(np.float32)).astype(float)
+        ga, gb = np.gradient(rho, a_ax, b_ax)
+        g = np.hypot(ga, gb)
+        g[solid > 0.5] = 0.0
+        return RegularGridInterpolator((a_ax, b_ax), g, bounds_error=False, fill_value=0.0)(pts).reshape(AA.shape)
+
+    ref = float(np.percentile(grad_image(np.load(files[-1]))[~mask], 99.0)) or 1.0
+    dpi = 100
+    writer = iio.get_writer(out, fps=fps, codec="libx264", quality=8, macro_block_size=8)
+    for i, fpath in enumerate(files):
+        snap = np.load(fpath)
+        g = grad_image(snap)
+        img = np.exp(-k * np.minimum(g / ref, 1.0))
+        img[mask] = 0.0
+        fig = plt.figure(figsize=(width / dpi, height / dpi), dpi=dpi, facecolor="black")
+        ax = fig.add_axes([0, 0, 1, 1])
+        ax.imshow(img.T, origin="lower", cmap="gray", vmin=0.0, vmax=1.0, extent=(A[0], A[-1], B[0], B[-1]),
+                  interpolation="bicubic", aspect="equal")
+        ax.set_axis_off()
+        txt = (title + "   " if title else "") + f"t = {float(snap['t']) * 1e3:.1f} ms"
+        ax.text(0.01, 0.97, txt, transform=ax.transAxes, color="white", fontsize=14, va="top")
+        fig.canvas.draw()
+        frame = np.asarray(fig.canvas.buffer_rgba())[..., :3]
+        plt.close(fig)
+        writer.append_data(frame)
+        if progress:
+            progress(i + 1, len(files))
+    writer.close()
+    return out
+
+
+# ---------------------------------------------------------------- particles through the flow
+class Tracers:
+    """Massless tracer particles emitted from a ring around the vehicle upstream and carried by the
+    (possibly changing) velocity field; drawn as short streaks coloured by Mach."""
+
+    def __init__(self, axes, bb, flow_dir, n_per_frame=110, tail=5, r_in=3.6, r_out=9.5, seed=1, target=None,
+                 upstream=None, max_age=None):
+        self.ax = axes
+        self.rng = np.random.default_rng(seed)
+        self.n = n_per_frame
+        self.tail = tail
+        self.dir = np.asarray(flow_dir, float) / np.linalg.norm(flow_dir)
+        c = np.array([(bb[0] + bb[1]) / 2, 0.0, 0.0])
+        L = bb[1] - bb[0]
+        # emitter: a ring perpendicular to the flow, `upstream` metres before `target` along the flow
+        # (default: just ahead of the vehicle), so the particles arrive where the camera looks
+        if target is None:
+            self.origin = c - self.dir * (0.5 * L + 4.0)
+        else:
+            self.origin = np.asarray(target, float) - self.dir * upstream
+        tmp = np.array([0.0, 1.0, 0.0]) if abs(self.dir[1]) < 0.9 else np.array([0.0, 0.0, 1.0])
+        self.e1 = np.cross(self.dir, tmp); self.e1 /= np.linalg.norm(self.e1)
+        self.e2 = np.cross(self.dir, self.e1)
+        self.r_in, self.r_out = r_in, r_out
+        self.paths = np.zeros((0, tail, 3))
+        self.age = np.zeros(0, int)
+        self.max_age = max_age
+        self.lo = np.array([a[0] for a in axes]); self.hi = np.array([a[-1] for a in axes])
+
+    def emit(self):
+        r = np.sqrt(self.rng.uniform(self.r_in ** 2, self.r_out ** 2, self.n))     # a ring around the hull
+        th = self.rng.uniform(0, 2 * np.pi, self.n)
+        p = self.origin + (r * np.cos(th))[:, None] * self.e1 + (r * np.sin(th))[:, None] * self.e2
+        p += self.dir * self.rng.uniform(0.0, 2.0, self.n)[:, None]
+        new = np.repeat(p[:, None, :], self.tail, 1)
+        self.paths = np.concatenate([self.paths, new])
+        self.age = np.concatenate([self.age, np.zeros(self.n, int)])
+
+    def step(self, vel_interp, solid_interp, dt, substeps=4):
+        self.emit()
+        P = self.paths[:, -1].copy()
+        h = dt / substeps
+        for _ in range(substeps):
+            v1 = vel_interp(np.clip(P, self.lo, self.hi))
+            v2 = vel_interp(np.clip(P + 0.5 * h * v1, self.lo, self.hi))
+            P = P + h * v2
+        self.paths = np.concatenate([self.paths[:, 1:], P[:, None]], 1)
+        self.age += 1
+        inside = np.all((P > self.lo) & (P < self.hi), axis=1)
+        ok = inside & (solid_interp(np.clip(P, self.lo, self.hi)) < 0.5)
+        if self.max_age:
+            ok &= self.age < self.max_age
+        self.paths = self.paths[ok]
+        self.age = self.age[ok]
+
+    def polydata(self, mach_interp):
+        n, t, _ = self.paths.shape
+        if n == 0:
+            return None
+        pts = self.paths.reshape(-1, 3)
+        lines = np.hstack([np.full((n, 1), t), np.arange(n * t).reshape(n, t)]).ravel()
+        poly = pv.PolyData(pts, lines=lines)
+        poly.point_data["mach"] = mach_interp(np.clip(pts, self.lo, self.hi))
+        return poly
+
+
+def _interps(x, y, z, u, v, w, mach, solid):
+    from scipy.interpolate import RegularGridInterpolator as RGI
+    ax = (x, y, z)
+    iu, iv, iw = (RGI(ax, a, bounds_error=False, fill_value=0.0) for a in (u, v, w))
+    vel = lambda P: np.stack([iu(P), iv(P), iw(P)], -1)
+    im = RGI(ax, mach, bounds_error=False, fill_value=0.0)
+    isd = RGI(ax, solid.astype(float), bounds_error=False, fill_value=0.0)
+    return vel, im, isd
+
+
+def render_flow(folder, out, width=1920, height=1080, fps=30, q=None, title=None, frames=360, mode="evolve",
+                progress=None, show_vortices=True, camera="three-quarter"):
+    """The full 3-D model (body + grid fins) with tracer streaks flowing past the hull and through the
+    fins, coloured by Mach, and (optionally) vortex surfaces. mode 'evolve': the recorded snapshots
+    (particles carried by the changing flow); 'orbit': the steady flow.vtk with a slow camera move."""
+    meta = {}
+    mp = os.path.join(folder, "loads.json")
+    if os.path.exists(mp):
+        with open(mp) as fh:
+            meta = json.load(fh)
+    body, fins = vehicle_meshes(meta)
+    bb = body.bounds
+    if mode == "evolve":
+        sd = os.path.join(folder, "snapshots")
+        mesh = dict(np.load(os.path.join(sd, "mesh.npz")))
+        if "vx" not in mesh:
+            raise SystemExit("needs 3-D snapshots: run with --snapshots N --snap-volume 1")
+        files = sorted(glob.glob(os.path.join(sd, "snap_*.npz")))
+        x, y, z = (mesh[k].astype(float) for k in ("vx", "vy", "vz"))
+        solid = mesh["vol_solid"]
+
+        def frame_fields(i):
+            s = np.load(files[i])
+            u, v, w = (s[k].astype(np.float32).astype(float) for k in ("vol_u", "vol_v", "vol_w"))
+            u[solid], v[solid], w[solid] = 0, 0, 0
+            return s, u, v, w, s["mach_vol"].astype(np.float32).astype(float), float(s["t"])
+        nfr = len(files)
+    else:
+        fd = load_steady(folder)[0]
+        f, x, y, z = derived.grid_arrays(fd.base)
+        solid = f["phi"] < 0 if "phi" in f else np.zeros_like(f["rho"], bool)
+        u, v, w = (np.where(solid, 0.0, f[c]) for c in "uvw")
+        mach = f.get("mach", np.sqrt(u * u + v * v + w * w))
+        frame_fields = lambda i: (None, u, v, w, mach, 0.0)
+        nfr = frames
+    s0, u0, v0, w0, m0, _ = frame_fields(nfr - 1)
+    fluid = ~solid
+    vmean = np.array([np.mean(a[fluid]) for a in (u0, v0, w0)])
+    Vinf = float(np.linalg.norm(vmean))
+    # colour range from the flow near the vehicle (the far field would make everything one colour)
+    X3 = np.meshgrid(x, y, z, indexing="ij")
+    near = fluid & (np.hypot(X3[1], X3[2]) < 12.0) & (X3[0] > bb[0] - 5) & (X3[0] < bb[1] + 10)
+    mrange = [float(np.percentile(m0[near], 3)), float(np.percentile(m0[near], 99.5))]
+    from .vehicles.super_heavy import SuperHeavyParams
+    R_hull = SuperHeavyParams().radius
+    close = camera == "fins"
+    # emitter ring from just outside the hull to beyond the fin tips (fins reach R + 4.2 m)
+    if close:
+        tgt, up_d = (SuperHeavyParams().fin_x_center, 0.0, 0.0), 14.0
+    else:
+        tgt, up_d = (bb[0], 0.0, 0.0), 8.0
+    tr = Tracers((x, y, z), bb, vmean, n_per_frame=120 if close else 150, tail=6 if close else 5,
+                 r_in=R_hull + 0.3, r_out=R_hull + 6.0, target=tgt, upstream=up_d,
+                 max_age=int((up_d + 22.0) / 1.2) if close else None)
+    # particles should move ~1.2 m per frame on screen
+    dt_draw = 1.2 / max(Vinf, 1e-6)
+    if show_vortices:
+        g_last = pv.RectilinearGrid(x, y, z)
+        for nm, a in (("u", u0), ("v", v0), ("w", w0)):
+            g_last.point_data[nm] = np.ascontiguousarray(a.transpose(2, 1, 0)).reshape(-1)
+        g_last.point_data["velocity"] = np.column_stack([g_last.point_data[c] for c in "uvw"])
+        g_last.point_data["rho"] = np.ones(g_last.n_points)
+        g_last.point_data["p"] = np.ones(g_last.n_points)
+        derived.add_to_grid(g_last, ["Q"])
+        ql = q if q is not None else auto_q(g_last)
+    pl = setup_plotter(width, height)
+    c = np.array([(bb[0] + bb[1]) / 2, 0, 0])
+    L = bb[1] - bb[0]
+    pl.open_movie(out, framerate=fps, quality=8)
+    # warm up the tracers so the first frame is already full of streaks
+    _, u, v, w, m, _ = frame_fields(0)
+    vel, im, isd = _interps(x, y, z, u, v, w, m, solid)
+    for _ in range(int(((25.0 if close else L) + up_d) / 1.2) + 5):
+        tr.step(vel, isd, dt_draw)
+    for i in range(nfr):
+        s, u, v, w, m, t = frame_fields(i)
+        vel, im, isd = _interps(x, y, z, u, v, w, m, solid)
+        tr.step(vel, isd, dt_draw)
+        pl.clear_actors()
+        add_vehicle(pl, body, fins)
+        poly = tr.polydata(im)
+        if poly is not None:
+            pl.add_mesh(poly, scalars="mach", cmap="turbo", clim=mrange, line_width=2.6 if close else 1.6,
+                        render_lines_as_tubes=True,
+                        opacity=0.9,
+                        show_scalar_bar=(i == 0 or True),
+                        scalar_bar_args=dict(title="Mach", color="white", vertical=True, position_x=0.93,
+                                             position_y=0.2, height=0.6, width=0.025, fmt="%.1f"))
+        if show_vortices:
+            g = pv.RectilinearGrid(x, y, z)
+            for nm, a in (("u", u), ("v", v), ("w", w)):
+                g.point_data[nm] = np.ascontiguousarray(a.transpose(2, 1, 0)).reshape(-1)
+            g.point_data["mach"] = np.ascontiguousarray(m.transpose(2, 1, 0)).reshape(-1)
+            g.point_data["rho"] = np.ones(g.n_points)
+            g.point_data["p"] = np.ones(g.n_points)
+            derived.add_to_grid(g, ["Q"])
+            iso = g.contour([ql], scalars="Q")
+            if iso.n_points:
+                pl.add_mesh(iso.smooth(n_iter=15), scalars="mach", cmap="turbo", clim=mrange, opacity=0.55,
+                            smooth_shading=True, show_scalar_bar=False)
+        if title or mode == "evolve":
+            pl.add_text((title + "   " if title else "") + (f"t = {t * 1e3:.1f} ms" if mode == "evolve" else ""),
+                        position="upper_left", font_size=11, color="#c8ccd4")
+        # camera: slow drift around a three-quarter view (or a close-up of the fins)
+        a = np.radians(-35 + 30 * i / max(nfr - 1, 1))
+        if camera == "fins":
+            from .vehicles.super_heavy import SuperHeavyParams
+            fx = SuperHeavyParams().fin_x_center
+            ctr = np.array([fx - 2.0, 0.0, 2.0])
+            pos = ctr + 26.0 * np.array([-0.55 * np.cos(a), -np.cos(a) * 0.6 + np.sin(a) * 0.4, 0.45])
+        else:
+            ctr = c
+            pos = c + 1.05 * L * np.array([np.sin(a) * 0.5, -np.cos(a), 0.3])
+        pl.camera_position = [tuple(pos), tuple(ctr), (0, 0, 1)]
+        pl.write_frame()
+        if progress:
+            progress(i + 1, nfr)
+    pl.close()
+    return out
 
 
 if __name__ == "__main__":

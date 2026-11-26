@@ -11,6 +11,10 @@ from PySide6 import QtCore, QtWidgets
 from .common import ROOT, RESULTS, hint, mpl_canvas, new_process, open_path, python_exe, result_folders, style_axes
 
 MOVIES = [
+    ("Flow over the booster and through the fins (3-D model + tracer streaks, needs 3-D snapshots)", "-m rocketcfd.cinematic", ["--mode", "flow"]),
+    ("Flow through the grid fins, close-up (needs 3-D snapshots)", "-m rocketcfd.cinematic", ["--mode", "flow", "--camera", "fins"]),
+    ("Schlieren film, side view, no model (needs 3-D snapshots)", "-m rocketcfd.cinematic", ["--mode", "schlieren"]),
+    ("Flow streaks on a steady result (camera drift)", "-m rocketcfd.cinematic", ["--mode", "flow-orbit"]),
     ("Cinematic: flow evolving (LAVA style, needs 3-D snapshots)", "-m rocketcfd.cinematic", ["--mode", "evolve", "--style", "lava"]),
     ("Cinematic: orbit around the steady flow (LAVA style)", "-m rocketcfd.cinematic", ["--mode", "orbit", "--style", "lava"]),
     ("Cinematic: orbit, schlieren only", "-m rocketcfd.cinematic", ["--mode", "orbit", "--style", "schlieren"]),
