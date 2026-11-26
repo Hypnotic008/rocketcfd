@@ -202,6 +202,7 @@ class Solver:
         self._setup_bcs(bcs)
         self._setup_thin(thin_sdf, thin_box)
         self._setup_ib()
+        self.n_trapped = self._remove_trapped()
         dev = self.device
         if verbose:
             name = torch.cuda.get_device_name(dev) if dev.type == "cuda" else "cpu"
@@ -591,6 +592,55 @@ class Solver:
             self.blk[tuple(v[valid] for v in fa)] |= np.int32(1 << (3 + d))
             n_valid += int(valid.sum())
         self.n_thin_normals = n_valid
+
+    def _remove_trapped(self):
+        """Fluid cells that no open face connects to the rest of the flow (pockets boxed in by thin
+        plates and walls, e.g. inside a grid-fin lattice cell) can exchange nothing: their state is
+        meaningless and, under viscous wall terms, can run away. Treat them as solid."""
+        if not getattr(self, "has_thin", False) or not np.any(self.blk & 7):
+            return 0
+        from scipy.sparse import coo_matrix
+        from scipy.sparse.csgraph import connected_components
+        nz = np.nonzero(self.blk & 7)
+        lo = [max(int(a.min()) - 3, 0) for a in nz]
+        hi = [min(int(a.max()) + 4, self.blk.shape[d]) for d, a in enumerate(nz)]
+        box = tuple(slice(lo[d], hi[d]) for d in range(3))
+        fl = self.fluid[box]
+        b = self.blk[box]
+        shp = fl.shape
+        ids = np.arange(fl.size).reshape(shp)
+        rows, cols = [], []
+        for d in range(3):
+            if shp[d] < 2:
+                continue
+            a_sl = tuple(slice(0, -1) if e == d else slice(None) for e in range(3))
+            c_sl = tuple(slice(1, None) if e == d else slice(None) for e in range(3))
+            ok = fl[a_sl] & fl[c_sl] & (((b[a_sl] >> d) & 1) == 0)
+            rows.append(ids[a_sl][ok])
+            cols.append(ids[c_sl][ok])
+        r = np.concatenate(rows)
+        c = np.concatenate(cols)
+        g = coo_matrix((np.ones(r.size, np.int8), (r, c)), shape=(fl.size, fl.size))
+        _, lab = connected_components(g, directed=False)
+        edge = np.zeros(shp, bool)
+        for d in range(3):
+            if shp[d] > 1:
+                idx = [slice(None)] * 3
+                idx[d] = 0
+                edge[tuple(idx)] = True
+                idx[d] = -1
+                edge[tuple(idx)] = True
+        outside = np.unique(lab[(edge & fl).ravel()])
+        trapped = fl & ~np.isin(lab.reshape(shp), outside)
+        n = int(trapped.sum())
+        if n:
+            sub = self.fluid[box]
+            sub[trapped] = False
+            self.fluid[box] = sub
+            self.thin_solid[box] |= trapped
+            if self.verbose:
+                print(f"note: {n} fluid cells boxed in by thin walls treated as solid")
+        return n
 
     def _setup_ib(self):
         phi = self.phi
@@ -1371,7 +1421,24 @@ class Solver:
                 if tf is not None:
                     Wa_t = Wf[:, tf["a_t"]].double().cpu().numpy()
                     Wb_t = Wf[:, tf["b_t"]].double().cpu().numpy()
-        dp = pb.double().cpu().numpy() - self.W_inf[4]
+        # a non-physical cell state (e.g. a runaway cell boxed in by thin plates) must not wreck the
+        # totals: leave such samples out and say where they are
+        lim = 1e3 * self.W_inf[4]
+        pbn = pb.double().cpu().numpy()
+        bad_ib = ~np.isfinite(pbn) | (pbn <= 0) | (pbn > lim)
+        pbn = np.where(bad_ib, self.W_inf[4], pbn)
+        bad_t = None
+        if tf is not None:
+            bad_t = ~np.isfinite(pa) | (pa <= 0) | (pa > lim) | ~np.isfinite(pbb) | (pbb <= 0) | (pbb > lim)
+            pa = np.where(bad_t, self.W_inf[4], pa)
+            pbb = np.where(bad_t, self.W_inf[4], pbb)
+        n_bad = int(bad_ib.sum()) + (int(bad_t.sum()) if bad_t is not None else 0)
+        if n_bad and not getattr(self, "_warned_bad_loads", False):
+            where = sf["pos"][:, np.flatnonzero(bad_ib)[0]] if bad_ib.any() else tf["pos"][:, np.flatnonzero(bad_t)[0]]
+            print(f"WARNING loads: left out {n_bad} surface samples with a non-physical pressure "
+                  f"(first near x {where[0]:.2f}, y {where[1]:.2f}, z {where[2]:.2f} m)", flush=True)
+            self._warned_bad_loads = True
+        dp = pbn - self.W_inf[4]
         dF = sf["wF"] * dp                                  # (3, Nb)
         F_fric = np.zeros(3)
         if self.viscous and friction:
@@ -1392,7 +1459,8 @@ class Solver:
             dFt[tf["dir"], np.arange(mag.size)] = mag      # the a side pushes the wall toward +d
             if self.viscous and friction:
                 # shear on both wetted sides of each blocked face (tangential = the other two axes)
-                for Wt, flag, ykey in ((Wa_t, tf["fa"], "ya"), (Wb_t, tf["fb"], "yb")):
+                okf = (~bad_t).astype(float)
+                for Wt, flag, ykey in ((Wa_t, tf["fa"] * okf, "ya"), (Wb_t, tf["fb"] * okf, "yb")):
                     nrm = np.zeros((3, mag.size))
                     nrm[tf["dir"], np.arange(mag.size)] = 1.0
                     # only wetted sides: a non-fluid side can hold rho = 0 and 0 * NaN is NaN

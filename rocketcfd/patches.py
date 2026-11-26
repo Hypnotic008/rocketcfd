@@ -302,6 +302,7 @@ class PatchGrid:
             cells = [int(np.prod(s.n)) for s in self.grids]
             print(f"PatchGrid: base {cells[0]/1e6:.2f} M cells + {len(cells)-1} patches "
                   f"{sum(cells[1:])/1e6:.2f} M cells; {self.n_covered} covered coarse cells; "
+                  f"{sum(getattr(g, 'n_trapped', 0) for g in self.grids)} boxed-in cells made solid; "
                   f"setup {time.time()-t0:.1f} s")
 
     def _patch_bcs(self, g):
