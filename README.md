@@ -378,7 +378,19 @@ python cases/aero_database.py                               # default: 10 Mach x
 python cases/aero_database.py --mach 2.8 1.6 1.1 0.8 --aoa 0 8 16 --roll 0 180 --out results/db_quick
 ```
 
-`integrations/catchsim/aero_cfd.py` is a drop-in for CatchSim (copy it into `quatsim/`):
+**Using it in CatchSim:** CatchSim ships the drop-in (`quatsim/aero_cfd.py`) and takes the
+files directly:
+
+```bash
+python run_mission.py --aero-cfd results/aero_db/aero_db.json
+python run_mission.py --aero-cfd results/aero_db/aero_db.json --fin-cfd results/fin_control.json
+```
+
+`--aero-cfd` drives the forces and the airframe moment, for truth and guidance and in the Monte
+Carlo. `--fin-cfd` gives each of the three working grid fins its own CFD control derivatives.
+Past the table's last incidence (20°), crossflow terms are extrapolated with sin α.
+
+`integrations/catchsim/aero_cfd.py` is the drop-in itself:
 `CFDAeroModel` replaces `AeroModel` (full CFD force at the actual angle of attack and roll,
 grid fins included), `cfd_restoring_moment` replaces `restoring_moment` (full CFD moment about
 the centre of mass, plus CatchSim's pitch damping). It reads `aero_db.json`; the V3 layout's
