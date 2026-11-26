@@ -478,6 +478,12 @@ Each flow frame has five layers:
 The background is graded, and translucent layers are depth-peeled so they stack correctly.
 `--still-frame K` writes frame K as a PNG, to preview a look before rendering the whole movie.
 
+Refinement patches (for example `--fin-h 0.06` around the grid fins) are recorded into the 3-D
+snapshots at the same stride as the base grid, capped at 8 M patch cells. The flow movies sample
+the finest grid at every point, so the streaks thread the fin lattice from the 6 cm solution and
+the fins' Cp comes from it, instead of from base-grid cells about as large as the lattice
+spacing. Steady results do the same with `flow_patches.vtm`.
+
 Styles: `lava` (vortex surfaces coloured by Mach over a greyscale schlieren plane, black
 background), `schlieren`, `mach`, `pressure`, `plume` (hot exhaust as a glowing temperature volume
 and a hot-gas surface coloured by Mach, over schlieren). `evolve` needs a run with `--snapshots N

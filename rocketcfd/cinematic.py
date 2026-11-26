@@ -497,7 +497,12 @@ class Tracers:
         return poly
 
 
-def _interps(x, y, z, u, v, w, mach, solid):
+def _interps(x, y, z, u, v, w, mach, solid, plevels=()):
+    if plevels:
+        fg = _FinestGrid([((x, y, z), dict(u=u, v=v, w=w, mach=mach, solid=solid.astype(float)))]
+                         + [(ax_, {k: f_[k] for k in ("u", "v", "w", "mach", "solid")}) for ax_, f_ in plevels])
+        vel = lambda P: np.stack([fg("u", P), fg("v", P), fg("w", P)], -1)
+        return vel, (lambda P: fg("mach", P)), (lambda P: fg("solid", P))
     from scipy.interpolate import RegularGridInterpolator as RGI
     ax = (x, y, z)
     iu, iv, iw = (RGI(ax, a, bounds_error=False, fill_value=0.0) for a in (u, v, w))
@@ -505,6 +510,36 @@ def _interps(x, y, z, u, v, w, mach, solid):
     im = RGI(ax, mach, bounds_error=False, fill_value=0.0)
     isd = RGI(ax, solid.astype(float), bounds_error=False, fill_value=0.0)
     return vel, im, isd
+
+
+class _FinestGrid:
+    """Point sampling over the base grid and its refinement patches: each point takes its value
+    from the finest grid that contains it (patches applied coarse to fine)."""
+
+    def __init__(self, levels):
+        from scipy.interpolate import RegularGridInterpolator as RGI
+        self.levels = []
+        order = sorted(levels, key=lambda L: -min(float(np.min(np.diff(a))) for a in L[0]))
+        for axes, fields in order:
+            ints = {k: RGI(axes, a, bounds_error=False, fill_value=0.0) for k, a in fields.items()}
+            lo = np.array([a[0] for a in axes]); hi = np.array([a[-1] for a in axes])
+            self.levels.append((lo, hi, ints))
+
+    def __call__(self, name, P):
+        P = np.asarray(P, float)
+        out = self.levels[0][2][name](P)
+        for lo, hi, ints in self.levels[1:]:
+            inside = np.all((P > lo) & (P < hi), axis=1)
+            if inside.any():
+                out[inside] = ints[name](P[inside])
+        return out
+
+
+def _patch_level(x, y, z, u, v, w, rho, p, solid, gamma=1.4):
+    """One refinement patch as a _FinestGrid level (velocity, Mach, solid, wall-filled pressure)."""
+    u, v, w = (np.where(solid, 0.0, a) for a in (u, v, w))
+    mach = np.sqrt(u * u + v * v + w * w) / np.sqrt(gamma * np.maximum(p, 1e-6) / np.maximum(rho, 1e-9))
+    return ((x, y, z), dict(u=u, v=v, w=w, mach=mach, solid=solid.astype(float), pf=_fill_solid(p, solid)))
 
 
 def _rgrid(x, y, z, **fields):
@@ -632,6 +667,9 @@ def render_flow(folder, out, width=1920, height=1080, fps=30, q=None, title=None
         solid = mesh["vol_solid"].astype(bool)
         p_inf = float(mesh["p_inf"])
 
+        n_p = int(mesh.get("n_patches", 0))
+        gam = float(mesh.get("gamma", 1.4))
+
         def frame_fields(i):
             s = np.load(files[i])
             u, v, w = (s[k].astype(np.float32).astype(float) for k in ("vol_u", "vol_v", "vol_w"))
@@ -639,6 +677,19 @@ def render_flow(folder, out, width=1920, height=1080, fps=30, q=None, title=None
             rho = s["vol_rho"].astype(np.float32).astype(float)
             p = s["vol_dp"].astype(np.float32).astype(float) + p_inf
             return u, v, w, s["mach_vol"].astype(np.float32).astype(float), rho, p, float(s["t"])
+
+        def patch_levels(i):
+            if not n_p:
+                return []
+            s = np.load(files[i])
+            out = []
+            for k in range(n_p):
+                if f"p{k}_u" not in s:
+                    continue
+                g = lambda n: s[f"p{k}_{n}"].astype(np.float32).astype(float)
+                out.append(_patch_level(*(mesh[f"p{k}_{a}"].astype(float) for a in "xyz"), g("u"), g("v"), g("w"),
+                                        g("rho"), g("dp") + p_inf, mesh[f"p{k}_solid"].astype(bool), gam))
+            return out
         nfr = len(files)
     else:
         fd = load_steady(folder)[0]
@@ -650,6 +701,15 @@ def render_flow(folder, out, width=1920, height=1080, fps=30, q=None, title=None
         mach = f.get("mach", np.sqrt(u * u + v * v + w * w) / a_snd)
         p_inf = float(cond.get("p", np.median(p[~solid])))
         frame_fields = lambda i: (u, v, w, mach, rho, p, 0.0)
+        steady_patches = []
+        for gp in fd.patches:
+            fp, px, py, pz = derived.grid_arrays(gp)
+            if not all(k in fp for k in ("u", "v", "w", "rho", "p")):
+                continue
+            ps = fp["phi"] < 0 if "phi" in fp else np.zeros_like(fp["rho"], bool)
+            steady_patches.append(_patch_level(px, py, pz, fp["u"], fp["v"], fp["w"], fp["rho"].astype(float),
+                                               fp["p"].astype(float), ps))
+        patch_levels = lambda i: steady_patches
         nfr = frames
     u0, v0, w0, m0, rho0, p0, _ = frame_fields(nfr - 1)
     fluid = ~solid
@@ -698,18 +758,17 @@ def render_flow(folder, out, width=1920, height=1080, fps=30, q=None, title=None
         from scipy.ndimage import distance_transform_edt
         fill_idx = tuple(distance_transform_edt(solid, return_distances=False, return_indices=True))
 
-    def surface_cp(p_field):
+    def surface_cp(p_field, plevels=()):
         pf = p_field[fill_idx] if fill_idx is not None else p_field
-        from scipy.interpolate import RegularGridInterpolator as RGI
-        ip = RGI((x, y, z), pf, bounds_error=False, fill_value=p_inf)
+        fg = _FinestGrid([((x, y, z), dict(pf=pf))] + [(ax_, dict(pf=f_["pf"])) for ax_, f_ in plevels])
         out_m = []
         for m in [body] + list(fins):
             mm = m.copy()
-            mm.point_data["Cp"] = ((ip(np.asarray(mm.points)) - p_inf) / q_inf).astype(np.float32)
+            mm.point_data["Cp"] = ((fg("pf", np.asarray(mm.points)) - p_inf) / q_inf).astype(np.float32)
             out_m.append(mm)
         return out_m
     if surface == "cp":
-        cps = np.concatenate([np.asarray(m.point_data["Cp"]) for m in surface_cp(p0)])
+        cps = np.concatenate([np.asarray(m.point_data["Cp"]) for m in surface_cp(p0, patch_levels(nfr - 1))])
         cp_hi = float(max(abs(np.percentile(cps, 5)), abs(np.percentile(cps, 95)), 0.05))
         cp_range = [-cp_hi, cp_hi]
 
@@ -723,16 +782,16 @@ def render_flow(folder, out, width=1920, height=1080, fps=30, q=None, title=None
         pl.open_movie(out, framerate=fps, quality=8)
     # warm up the tracers so the first frame is already full of streaks
     u, v, w, m, rho, p, _ = frame_fields(0)
-    vel, im, isd = _interps(x, y, z, u, v, w, m, solid)
+    vel, im, isd = _interps(x, y, z, u, v, w, m, solid, patch_levels(0))
     for _ in range(int(((26.0 if close else L) + up_d) / 1.2) + trail + 5):
         tr.step(vel, isd, dt_draw)
     bar = dict(color="white", vertical=True, height=0.55, width=0.022, position_y=0.22, fmt="%.1f",
                title_font_size=14, label_font_size=12)
-    def field_layers(u, v, w, m, rho, p):
+    def field_layers(u, v, w, m, rho, p, plev=()):
         acts = _Actors()
         # vehicle
         if surface == "cp":
-            ms = surface_cp(p)
+            ms = surface_cp(p, plev)
             for k, mm in enumerate(ms):
                 acts.append_mesh(mm, scalars="Cp", cmap="coolwarm", clim=cp_range, smooth_shading=(k == 0),
                             ambient=0.25, diffuse=0.7, specular=0.35, specular_power=25,
@@ -777,7 +836,8 @@ def render_flow(folder, out, width=1920, height=1080, fps=30, q=None, title=None
     last_i = -1
     for i in frames_to_draw:
         u, v, w, m, rho, p, t = frame_fields(i)
-        vel, im, isd = _interps(x, y, z, u, v, w, m, solid)
+        plev = patch_levels(i)
+        vel, im, isd = _interps(x, y, z, u, v, w, m, solid, plev)
         for _ in range(max(1, i - last_i) if still_frame is not None else 1):
             tr.step(vel, isd, dt_draw)
         last_i = i
@@ -802,7 +862,7 @@ def render_flow(folder, out, width=1920, height=1080, fps=30, q=None, title=None
         key = i if mode == "evolve" else 0
         if layer_cache.get("key") != key:
             layer_cache.clear()
-            layer_cache.update(key=key, actors=field_layers(u, v, w, m, rho, p))
+            layer_cache.update(key=key, actors=field_layers(u, v, w, m, rho, p, plev))
         for mesh_, kw, tag in layer_cache["actors"]:
             if tag == "shock":
                 kw = dict(kw, opacity=kw["opacity"] * shock_fade)

@@ -16,7 +16,8 @@ NG = 2
 
 
 class SnapshotRecorder:
-    def __init__(self, solver, folder, q_inf, p_inf, region, half=15.0, volume_stride=0):
+    def __init__(self, solver, folder, q_inf, p_inf, region, half=15.0, volume_stride=0, patches=None,
+                 max_patch_cells=8e6):
         from skimage.measure import marching_cubes
         self.s = solver
         self.dir = os.path.join(folder, "snapshots")
@@ -69,11 +70,31 @@ class SnapshotRecorder:
                         vz=ax[2][self.vk].astype(np.float32),
                         vol_solid=solid[self.vi][:, self.vj][:, :, self.vk], rho_inf=float(solver.W_inf[0]),
                         gamma=float(solver.gamma))
+        # refinement patches (e.g. the 6 cm grids around the fins): their interiors at the same
+        # stride, so 3-D movies can draw the flow through the fins from the finest grid
+        self.patches = []
+        if volume_stride and patches:
+            total = 0
+            for g in patches:
+                ii = [np.arange(NG, len(a_) - NG)[::volume_stride] for a_ in g.axes]
+                n = int(np.prod([len(a_) for a_ in ii]))
+                if total + n > max_patch_cells:
+                    print(f"snapshots: patch volumes capped at {max_patch_cells / 1e6:.0f} M cells "
+                          f"({len(self.patches)} of {len(patches)} patches recorded)")
+                    break
+                total += n
+                k = len(self.patches)
+                mesh.update({f"p{k}_x": g.axes[0][ii[0]].astype(np.float32),
+                             f"p{k}_y": g.axes[1][ii[1]].astype(np.float32),
+                             f"p{k}_z": g.axes[2][ii[2]].astype(np.float32),
+                             f"p{k}_solid": (~g.fluid)[ii[0]][:, ii[1]][:, :, ii[2]]})
+                self.patches.append((g, ii))
+            mesh["n_patches"] = len(self.patches)
         np.savez_compressed(os.path.join(self.dir, "mesh.npz"), **mesh)
         self.k = 0
 
-    def _device_primitive(self):
-        s = self.s
+    def _device_primitive(self, s=None):
+        s = self.s if s is None else s
         if s.backend == "warp":
             s._wprim("U")
             return s.W_buf
@@ -104,5 +125,11 @@ class SnapshotRecorder:
             out["vol_v"] = sub(W[2]).half().cpu().numpy()
             out["vol_w"] = sub(W[3]).half().cpu().numpy()
             out["vol_dp"] = (sub(W[4]) - self.p_inf).half().cpu().numpy()
+        for k, (g, ii) in enumerate(self.patches):
+            Wg = self._device_primitive(g)               # (may share a scratch buffer: copy out now)
+            pi_, pj, pk = (torch.as_tensor(a_, device=Wg.device) for a_ in ii)
+            subp = lambda a_: a_[pi_][:, pj][:, :, pk].half().cpu().numpy()
+            out[f"p{k}_rho"], out[f"p{k}_u"], out[f"p{k}_v"], out[f"p{k}_w"] = (subp(Wg[c]) for c in range(4))
+            out[f"p{k}_dp"] = (Wg[4][pi_][:, pj][:, :, pk] - self.p_inf).half().cpu().numpy()
         np.savez_compressed(os.path.join(self.dir, f"snap_{self.k:04d}.npz"), **out)
         self.k += 1

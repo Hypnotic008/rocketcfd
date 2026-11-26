@@ -306,7 +306,8 @@ def main(argv=None):
     if a.snapshots:
         from rocketcfd.snapshots import SnapshotRecorder
         rec = SnapshotRecorder(s, a.out, q, p, ((-1.5, -6.6, -6.6), (L + 0.6, 6.6, 6.6)),
-                               volume_stride=a.snap_volume)
+                               volume_stride=a.snap_volume,
+                               patches=(runner.grids[1:] if patches else None))
         rec.record(0, 0.0)
         hooks.append((max(1, nsteps // a.snapshots), rec.record))
         print(f"recording a snapshot every {hooks[-1][0]} steps into {a.out}/snapshots")
