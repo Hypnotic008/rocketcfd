@@ -52,6 +52,11 @@ guessed aero coefficients in CatchSim (`quatsim/aero.py`).
   model. Patch runs advance all grids with one global time step (`run_explicit(time_accurate=True)`).
   Taylor-Green vortex, Re 1600, 32^3: dissipation peak 0.0117 at t 7.0 (DNS 0.0127 at t 9; a
   coarse grid peaks early); Vreman over-dissipates here (peak at t 5.5).
+* **Fixed: explicit k-omega SST steps on patch grids diverged.** Base cells covered by a patch had a
+  ~1e30 s local time step in the explicit turbulence update (their rate is masked to 0), which put
+  them at k = R_k / D_k; this blew up within two steps on the booster with a hull shell and would
+  have hit the explicit finish of every RANS patch run. Also the RK stage copies of k / omega now
+  get the patch-interface values. Divergence messages now name the first bad grid, cell and field.
 * **Visuals**: `rocketcfd.derived` (schlieren, Q, lambda-2, vorticity, T, Cp, total-pressure ratio),
   `rocketcfd.cinematic` (stills, orbits, time evolutions in the NASA LAVA style), 3-D snapshots
   now store the full state (rho, u, v, w, p) for movies.

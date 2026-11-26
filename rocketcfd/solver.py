@@ -808,7 +808,7 @@ class Solver:
         shape = tuple(self.U.shape[1:])
         self._L(K.prim_kernel, shape, [w[Ukey], self.gamma, self.rho_min, self.p_min, w["W"]])
         if self._iface is not None:
-            self._iface(self)
+            self._iface(self, tkey)
         self._fill_bc(self.W_buf)
         ib = self._wp_ib
         if ib is not None:
@@ -909,6 +909,10 @@ class Solver:
             torch.div(self.cfl, self.rate_buf.max(), out=self.dt_buf[0])
         if local and dt_fixed is None:
             torch.div(self.cfl, torch.clamp(self.rate_buf, min=1e-30), out=self.dtl_buf)
+            # cells this grid does not update (solid, covered by a finer patch) have rate 0 and so a
+            # ~1e30 s local step; zero it: the k-omega update does not check the mask, and with that
+            # step it put covered cells at k = R_k / D_k (explicit SST patch runs diverged)
+            self.dtl_buf.mul_(self.mask_f)
         elif tiles is None and getattr(self, "_tiles_on", False):
             self.dtl_buf.copy_(self.dt_buf[0].expand_as(self.dtl_buf))   # for the activity measure
         self._wresidual(order, tiles)

@@ -427,6 +427,7 @@ class PatchGrid:
                 n=dst.size,
                 d1=torch.as_tensor((co[p] + dst).astype(np.int32), device=dev),
                 d5=torch.as_tensor((5 * co[p] + dst).astype(np.int32), device=dev),
+                loc=torch.as_tensor(dst.astype(np.int64), device=dev),
                 s1=as_i(s1), s5=as_i(s5), sstr=as_i(sstr),
                 w=torch.as_tensor(np.concatenate(ws).astype(np.float32), device=dev))
             s._iface = self._make_hook(p)
@@ -550,7 +551,7 @@ class PatchGrid:
         return D["_wv"]
 
     def _make_hook(self, p):
-        def hook(s):
+        def hook(s, tkey=None):
             G = self.gather[p]
             v = self._warp_views(G)
             wp = self._wp
@@ -564,6 +565,13 @@ class PatchGrid:
                     v = self._warp_views(G)
                 for name in ("K", "O"):
                     s._L(self._gk, G["n"], [self._wbuf(name), 1, v["d1"], 0, v["s1"], v["zs"], v["w"]])
+                if tkey not in (None, "", "K"):
+                    # RK stage 2 works on the stage copies K1 / O1, which live outside the shared
+                    # buffers: give them the interface values too (they otherwise kept the start-up
+                    # freestream turbulence at every patch edge, and explicit SST patch runs diverged)
+                    loc = G["loc"]
+                    s.K1_buf.view(-1)[loc] = s.K_buf.reshape(-1)[loc]
+                    s.O1_buf.view(-1)[loc] = s.O_buf.reshape(-1)[loc]
         return hook
 
     def _wbuf(self, name):
@@ -650,12 +658,27 @@ class PatchGrid:
                     bad |= ~torch.isfinite(g.K_buf[NG:-NG, NG:-NG, NG:-NG]) | ~torch.isfinite(g.O_buf[NG:-NG, NG:-NG, NG:-NG])
                 bad &= g.update_mask
                 n = int(bad.sum())
+                kinds = []
+                if n:
+                    m = g.update_mask
+                    kinds.append(f"U {int((~torch.isfinite(U).all(0) & m).sum())}")
+                    kinds.append(f"rho<=0 {int(((U[0] <= 0) & m).sum())}")
+                    if g.turbulence:
+                        kinds.append(f"k {int((~torch.isfinite(g.K_buf[NG:-NG, NG:-NG, NG:-NG]) & m).sum())}")
+                        kinds.append(f"omega {int((~torch.isfinite(g.O_buf[NG:-NG, NG:-NG, NG:-NG]) & m).sum())}")
+                        mt = torch.nan_to_num(g.mut_buf, nan=-1.0, posinf=3e38)
+                        j = int(torch.argmax(mt))
+                        ijk = np.unravel_index(j, tuple(mt.shape))
+                        inner = all(NG <= ijk[d] < mt.shape[d] - NG for d in range(3))
+                        kinds.append(f"mut max {float(mt.reshape(-1)[j]):.3g} at {'interior' if inner else 'ghost'} "
+                                     f"{tuple(int(v) for v in ijk)} of {tuple(mt.shape)}, rho k {float(g.K_buf[ijk]):.3g}, "
+                                     f"rho omega {float(g.O_buf[ijk]):.3g}, phi {float(g.phi[ijk]):.2f}")
                 if n:
                     idx = torch.nonzero(bad)[0].tolist()
                     xyz = [float(g.axes[d][idx[d] + NG]) for d in range(3)]
                     ph = float(g.phi[idx[0] + NG, idx[1] + NG, idx[2] + NG])
                     out.append(f"grid {gi} ({'base' if gi == 0 else 'patch'}, h {tuple(np.round(g.h, 3))}): {n} bad cells, "
-                               f"first at ({xyz[0]:.2f}, {xyz[1]:.2f}, {xyz[2]:.2f}) m, wall distance {ph:.3f} m")
+                               f"first at ({xyz[0]:.2f}, {xyz[1]:.2f}, {xyz[2]:.2f}) m, wall distance {ph:.3f} m [{', '.join(kinds)}]")
         return "; ".join(out[:4]) or "no bad cells found"
 
     def run(self, iters, chunk=50, first_order_steps=200, report=None, cfl_max=20.0, cfl_start=1.0,

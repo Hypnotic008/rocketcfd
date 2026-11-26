@@ -252,7 +252,8 @@ def main(argv=None):
     hmin = min(float(g.h.min()) for g in runner.grids) if (patches and a.time_accurate) else s.h.min()
     dt_est = s.cfl / ((V + cs) / hmin + 2 * (cs + V * np.sin(al)) / hmin)
     nsteps = a.steps or int(a.flowthroughs * (s.hi[0] - s.lo[0]) / V / dt_est)
-    nsteps = int(np.ceil(nsteps / 100) * 100)
+    if not a.steps:
+        nsteps = int(np.ceil(nsteps / 100) * 100)
     if a.implicit:
         nsteps = a.steps or a.iters
         print(f"implicit solver: up to {nsteps} iterations at CFL {a.cfl_max:g}, stopping early when converged")
@@ -298,6 +299,7 @@ def main(argv=None):
 
     t0 = time.time()
     chunk = max(100, int(round(nsteps / 40 / 50)) * 50)       # ~40 load checks over the max length
+    chunk = min(chunk, nsteps)
     if a.implicit:
         chunk = 50
     hooks = []
