@@ -1395,7 +1395,14 @@ class Solver:
                 for Wt, flag, ykey in ((Wa_t, tf["fa"], "ya"), (Wb_t, tf["fb"], "yb")):
                     nrm = np.zeros((3, mag.size))
                     nrm[tf["dir"], np.arange(mag.size)] = 1.0
-                    ft = self._shear(Wt, nrm, tf[ykey]) * (tf["area"] * flag)
+                    # only wetted sides: a non-fluid side can hold rho = 0 and 0 * NaN is NaN
+                    ft = np.zeros((3, mag.size))
+                    wet = np.asarray(flag) > 0
+                    if wet.any():
+                        Ww = [w_[:, wet] for w_ in Wt] if isinstance(Wt, (list, tuple)) else Wt[:, wet]
+                        yy = tf[ykey]
+                        yw = [y_[wet] for y_ in yy] if isinstance(yy, (list, tuple)) else np.asarray(yy)[..., wet]
+                        ft[:, wet] = self._shear(Ww, nrm[:, wet], yw) * (tf["area"][wet] * np.asarray(flag)[wet])
                     dFt = dFt + ft
                     F_fric = F_fric + ft.sum(1)
             F_thin = dFt.sum(1)
@@ -1459,14 +1466,23 @@ class Solver:
         v = self.viscous
         if isinstance(Wc, (list, tuple)) and len(Wc) == 2 and not self.wallmodel:
             (W1, W2), (y1, y2) = Wc, y
+            good = (np.asarray(W1[0]) > 0) & (np.asarray(W2[0]) > 0) & (np.asarray(W1[4]) > 0)
+            if not good.all():
+                Wi = np.asarray(self.W_inf, float)[:, None]
+                W1, W2 = np.where(good[None], W1, Wi), np.where(good[None], W2, Wi)
             T = W1[4] / (W1[0] * v["R"])
             mu = v["mu"] if v["model"] == "constant" else \
                 v["mu"] * (T / v["T0"]) ** 1.5 * (v["T0"] + v["S"]) / (T + v["S"])
             u1 = W1[1:4] - (W1[1:4] * nrm).sum(0) * nrm
             u2 = W2[1:4] - (W2[1:4] * nrm).sum(0) * nrm
-            return mu * (u1 * y2 ** 2 - u2 * y1 ** 2) / (y1 * y2 * (y2 - y1))
+            return mu * (u1 * y2 ** 2 - u2 * y1 ** 2) / (y1 * y2 * (y2 - y1)) * good
         if isinstance(Wc, (list, tuple)):
             Wc, y = Wc[0], y[0]
+        # samples whose stencil found no fluid cell hold zeros (their weight in the sum is 0, but
+        # 0 * NaN is NaN): give them a harmless state and zero shear
+        good = (np.asarray(Wc[0]) > 0) & (np.asarray(Wc[4]) > 0) & np.isfinite(np.asarray(Wc).sum(0))
+        if not good.all():
+            Wc = np.where(good[None], Wc, np.asarray(self.W_inf, float)[:, None])
         rho, vel, p = Wc[0], Wc[1:4], Wc[4]
         T = p / (rho * v["R"])
         mu = v["mu"] if v["model"] == "constant" else \
@@ -1478,7 +1494,7 @@ class Solver:
             tau = rho * utau ** 2
         else:
             tau = mu * um / y
-        return tau * ut / um
+        return tau * ut / um * good
 
     def _surface_tri(self):
         """Triangulated immersed walls for the loads: marching cubes of phi in index space (in
