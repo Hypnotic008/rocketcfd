@@ -13,6 +13,7 @@ from .common import ROOT, RESULTS, hint, mpl_canvas, new_process, open_path, pyt
 MOVIES = [
     ("Flow over the booster and through the fins (3-D model + tracer streaks, needs 3-D snapshots)", "-m rocketcfd.cinematic", ["--mode", "flow"]),
     ("Flow through the grid fins, close-up (needs 3-D snapshots)", "-m rocketcfd.cinematic", ["--mode", "flow", "--camera", "fins"]),
+    ("Flow fly-by: wide view, then in along the hull to the fins (needs 3-D snapshots)", "-m rocketcfd.cinematic", ["--mode", "flow", "--camera", "flyby"]),
     ("Schlieren film, side view, no model (needs 3-D snapshots)", "-m rocketcfd.cinematic", ["--mode", "schlieren"]),
     ("Flow streaks on a steady result (camera drift)", "-m rocketcfd.cinematic", ["--mode", "flow-orbit"]),
     ("Cinematic: flow evolving (LAVA style, needs 3-D snapshots)", "-m rocketcfd.cinematic", ["--mode", "evolve", "--style", "lava"]),

@@ -453,6 +453,19 @@ python -m rocketcfd.cinematic results/les_wake --mode schlieren             # si
 python -m rocketcfd.cinematic results/glide_patch --mode flow-orbit         # streaks on a steady result
 ```
 
+Each flow frame has five layers:
+- the hull and fins coloured by surface pressure (Cp, sampled from the flow at the wall), or
+  polished steel with `--surface metal`
+- tracer streaks coloured by Mach, with comet tails that fade over `--trail` frames and a soft glow
+- a numerical-schlieren backdrop plane through the axis in the pitch plane, which carries the
+  bow shock, the fin shocks and the expansion fans (`--flow-plane mach|none`)
+- translucent "glass" shock sheets wherever the density jumps by more than ~12% per cell
+  (`--no-shocks` turns them off)
+- vortex surfaces (Q-criterion) coloured by Mach (`--no-vortices` turns them off)
+
+The background is graded, and translucent layers are depth-peeled so they stack correctly.
+`--still-frame K` writes frame K as a PNG, to preview a look before rendering the whole movie.
+
 Styles: `lava` (vortex surfaces coloured by Mach over a greyscale schlieren plane, black
 background), `schlieren`, `mach`, `pressure`, `plume` (hot exhaust as a glowing temperature volume
 and a hot-gas surface coloured by Mach, over schlieren). `evolve` needs a run with `--snapshots N

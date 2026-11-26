@@ -299,8 +299,15 @@ def main(argv=None):
                     help="schlieren: 2-D side-on schlieren film of the snapshots (no model); flow: the 3-D model "
                          "with tracer streaks through the recorded flow; flow-orbit: the same on a steady result")
     ap.add_argument("--plane", choices=["xz", "xy"], default="xz", help="schlieren: plane through the axis")
-    ap.add_argument("--camera", choices=["three-quarter", "fins"], default="three-quarter", help="flow: framing")
-    ap.add_argument("--no-vortices", action="store_true", help="flow: tracer streaks only")
+    ap.add_argument("--camera", choices=["three-quarter", "fins", "flyby"], default="three-quarter",
+                    help="flow: framing (flyby: wide, then a push in along the hull to the fins)")
+    ap.add_argument("--no-vortices", action="store_true", help="flow: no vortex surfaces")
+    ap.add_argument("--surface", choices=["cp", "metal"], default="cp", help="flow: vehicle coloured by Cp, or steel")
+    ap.add_argument("--flow-plane", choices=["schlieren", "mach", "none"], default="schlieren",
+                    help="flow: backdrop plane through the axis")
+    ap.add_argument("--no-shocks", action="store_true", help="flow: no shock surfaces")
+    ap.add_argument("--trail", type=int, default=14, help="flow: streak length in frames")
+    ap.add_argument("--still-frame", type=int, default=None, help="flow: write only this frame, as a PNG")
     ap.add_argument("--style", choices=STYLES, default="lava")
     ap.add_argument("--out", default=None, help="output file (default: in the results folder)")
     ap.add_argument("--width", type=int, default=1920)
@@ -318,8 +325,12 @@ def main(argv=None):
     if a.mode == "schlieren":
         render_schlieren2d(a.folder, out, a.plane, a.width, a.height, a.fps, title=a.title, progress=prog)
     elif a.mode in ("flow", "flow-orbit"):
+        if a.still_frame is not None and not a.out:
+            out = out[:-4] + f"_f{a.still_frame}.png"
         render_flow(a.folder, out, a.width, a.height, a.fps, a.q, a.title, a.frames,
-                    "evolve" if a.mode == "flow" else "orbit", prog, not a.no_vortices, a.camera)
+                    "evolve" if a.mode == "flow" else "orbit", prog, not a.no_vortices, a.camera,
+                    surface=a.surface, plane=a.flow_plane, shocks=not a.no_shocks, trail=a.trail,
+                    still_frame=a.still_frame)
     elif a.mode == "still":
         render_still(a.folder, out, a.style, a.width, a.height, a.q, a.title)
     elif a.mode == "orbit":
@@ -496,11 +507,113 @@ def _interps(x, y, z, u, v, w, mach, solid):
     return vel, im, isd
 
 
+def _rgrid(x, y, z, **fields):
+    g = pv.RectilinearGrid(x, y, z)
+    for nm, a in fields.items():
+        g.point_data[nm] = np.ascontiguousarray(np.asarray(a, np.float32).transpose(2, 1, 0)).reshape(-1)
+    return g
+
+
+def _fill_solid(a, solid):
+    """Values inside the body replaced by the nearest fluid value (so a surface sample is the wall value)."""
+    if not solid.any():
+        return a
+    from scipy.ndimage import distance_transform_edt
+    idx = distance_transform_edt(solid, return_distances=False, return_indices=True)
+    return a[tuple(idx)]
+
+
+def _shock_sensor(rho, x, y, z, solid, wall_cells=0):
+    """Density jump per cell, |grad rho| h / rho: ~0.1-0.4 inside a captured shock, small elsewhere.
+    wall_cells: also zero it this many cells from the body (the stair-stepped immersed wall reads
+    as a jump there)."""
+    gx, gy, gz = np.gradient(rho, x, y, z)
+    hx, hy, hz = (np.gradient(c) for c in (x, y, z))
+    h = np.maximum.reduce(np.meshgrid(hx, hy, hz, indexing="ij"))
+    s = np.sqrt(gx * gx + gy * gy + gz * gz) * h / np.maximum(rho, 1e-9)
+    if wall_cells > 0 and solid.any():
+        from scipy.ndimage import binary_dilation
+        s[binary_dilation(solid, iterations=wall_cells)] = 0.0
+    s[solid] = 0.0
+    return s
+
+
+def _big_pieces(surf, frac=0.04, keep=6):
+    """The largest connected pieces of an iso-surface (each at least `frac` of the biggest)."""
+    if surf.n_points == 0:
+        return surf
+    con = surf.connectivity("all")
+    rid = np.asarray(con.point_data["RegionId"])
+    counts = np.bincount(rid)
+    order = np.argsort(counts)[::-1][:keep]
+    good = [r for r in order if counts[r] >= frac * counts[order[0]] and counts[r] > 50]
+    if not good:
+        return pv.PolyData()
+    return con.extract_points(np.isin(rid, good), adjacent_cells=False).extract_surface()
+
+
+class _Actors(list):
+    """(mesh, add_mesh kwargs) pairs, built once and re-added to the plotter every frame."""
+
+    def append_mesh(self, mesh, tag=None, **kw):
+        # smooth shading: point normals computed once here (VTK shades with them), instead of
+        # PyVista recomputing them every time the mesh is re-added
+        if kw.pop("smooth_shading", False) and isinstance(mesh, pv.PolyData) and mesh.n_points:
+            mesh = mesh.compute_normals(cell_normals=False, split_vertices=False, auto_orient_normals=False)
+        kw["render"] = False
+        self.append((mesh, kw, tag))
+
+
+def _vehicle_actors(body, fins, color="#c9ced6"):
+    acts = _Actors()
+    acts.append_mesh(body, color=color, ambient=0.22, diffuse=0.75, specular=0.5, specular_power=30,
+                     smooth_shading=True)
+    for f in fins:
+        acts.append_mesh(f, color="#9aa2ad", ambient=0.25, diffuse=0.7, specular=0.3)
+    return acts
+
+
+def _pitch_plane_normal(vdir):
+    """Normal of the plane holding the vehicle axis and the crossflow (the plane of the shock pattern)."""
+    c = np.array([0.0, vdir[1], vdir[2]])
+    if np.linalg.norm(c) < 1e-3 * max(np.linalg.norm(vdir), 1e-9):
+        return np.array([0.0, 1.0, 0.0])
+    n = np.cross([1.0, 0.0, 0.0], c / np.linalg.norm(c))
+    return n / np.linalg.norm(n)
+
+
+def _streak_poly(tr, mach_interp, fade=1.6, m_inf=None, dm=0.3):
+    """Tracer paths as polylines with a per-point opacity that fades toward the tail (comet streaks)
+    and, given the freestream Mach, toward undisturbed flow: streaks are bright where the flow has
+    been slowed or accelerated (shock layers, the fins, the wake) and faint in the freestream."""
+    poly = tr.polydata(mach_interp)
+    if poly is None:
+        return None
+    n, t = tr.paths.shape[:2]
+    a = np.tile(0.05 + 0.95 * (np.arange(t) / max(t - 1, 1)) ** fade, n)
+    if m_inf is not None:
+        dev = np.abs(np.asarray(poly.point_data["mach"]) - m_inf) / dm
+        a = a * (0.18 + 0.82 * np.clip(dev, 0.0, 1.0))
+    poly.point_data["alpha"] = a.astype(np.float32)
+    return poly
+
+
 def render_flow(folder, out, width=1920, height=1080, fps=30, q=None, title=None, frames=360, mode="evolve",
-                progress=None, show_vortices=True, camera="three-quarter"):
-    """The full 3-D model (body + grid fins) with tracer streaks flowing past the hull and through the
-    fins, coloured by Mach, and (optionally) vortex surfaces. mode 'evolve': the recorded snapshots
-    (particles carried by the changing flow); 'orbit': the steady flow.vtk with a slow camera move."""
+                progress=None, show_vortices=True, camera="three-quarter", surface="cp", plane="schlieren",
+                shocks=True, trail=14, still_frame=None):
+    """The full 3-D model (body + grid fins) with the flow around it, LAVA-style:
+
+      * tracer streaks through the hull boundary layer and the fins, coloured by Mach, with fading
+        comet tails and a soft glow;
+      * the hull and fins coloured by surface pressure (Cp) sampled from the flow (surface='cp'),
+        or polished steel (surface='metal');
+      * a numerical-schlieren (or Mach) plane through the axis in the pitch plane behind the
+        vehicle, carrying the shock pattern;
+      * translucent shock surfaces (density jump per cell) and vortex surfaces (Q-criterion);
+      * a graded background, depth-peeled transparency and a slow camera move.
+
+    mode 'evolve': the recorded snapshots (particles carried by the changing flow); 'orbit': the
+    steady flow.vtk with a slow camera move. still_frame=k: write frame k only, as a PNG (out)."""
     meta = {}
     mp = os.path.join(folder, "loads.json")
     if os.path.exists(mp):
@@ -508,6 +621,7 @@ def render_flow(folder, out, width=1920, height=1080, fps=30, q=None, title=None
             meta = json.load(fh)
     body, fins = vehicle_meshes(meta)
     bb = body.bounds
+    cond = meta.get("condition") or {}
     if mode == "evolve":
         sd = os.path.join(folder, "snapshots")
         mesh = dict(np.load(os.path.join(sd, "mesh.npz")))
@@ -515,102 +629,203 @@ def render_flow(folder, out, width=1920, height=1080, fps=30, q=None, title=None
             raise SystemExit("needs 3-D snapshots: run with --snapshots N --snap-volume 1")
         files = sorted(glob.glob(os.path.join(sd, "snap_*.npz")))
         x, y, z = (mesh[k].astype(float) for k in ("vx", "vy", "vz"))
-        solid = mesh["vol_solid"]
+        solid = mesh["vol_solid"].astype(bool)
+        p_inf = float(mesh["p_inf"])
 
         def frame_fields(i):
             s = np.load(files[i])
             u, v, w = (s[k].astype(np.float32).astype(float) for k in ("vol_u", "vol_v", "vol_w"))
             u[solid], v[solid], w[solid] = 0, 0, 0
-            return s, u, v, w, s["mach_vol"].astype(np.float32).astype(float), float(s["t"])
+            rho = s["vol_rho"].astype(np.float32).astype(float)
+            p = s["vol_dp"].astype(np.float32).astype(float) + p_inf
+            return u, v, w, s["mach_vol"].astype(np.float32).astype(float), rho, p, float(s["t"])
         nfr = len(files)
     else:
         fd = load_steady(folder)[0]
         f, x, y, z = derived.grid_arrays(fd.base)
         solid = f["phi"] < 0 if "phi" in f else np.zeros_like(f["rho"], bool)
         u, v, w = (np.where(solid, 0.0, f[c]) for c in "uvw")
-        mach = f.get("mach", np.sqrt(u * u + v * v + w * w))
-        frame_fields = lambda i: (None, u, v, w, mach, 0.0)
+        rho, p = f["rho"].astype(float), f["p"].astype(float)
+        a_snd = np.sqrt(1.4 * np.maximum(p, 1e-6) / np.maximum(rho, 1e-9))
+        mach = f.get("mach", np.sqrt(u * u + v * v + w * w) / a_snd)
+        p_inf = float(cond.get("p", np.median(p[~solid])))
+        frame_fields = lambda i: (u, v, w, mach, rho, p, 0.0)
         nfr = frames
-    s0, u0, v0, w0, m0, _ = frame_fields(nfr - 1)
+    u0, v0, w0, m0, rho0, p0, _ = frame_fields(nfr - 1)
     fluid = ~solid
     vmean = np.array([np.mean(a[fluid]) for a in (u0, v0, w0)])
     Vinf = float(np.linalg.norm(vmean))
-    # colour range from the flow near the vehicle (the far field would make everything one colour)
+    vdir = vmean / max(Vinf, 1e-9)
+    rho_inf = float(cond.get("rho", np.median(rho0[fluid])))
+    m_inf = float(cond.get("mach", np.median(m0[fluid])))
+    q_inf = 0.5 * rho_inf * float(cond.get("V", Vinf)) ** 2
+    # colour ranges from the flow near the vehicle (the far field would make everything one colour)
     X3 = np.meshgrid(x, y, z, indexing="ij")
     near = fluid & (np.hypot(X3[1], X3[2]) < 12.0) & (X3[0] > bb[0] - 5) & (X3[0] < bb[1] + 10)
-    mrange = [float(np.percentile(m0[near], 3)), float(np.percentile(m0[near], 99.5))]
+    # streak colours: the spread of Mach in the layer the particles fly through (near freestream
+    # everywhere else), so the slowed and accelerated regions stand out
+    band = fluid & (np.hypot(X3[1], X3[2]) < 10.5) & (X3[0] > bb[0] - 2) & (X3[0] < bb[1] + 4)
+    mrange = [float(np.percentile(m0[band], 4)), float(np.percentile(m0[band], 99))]
     from .vehicles.super_heavy import SuperHeavyParams
-    R_hull = SuperHeavyParams().radius
+    SP = SuperHeavyParams()
+    R_hull = SP.radius
     close = camera == "fins"
-    # emitter ring from just outside the hull to beyond the fin tips (fins reach R + 4.2 m)
     if close:
-        tgt, up_d = (SuperHeavyParams().fin_x_center, 0.0, 0.0), 14.0
+        tgt, up_d = (SP.fin_x_center, 0.0, 0.0), 14.0
     else:
         tgt, up_d = (bb[0], 0.0, 0.0), 8.0
-    tr = Tracers((x, y, z), bb, vmean, n_per_frame=120 if close else 150, tail=6 if close else 5,
-                 r_in=R_hull + 0.3, r_out=R_hull + 6.0, target=tgt, upstream=up_d,
-                 max_age=int((up_d + 22.0) / 1.2) if close else None)
-    # particles should move ~1.2 m per frame on screen
-    dt_draw = 1.2 / max(Vinf, 1e-6)
+    L_v = bb[1] - bb[0]
+    tr = Tracers((x, y, z), bb, vmean, n_per_frame=80 if close else 40, tail=trail,
+                 r_in=R_hull + 0.25, r_out=R_hull + (5.5 if close else 4.5), target=tgt, upstream=up_d,
+                 max_age=int((up_d + 26.0) / 1.2) if close else int((up_d + L_v + 12.0) / 1.2))
+    dt_draw = 1.2 / max(Vinf, 1e-6)             # particles move ~1.2 m per frame on screen
+    # one Q level and one shock level for the whole movie
+    g_last = _rgrid(x, y, z, u=u0, v=v0, w=w0, rho=np.ones_like(u0), p=np.ones_like(u0))
+    g_last.point_data["velocity"] = np.column_stack([g_last.point_data[c] for c in "uvw"])
+    ql = None
     if show_vortices:
-        g_last = pv.RectilinearGrid(x, y, z)
-        for nm, a in (("u", u0), ("v", v0), ("w", w0)):
-            g_last.point_data[nm] = np.ascontiguousarray(a.transpose(2, 1, 0)).reshape(-1)
-        g_last.point_data["velocity"] = np.column_stack([g_last.point_data[c] for c in "uvw"])
-        g_last.point_data["rho"] = np.ones(g_last.n_points)
-        g_last.point_data["p"] = np.ones(g_last.n_points)
         derived.add_to_grid(g_last, ["Q"])
-        ql = q if q is not None else auto_q(g_last)
-    pl = setup_plotter(width, height)
-    c = np.array([(bb[0] + bb[1]) / 2, 0, 0])
+        ql = q if q is not None else auto_q(g_last, frac=0.99)
+    s_lvl = 0.12
+    # framing region for the plane and the shock surfaces
     L = bb[1] - bb[0]
-    pl.open_movie(out, framerate=fps, quality=8)
+    c = np.array([(bb[0] + bb[1]) / 2, 0.0, 0.0])
+    nrm = _pitch_plane_normal(vdir)
+    box = [bb[0] - 0.22 * L, bb[1] + 0.35 * L, -0.42 * L, 0.42 * L, -0.42 * L, 0.42 * L]
+
+    fill_idx = None
+    if solid.any():
+        from scipy.ndimage import distance_transform_edt
+        fill_idx = tuple(distance_transform_edt(solid, return_distances=False, return_indices=True))
+
+    def surface_cp(p_field):
+        pf = p_field[fill_idx] if fill_idx is not None else p_field
+        from scipy.interpolate import RegularGridInterpolator as RGI
+        ip = RGI((x, y, z), pf, bounds_error=False, fill_value=p_inf)
+        out_m = []
+        for m in [body] + list(fins):
+            mm = m.copy()
+            mm.point_data["Cp"] = ((ip(np.asarray(mm.points)) - p_inf) / q_inf).astype(np.float32)
+            out_m.append(mm)
+        return out_m
+    if surface == "cp":
+        cps = np.concatenate([np.asarray(m.point_data["Cp"]) for m in surface_cp(p0)])
+        cp_hi = float(max(abs(np.percentile(cps, 5)), abs(np.percentile(cps, 95)), 0.05))
+        cp_range = [-cp_hi, cp_hi]
+
+    pl = setup_plotter(width, height)
+    try:
+        pl.set_background("#02040a", top="#121c30")
+        pl.enable_depth_peeling(number_of_peels=10, occlusion_ratio=0.0)
+    except Exception:                       # noqa: BLE001
+        pass
+    if still_frame is None:
+        pl.open_movie(out, framerate=fps, quality=8)
     # warm up the tracers so the first frame is already full of streaks
-    _, u, v, w, m, _ = frame_fields(0)
+    u, v, w, m, rho, p, _ = frame_fields(0)
     vel, im, isd = _interps(x, y, z, u, v, w, m, solid)
-    for _ in range(int(((25.0 if close else L) + up_d) / 1.2) + 5):
+    for _ in range(int(((26.0 if close else L) + up_d) / 1.2) + trail + 5):
         tr.step(vel, isd, dt_draw)
-    for i in range(nfr):
-        s, u, v, w, m, t = frame_fields(i)
-        vel, im, isd = _interps(x, y, z, u, v, w, m, solid)
-        tr.step(vel, isd, dt_draw)
-        pl.clear_actors()
-        add_vehicle(pl, body, fins)
-        poly = tr.polydata(im)
-        if poly is not None:
-            pl.add_mesh(poly, scalars="mach", cmap="turbo", clim=mrange, line_width=2.6 if close else 1.6,
-                        render_lines_as_tubes=True,
-                        opacity=0.9,
-                        show_scalar_bar=(i == 0 or True),
-                        scalar_bar_args=dict(title="Mach", color="white", vertical=True, position_x=0.93,
-                                             position_y=0.2, height=0.6, width=0.025, fmt="%.1f"))
-        if show_vortices:
-            g = pv.RectilinearGrid(x, y, z)
-            for nm, a in (("u", u), ("v", v), ("w", w)):
-                g.point_data[nm] = np.ascontiguousarray(a.transpose(2, 1, 0)).reshape(-1)
-            g.point_data["mach"] = np.ascontiguousarray(m.transpose(2, 1, 0)).reshape(-1)
-            g.point_data["rho"] = np.ones(g.n_points)
-            g.point_data["p"] = np.ones(g.n_points)
-            derived.add_to_grid(g, ["Q"])
-            iso = g.contour([ql], scalars="Q")
+    bar = dict(color="white", vertical=True, height=0.55, width=0.022, position_y=0.22, fmt="%.1f",
+               title_font_size=14, label_font_size=12)
+    def field_layers(u, v, w, m, rho, p):
+        acts = _Actors()
+        # vehicle
+        if surface == "cp":
+            ms = surface_cp(p)
+            for k, mm in enumerate(ms):
+                acts.append_mesh(mm, scalars="Cp", cmap="coolwarm", clim=cp_range, smooth_shading=(k == 0),
+                            ambient=0.25, diffuse=0.7, specular=0.35, specular_power=25,
+                            show_scalar_bar=(k == 0), scalar_bar_args=dict(title="Cp", position_x=0.035, **bar))
+        else:
+            acts.extend(_vehicle_actors(body, fins))
+        # backdrop plane through the axis (pitch plane), cut away around the camera side
+        sens = _shock_sensor(rho, x, y, z, solid, wall_cells=2)
+        from scipy.ndimage import gaussian_filter
+        g = _rgrid(x, y, z, mach=m, phi=np.where(solid, -1.0, 1.0), sens=sens,
+                   sch=np.exp(-14.0 * gaussian_filter(sens, 0.8)))      # plane: one-cell smoothing
+        if plane != "none":
+            sl = g.slice(normal=tuple(nrm), origin=tuple(c)).clip_box(box, invert=False)
+            if sl.n_points:
+                sl = sl.threshold(0.0, scalars="phi")
+            if sl.n_points:
+                if plane == "schlieren":       # shadowgraph glow: shocks light on a dark plane
+                    acts.append_mesh(sl, scalars="sch", cmap="bone_r", clim=[0.1, 1.0], opacity=0.85,
+                                show_scalar_bar=False, ambient=0.6, diffuse=0.4, specular=0.0)
+                else:
+                    acts.append_mesh(sl, scalars="mach", cmap="turbo", clim=mrange, opacity=0.6,
+                                show_scalar_bar=False, ambient=0.6, diffuse=0.4, specular=0.0)
+        # shock surfaces: translucent glass sheets where the density jumps
+        if shocks:
+            sh = _big_pieces(g.clip_box(box, invert=False).contour([s_lvl], scalars="sens"))
+            if sh.n_points:
+                acts.append_mesh(sh.smooth(n_iter=25), tag="shock", color="#d8ecff", opacity=0.16, smooth_shading=True,
+                            specular=0.6, specular_power=40, ambient=0.3)
+        # vortex surfaces
+        if show_vortices and ql:
+            gq = _rgrid(x, y, z, u=u, v=v, w=w, mach=m, rho=np.ones_like(u), p=np.ones_like(u))
+            gq.point_data["velocity"] = np.column_stack([gq.point_data[cc] for cc in "uvw"])
+            derived.add_to_grid(gq, ["Q"])
+            iso = gq.contour([ql], scalars="Q")
             if iso.n_points:
-                pl.add_mesh(iso.smooth(n_iter=15), scalars="mach", cmap="turbo", clim=mrange, opacity=0.55,
-                            smooth_shading=True, show_scalar_bar=False)
-        if title or mode == "evolve":
-            pl.add_text((title + "   " if title else "") + (f"t = {t * 1e3:.1f} ms" if mode == "evolve" else ""),
-                        position="upper_left", font_size=11, color="#c8ccd4")
+                acts.append_mesh(iso.smooth(n_iter=15), scalars="mach", cmap="turbo", clim=mrange, opacity=0.45,
+                            smooth_shading=True, show_scalar_bar=False, specular=0.4)
+        return acts
+
+    layer_cache = {}
+    frames_to_draw = range(nfr) if still_frame is None else [min(still_frame, nfr - 1)]
+    last_i = -1
+    for i in frames_to_draw:
+        u, v, w, m, rho, p, t = frame_fields(i)
+        vel, im, isd = _interps(x, y, z, u, v, w, m, solid)
+        for _ in range(max(1, i - last_i) if still_frame is not None else 1):
+            tr.step(vel, isd, dt_draw)
+        last_i = i
         # camera: slow drift around a three-quarter view (or a close-up of the fins)
         a = np.radians(-35 + 30 * i / max(nfr - 1, 1))
-        if camera == "fins":
-            from .vehicles.super_heavy import SuperHeavyParams
-            fx = SuperHeavyParams().fin_x_center
-            ctr = np.array([fx - 2.0, 0.0, 2.0])
-            pos = ctr + 26.0 * np.array([-0.55 * np.cos(a), -np.cos(a) * 0.6 + np.sin(a) * 0.4, 0.45])
+        ctr_f = np.array([SP.fin_x_center - 2.0, 0.0, 2.0])
+        pos_f = ctr_f + 26.0 * np.array([-0.55 * np.cos(a), -np.cos(a) * 0.6 + np.sin(a) * 0.4, 0.45])
+        ctr_w, pos_w = c, c + 1.35 * L * np.array([np.sin(a) * 0.5, -np.cos(a), 0.3])
+        shock_fade = 0.4 if close else 1.0
+        if close:
+            ctr, pos = ctr_f, pos_f
+        elif camera == "flyby":
+            # wide three-quarter view, then a push in along the hull to the fins
+            k = np.clip((i / max(nfr - 1, 1) - 0.15) / 0.7, 0.0, 1.0)
+            k = k * k * (3 - 2 * k)
+            shock_fade = 1.0 - 0.85 * k
+            ctr = (1 - k) * ctr_w + k * ctr_f
+            pos = (1 - k) * pos_w + k * pos_f
         else:
-            ctr = c
-            pos = c + 1.05 * L * np.array([np.sin(a) * 0.5, -np.cos(a), 0.3])
+            ctr, pos = ctr_w, pos_w
+        pl.clear_actors()
+        key = i if mode == "evolve" else 0
+        if layer_cache.get("key") != key:
+            layer_cache.clear()
+            layer_cache.update(key=key, actors=field_layers(u, v, w, m, rho, p))
+        for mesh_, kw, tag in layer_cache["actors"]:
+            if tag == "shock":
+                kw = dict(kw, opacity=kw["opacity"] * shock_fade)
+            pl.add_mesh(mesh_, **kw)
+        # streaks: soft wide glow under a bright fading core
+        poly = _streak_poly(tr, im, m_inf=m_inf)
+        if poly is not None:
+            lw = 2.2 if close else 1.4
+            pl.add_mesh(poly, scalars="mach", cmap="turbo", clim=mrange, line_width=lw * 3.2, opacity=0.08,
+                        show_scalar_bar=False, lighting=False, render=False)
+            pl.add_mesh(poly, scalars="mach", cmap="turbo", clim=mrange, line_width=lw, opacity="alpha",
+                        lighting=False, show_scalar_bar=True, render=False,
+                        scalar_bar_args=dict(title="Mach", position_x=0.94, **bar))
+        txt = (title + "   " if title else "")
+        if mode == "evolve":
+            txt += f"t = {t * 1e3:.1f} ms"
+        if txt:
+            pl.add_text(txt, position="upper_left", font_size=11, color="#c8ccd4")
         pl.camera_position = [tuple(pos), tuple(ctr), (0, 0, 1)]
-        pl.write_frame()
+        if still_frame is not None:
+            pl.screenshot(out)
+        else:
+            pl.write_frame()
         if progress:
             progress(i + 1, nfr)
     pl.close()
