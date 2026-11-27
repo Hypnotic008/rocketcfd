@@ -81,6 +81,9 @@ def main(argv=None):
                     help="refine where an earlier LES's time-averaged criterion is largest "
                          "(Mozaffari et al. 2022): that run's results folder")
     ap.add_argument("--adapt-h", type=float, default=0.15, help="--adapt-from: cell size of the new patches [m]")
+    ap.add_argument("--adapt-goal", default="flow", choices=["flow", "loads"],
+                    help="--adapt-from: flow = refine the largest averaged error anywhere; loads = weight it by "
+                         "closeness to the body (shock layer, chines, fins before the far wake)")
     ap.add_argument("--adapt-cells", type=float, default=3e6,
                     help="--adapt-from: cell budget of the new patches (sets the threshold, as LAVA's AMR)")
     ap.add_argument("--engines", default="none", choices=["none", "centre", "inner", "all"],
@@ -229,7 +232,11 @@ def main(argv=None):
         crit = load_criterion(a.adapt_from)
         reg = ((-0.3 * L, -25.0, -25.0), (1.6 * L, 25.0, 25.0))
         print(f"averaged-criterion patches from {a.adapt_from} ({a.adapt_h} m, budget {a.adapt_cells/1e6:.1f} M cells):")
-        ap_, _ = adapted_patches(crit, faces, a.adapt_h, a.adapt_cells, existing=patches, region=reg)
+        wgt = None
+        if a.adapt_goal == "loads":
+            from rocketcfd.adapt import goal_weight
+            wgt = goal_weight(crit, sdf)
+        ap_, _ = adapted_patches(crit, faces, a.adapt_h, a.adapt_cells, existing=patches, region=reg, weight=wgt)
         patches += ap_
         if not a.explicit:
             a.implicit = not a.explicit

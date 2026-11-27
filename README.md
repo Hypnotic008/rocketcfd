@@ -622,6 +622,18 @@ python cases/super_heavy_descent.py --h 0.3 --fins parametric --fin-h 0.04 --aoa
 
 Add `--dry-run` to the second command to see the patch count and memory first.
 
+`--adapt-goal loads` is a cheap goal-oriented variant. It weights the criterion by
+exp(-d / 6 m), with d the distance to the body, so the budget goes to the flow that sets the
+surface loads (shock layer, chines, fins) before the far wake. This is the hybrid feature/goal
+idea of Vivarelli, Qin & Shahpar (Fluids 10, 2025), standing in for an adjoint weighting
+(Kast & Fidkowski, J. Comput. Phys. 252, 2013). Use it for aero-database runs; keep the
+default `flow` for movies, where the wake is the point.
+
+![adaptation goals](results/adapt_goal_example.png)
+
+*Patches from a 2-sample test on a 0.9 m grid. Left, `flow`: bow shock, windward shock layer,
+fins, wake. Right, `loads`: the same budget pulled in against the body.*
+
 ## Probes: time histories and spectra
 
 `--probes` records rho, u, v, w, p every step at points in the wake, beside the hull, behind the

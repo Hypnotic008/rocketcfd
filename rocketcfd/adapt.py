@@ -85,20 +85,35 @@ def load_criterion(path):
                 samples=int(d["samples"]))
 
 
+def goal_weight(crit, sdf, length=6.0):
+    """Hybrid feature / goal weight (Vivarelli, Qin & Shahpar, Fluids 10, 2025, Sec. 5): the
+    error in the surface loads comes from the flow near the body, so the averaged criterion is
+    weighted by exp(-d / length) with d the distance to the body. A cheap stand-in for an adjoint
+    weighting (Kast & Fidkowski 2013): the shock layer and the flow over the chines and fins are
+    favoured over the far wake."""
+    cf = crit["faces"]
+    X = np.meshgrid(*[0.5 * (f[1:] + f[:-1]) for f in cf], indexing="ij")
+    d = np.maximum(sdf(*X), 0.0)
+    return np.exp(-d / length)
+
+
 def adapted_patches(crit, base_faces, h_new, budget, existing=(), region=None, box=(64, 64, 64),
-                    verbose=True):
+                    verbose=True, weight=None):
     """Patches of cell size h_new where the averaged criterion times the (criterion grid's) cell
     size is largest, sized to about `budget` new cells.
 
     crit: load_criterion(...). existing: patch face lists already in the run; cells inside one
     at least as fine as h_new are skipped. region: ((x0, y0, z0), (x1, y1, z1)) bounding box
-    for the refinement (LAVA-style refinement box)."""
+    for the refinement (LAVA-style refinement box). weight: optional per-cell factor on C h
+    (same shape as the criterion), e.g. goal_weight() for refinement aimed at the surface loads."""
     from .patches import cell_patches
     C, cf = crit["C"], crit["faces"]
     cen = np.meshgrid(*[0.5 * (f[1:] + f[:-1]) for f in cf], indexing="ij")
     wid = np.meshgrid(*[np.diff(f) for f in cf], indexing="ij")
     hc = np.maximum.reduce(wid)
     err = C * hc
+    if weight is not None:
+        err = err * weight
     ok = crit["fluid"].astype(bool) & (err > 0) & (hc > 1.2 * h_new)
     if region is not None:
         lo, hi = np.asarray(region[0], float), np.asarray(region[1], float)
