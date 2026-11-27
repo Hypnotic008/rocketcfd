@@ -53,6 +53,8 @@ def main(argv=None):
     ap.add_argument("--snapshots", type=int, default=0,
                     help="save about this many frames over the run for `viewer --movie evolve` "
                          "(use with --time-accurate for a physically time-accurate movie)")
+    ap.add_argument("--snap-patch-cells", type=float, default=8e6,
+                    help="3-D snapshots: record refinement patches up to this many cells in all (finest first)")
     ap.add_argument("--snap-volume", type=int, default=0, help="also save a coarse 3-D Mach field (stride)")
     ap.add_argument("--probes", action="store_true",
                     help="record rho, u, v, w, p every step at a default set of points (wake, leeward hull, "
@@ -356,7 +358,8 @@ def main(argv=None):
         from rocketcfd.snapshots import SnapshotRecorder
         rec = SnapshotRecorder(s, a.out, q, p, ((-1.5, -6.6, -6.6), (L + 0.6, 6.6, 6.6)),
                                volume_stride=a.snap_volume,
-                               patches=(runner.grids[1:] if patches else None))
+                               patches=(runner.grids[1:] if patches else None),
+                               max_patch_cells=a.snap_patch_cells)
         rec.record(0, 0.0)
         hooks.append((max(1, nsteps // a.snapshots), rec.record))
         print(f"recording a snapshot every {hooks[-1][0]} steps into {a.out}/snapshots")

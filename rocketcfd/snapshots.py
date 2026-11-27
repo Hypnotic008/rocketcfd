@@ -76,12 +76,15 @@ class SnapshotRecorder:
         self.patches = []
         if volume_stride and patches:
             total = 0
+            # finest first: if the cap bites, the coarse patches (hull shell, adapted) go first
+            patches = sorted(patches, key=lambda g_: float(np.min([np.min(np.diff(a_)) for a_ in g_.axes])))
             for g in patches:
                 ii = [np.arange(NG, len(a_) - NG)[::volume_stride] for a_ in g.axes]
                 n = int(np.prod([len(a_) for a_ in ii]))
                 if total + n > max_patch_cells:
                     print(f"snapshots: patch volumes capped at {max_patch_cells / 1e6:.0f} M cells "
-                          f"({len(self.patches)} of {len(patches)} patches recorded)")
+                          f"({len(self.patches)} of {len(patches)} patches recorded; raise --snap-patch-cells "
+                          f"or --snap-volume to keep them all)")
                     break
                 total += n
                 k = len(self.patches)
