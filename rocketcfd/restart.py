@@ -125,8 +125,8 @@ def load(runner, path, gamma=None, verbose=True, rotate_x=0.0):
         order = np.argsort(vol)                                    # finest first
         interps, h_old = [], []
         for i in order:
-            h_old.append(float(max(np.max(np.diff(o["faces"][d])) for d in range(3))))
             o = old[i]
+            h_old.append(float(max(np.max(np.diff(o["faces"][d])) for d in range(3))))
             ax = _centres(o["faces"])
             W = cons_to_prim(torch.as_tensor(o["U"], dtype=torch.float64), gam, 1e-9, 1e-6).numpy()
             if rotate_x:
