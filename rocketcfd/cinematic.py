@@ -709,13 +709,34 @@ class _FinestGrid:
             lo = np.array([a[0] for a in axes]); hi = np.array([a[-1] for a in axes])
             self.levels.append((lo, hi, ints))
 
+    # which points fall in which patch: the same body / oil-flow points against the same patches
+    # every frame, so cached (it was ~3.5 s of a 13 s frame with 74 patches and 1 M points)
+    _inside_cache = {}
+
+    def _inside(self, P):
+        key = (P.shape, float(P[:, 0].sum()), float(P[:, 1].sum()),
+               tuple((tuple(lo), tuple(hi)) for lo, hi, _ in self.levels[1:]))
+        hit = _FinestGrid._inside_cache.get(key)
+        if hit is None:
+            hit = []
+            for lo, hi, _ in self.levels[1:]:
+                # cheap x test first, the full box test only on those points
+                cand = np.flatnonzero((P[:, 0] > lo[0]) & (P[:, 0] < hi[0]))
+                if cand.size:
+                    sub = P[cand]
+                    cand = cand[np.all((sub[:, 1:] > lo[1:]) & (sub[:, 1:] < hi[1:]), axis=1)]
+                hit.append(cand)
+            if len(_FinestGrid._inside_cache) > 8:
+                _FinestGrid._inside_cache.clear()
+            _FinestGrid._inside_cache[key] = hit
+        return hit
+
     def __call__(self, name, P):
         P = np.asarray(P, float)
         out = self.levels[0][2][name](P)
-        for lo, hi, ints in self.levels[1:]:
-            inside = np.all((P > lo) & (P < hi), axis=1)
-            if inside.any():
-                out[inside] = ints[name](P[inside])
+        for (lo, hi, ints), idx in zip(self.levels[1:], self._inside(P)):
+            if idx.size:
+                out[idx] = ints[name](P[idx])
         return out
 
 

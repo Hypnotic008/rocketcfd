@@ -531,7 +531,8 @@ More options for the flow movie:
 - `--volume`: volume-render the density jump instead of drawing glass shock sheets, as a 3-D
   numerical schlieren. Shocks and expansion fans show as glowing smoke, the density-gradient
   look of LAVA's videos. It uses CPU ray casting, which works on any machine (headless too) but
-  adds a few seconds per frame.
+  is slow: about 60 s per frame on a 3 M-cell run, against about 10 s without it. Use it for
+  short clips or stills (`--still-frame`).
 - `--refine N`: the shock and vortex surfaces are cut from every patch at its own resolution and
   from the base flow resampled N times finer (cubic), then smoothed, instead of in cell-sized
   facets. The default is 2 on volumes recorded coarser than 0.45 m, else 1.
