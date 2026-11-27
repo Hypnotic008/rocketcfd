@@ -490,6 +490,8 @@ More options for the flow movie:
 - `--refine N`: the shock and vortex surfaces are cut from every patch at its own resolution and
   from the base flow resampled N times finer (cubic), then smoothed, instead of in cell-sized
   facets. The default is 2 on volumes recorded coarser than 0.45 m, else 1.
+- `--tween N`: draw N frames per snapshot interval, with the flow fields blended between
+  snapshots, for smoother motion when snapshots are far apart (N times the render time).
 - `--start K`: skip the first K snapshots, for example the transient after a restart onto a new
   grid.
 

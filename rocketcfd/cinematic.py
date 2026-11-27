@@ -312,6 +312,8 @@ def main(argv=None):
     ap.add_argument("--no-shocks", action="store_true", help="flow: no shock surfaces")
     ap.add_argument("--trail", type=int, default=14, help="flow: streak length in frames")
     ap.add_argument("--no-streaks", action="store_true", help="flow: no tracer streaks")
+    ap.add_argument("--tween", type=int, default=1,
+                    help="flow: frames per snapshot interval, fields blended between snapshots (smoother motion)")
     ap.add_argument("--volume", action="store_true",
                     help="flow: volume-render the density jump (3-D schlieren smoke) instead of shock sheets")
     ap.add_argument("--oil-flow", action="store_true",
@@ -348,7 +350,7 @@ def main(argv=None):
                     "evolve" if a.mode == "flow" else "orbit", prog, not a.no_vortices, a.camera,
                     surface=a.surface, plane=a.flow_plane, shocks=not a.no_shocks, trail=a.trail,
                     still_frame=a.still_frame, streaks=not a.no_streaks, refine=a.refine, start=a.start,
-                    oil=a.oil_flow, volume=a.volume)
+                    oil=a.oil_flow, volume=a.volume, tween=a.tween)
     elif a.mode == "still":
         render_still(a.folder, out, a.style, a.width, a.height, a.q, a.title)
     elif a.mode == "orbit":
@@ -817,7 +819,7 @@ class _OilFlow:
 def render_flow(folder, out, width=1920, height=1080, fps=30, q=None, title=None, frames=360, mode="evolve",
                 progress=None, show_vortices=True, camera="three-quarter", surface="cp", plane="schlieren",
                 shocks=True, trail=14, still_frame=None, streaks=True, refine=None, start=0, oil=False,
-                volume=False):
+                volume=False, tween=1):
     """The full 3-D model (body + grid fins) with the flow around it, LAVA-style:
 
       * tracer streaks through the hull boundary layer and the fins, coloured by Mach, with fading
@@ -831,6 +833,8 @@ def render_flow(folder, out, width=1920, height=1080, fps=30, q=None, title=None
 
     mode 'evolve': the recorded snapshots (particles carried by the changing flow); 'orbit': the
     steady flow.vtk with a slow camera move. still_frame=k: write frame k only, as a PNG (out).
+    tween=N: N frames per snapshot interval, the flow fields blended linearly between snapshots
+    (smoother motion when snapshots are far apart in time; N times the render time).
     volume=True: volume rendering of the density jump per cell (numerical schlieren in 3-D: the
     shocks and expansion fans as glowing smoke, the LAVA density-gradient look) in place of the
     glass shock sheets.
@@ -1075,17 +1079,39 @@ def render_flow(folder, out, width=1920, height=1080, fps=30, q=None, title=None
 
     layer_cache = {}
     frames_to_draw = range(nfr) if still_frame is None else [min(still_frame, nfr - 1)]
+    if mode == "evolve" and tween > 1 and still_frame is None and nfr > 1:
+        sched = [(i_, f_) for i_ in range(nfr - 1) for f_ in np.arange(tween) / tween] + [(nfr - 1, 0.0)]
+    else:
+        sched = [(i_, 0.0) for i_ in frames_to_draw]
+    loaded = {}
+
+    def fields_at(i_, f_):
+        """Snapshot i_ blended a fraction f_ toward i_ + 1 (fields and patch levels)."""
+        def get(j):
+            if j not in loaded:
+                if len(loaded) >= 3:
+                    loaded.pop(min(loaded))
+                loaded[j] = (frame_fields(j), patch_levels(j))
+            return loaded[j]
+        a_, la = get(i_)
+        if f_ <= 0.0:
+            return a_, la
+        b_, lb = get(i_ + 1)
+        mix = tuple((1 - f_) * x_ + f_ * y_ for x_, y_ in zip(a_, b_))
+        lev = [(axa, {k_: (1 - f_) * fa[k_] + f_ * fb[k_] for k_ in fa}) for (axa, fa), (_, fb) in zip(la, lb)]
+        return mix, lev
+
     last_i = -1
-    for i in frames_to_draw:
-        u, v, w, m, rho, p, t = frame_fields(i)
-        plev = patch_levels(i)
+    for n_fr, (i, frac) in enumerate(sched):
+        (u, v, w, m, rho, p, t), plev = fields_at(i, frac)
+        s_pos = (i + frac) / max(nfr - 1, 1)
         if streaks:
             vel, im, isd = _interps(x, y, z, u, v, w, m, solid, plev)
             for _ in range(max(1, i - last_i) if still_frame is not None else 1):
                 tr.step(vel, isd, dt_draw)
         last_i = i
         # camera: slow drift around a three-quarter view (or a close-up of the fins)
-        a = np.radians(-35 + 30 * i / max(nfr - 1, 1))
+        a = np.radians(-35 + 30 * s_pos)
         ctr_f = np.array([SP.fin_x_center - 2.0, 0.0, 2.0])
         pos_f = ctr_f + 26.0 * np.array([-0.55 * np.cos(a), -np.cos(a) * 0.6 + np.sin(a) * 0.4, 0.45])
         ctr_w, pos_w = c, c + 1.35 * L * np.array([np.sin(a) * 0.5, -np.cos(a), 0.3])
@@ -1094,7 +1120,7 @@ def render_flow(folder, out, width=1920, height=1080, fps=30, q=None, title=None
             ctr, pos = ctr_f, pos_f
         elif camera == "flyby":
             # wide three-quarter view, then a push in along the hull to the fins
-            k = np.clip((i / max(nfr - 1, 1) - 0.15) / 0.7, 0.0, 1.0)
+            k = np.clip((s_pos - 0.15) / 0.7, 0.0, 1.0)
             k = k * k * (3 - 2 * k)
             shock_fade = 1.0 - 0.85 * k
             ctr = (1 - k) * ctr_w + k * ctr_f
@@ -1102,7 +1128,7 @@ def render_flow(folder, out, width=1920, height=1080, fps=30, q=None, title=None
         else:
             ctr, pos = ctr_w, pos_w
         pl.clear_actors()
-        key = i if mode == "evolve" else 0
+        key = (i, frac) if mode == "evolve" else 0
         if layer_cache.get("key") != key:
             layer_cache.clear()
             layer_cache.update(key=key, actors=field_layers(u, v, w, m, rho, p, plev))
@@ -1142,7 +1168,7 @@ def render_flow(folder, out, width=1920, height=1080, fps=30, q=None, title=None
         else:
             pl.write_frame()
         if progress:
-            progress(i + 1, nfr)
+            progress(n_fr + 1, len(sched))
     pl.close()
     return out
 
