@@ -1136,14 +1136,23 @@ def render_flow(folder, out, width=1920, height=1080, fps=30, q=None, title=None
                                    opacity=[0.0, 0.0, 0.015, 0.05, 0.13, 0.26], shade=False,
                                    mapper="fixed_point",     # CPU ray casting: renders headless too
                                    show_scalar_bar=False, render=False), "volume"))
+        def _cap(surf, n_max=1_500_000):
+            # full-resolution snapshots with 4 cm patches can give surfaces of many millions of
+            # triangles: thin them before smoothing / drawing (frame time and memory)
+            surf = surf.triangulate()
+            if surf.n_cells > n_max:
+                surf = surf.decimate(1.0 - n_max / surf.n_cells)
+            return surf
+
         if sh_all:
-            sh = _big_pieces(pv.merge(sh_all).clip_box(box, invert=False), keep=12)
+            sh = _cap(_big_pieces(pv.merge(sh_all).clip_box(box, invert=False), keep=12))
             if sh.n_points:
                 acts.append_mesh(sh.smooth_taubin(n_iter=30, pass_band=0.08), tag="shock", color="#d8ecff",
                                  opacity=0.16, smooth_shading=True, specular=0.6, specular_power=40, ambient=0.3)
         if vx_all:
             iso = pv.merge(vx_all)
             if iso.n_points:
+                iso = _cap(iso)
                 acts.append_mesh(iso.smooth_taubin(n_iter=25, pass_band=0.1), scalars="mach", cmap="turbo",
                                  clim=mrange, opacity=0.45, smooth_shading=True, specular=0.4,
                                  show_scalar_bar=not streaks,
