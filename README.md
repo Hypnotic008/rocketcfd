@@ -483,6 +483,10 @@ More options for the flow movie:
 - `--oil-flow`: oil-flow lines on the hull, as in a wind-tunnel oil-flow test. They come from the
   near-wall velocity, taken 0.45 m off the wall and integrated on the surface. They show
   separation and attachment lines and the flow around the chines.
+- `--volume`: volume-render the density jump instead of drawing glass shock sheets, as a 3-D
+  numerical schlieren. Shocks and expansion fans show as glowing smoke, the density-gradient
+  look of LAVA's videos. It uses CPU ray casting, which works on any machine (headless too) but
+  adds a few seconds per frame.
 - `--refine N`: the shock and vortex surfaces are cut from every patch at its own resolution and
   from the base flow resampled N times finer (cubic), then smoothed, instead of in cell-sized
   facets. The default is 2 on volumes recorded coarser than 0.45 m, else 1.

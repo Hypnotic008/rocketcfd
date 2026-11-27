@@ -312,6 +312,8 @@ def main(argv=None):
     ap.add_argument("--no-shocks", action="store_true", help="flow: no shock surfaces")
     ap.add_argument("--trail", type=int, default=14, help="flow: streak length in frames")
     ap.add_argument("--no-streaks", action="store_true", help="flow: no tracer streaks")
+    ap.add_argument("--volume", action="store_true",
+                    help="flow: volume-render the density jump (3-D schlieren smoke) instead of shock sheets")
     ap.add_argument("--oil-flow", action="store_true",
                     help="flow: surface oil-flow lines on the hull (near-wall flow, separation lines)")
     ap.add_argument("--start", type=int, default=0,
@@ -346,7 +348,7 @@ def main(argv=None):
                     "evolve" if a.mode == "flow" else "orbit", prog, not a.no_vortices, a.camera,
                     surface=a.surface, plane=a.flow_plane, shocks=not a.no_shocks, trail=a.trail,
                     still_frame=a.still_frame, streaks=not a.no_streaks, refine=a.refine, start=a.start,
-                    oil=a.oil_flow)
+                    oil=a.oil_flow, volume=a.volume)
     elif a.mode == "still":
         render_still(a.folder, out, a.style, a.width, a.height, a.q, a.title)
     elif a.mode == "orbit":
@@ -814,7 +816,8 @@ class _OilFlow:
 
 def render_flow(folder, out, width=1920, height=1080, fps=30, q=None, title=None, frames=360, mode="evolve",
                 progress=None, show_vortices=True, camera="three-quarter", surface="cp", plane="schlieren",
-                shocks=True, trail=14, still_frame=None, streaks=True, refine=None, start=0, oil=False):
+                shocks=True, trail=14, still_frame=None, streaks=True, refine=None, start=0, oil=False,
+                volume=False):
     """The full 3-D model (body + grid fins) with the flow around it, LAVA-style:
 
       * tracer streaks through the hull boundary layer and the fins, coloured by Mach, with fading
@@ -828,6 +831,9 @@ def render_flow(folder, out, width=1920, height=1080, fps=30, q=None, title=None
 
     mode 'evolve': the recorded snapshots (particles carried by the changing flow); 'orbit': the
     steady flow.vtk with a slow camera move. still_frame=k: write frame k only, as a PNG (out).
+    volume=True: volume rendering of the density jump per cell (numerical schlieren in 3-D: the
+    shocks and expansion fans as glowing smoke, the LAVA density-gradient look) in place of the
+    glass shock sheets.
     oil=True: surface oil-flow lines on the hull (streamlines of the near-wall velocity
     integrated on the surface, as in a wind-tunnel oil-flow test: separation and attachment
     lines, the flow around the chines). streaks=False: no tracer streaks. refine: the shock and vortex
@@ -1012,10 +1018,15 @@ def render_flow(folder, out, width=1920, height=1080, fps=30, q=None, title=None
         for ax_p, f_p in plev:
             grids_.append((list(ax_p), dict(u=f_p["u"], v=f_p["v"], w=f_p["w"], mach=f_p["mach"], rho=f_p["rho"],
                                             solid=f_p["solid"]), False))
-        sh_all, vx_all = [], []
+        sh_all, vx_all, vol_levels = [], [], []
         for ax_, f_, is_base in grids_:
             sol_ = f_["solid"] > 0.5
-            if shocks:
+            if volume:
+                sv = _shock_sensor(f_["rho"], *ax_, sol_, wall_cells=2 * (refine if is_base else 1))
+                if is_base:
+                    sv *= max(refine, 1)
+                vol_levels.append((tuple(ax_), dict(sens=sv)))
+            if shocks and not volume:
                 sn = _shock_sensor(f_["rho"], *ax_, sol_, wall_cells=2 * (refine if is_base else 1))
                 if is_base:
                     sn *= max(refine, 1)           # per cell of the recorded grid, not the resampled one
@@ -1036,6 +1047,18 @@ def render_flow(folder, out, width=1920, height=1080, fps=30, q=None, title=None
                 iso = gq.contour([ql], scalars="Q")
                 if iso.n_points:
                     vx_all.append(iso)
+        if vol_levels:
+            # uniform voxels over the framing box, each from the finest grid there
+            hv = max(0.25, (box[1] - box[0]) / 360.0)
+            dims = [int((box[2 * d + 1] - box[2 * d]) / hv) + 1 for d in range(3)]
+            img = pv.ImageData(dimensions=dims, spacing=(hv, hv, hv), origin=(box[0], box[2], box[4]))
+            fgv = _FinestGrid(vol_levels)
+            sv = fgv("sens", np.asarray(img.points))
+            img.point_data["sens"] = np.clip(sv, 0.0, 0.5).astype(np.float32)
+            acts.append((img, dict(scalars="sens", cmap="bone", clim=[0.03, 0.35],
+                                   opacity=[0.0, 0.0, 0.015, 0.05, 0.13, 0.26], shade=False,
+                                   mapper="fixed_point",     # CPU ray casting: renders headless too
+                                   show_scalar_bar=False, render=False), "volume"))
         if sh_all:
             sh = _big_pieces(pv.merge(sh_all).clip_box(box, invert=False), keep=12)
             if sh.n_points:
@@ -1084,6 +1107,9 @@ def render_flow(folder, out, width=1920, height=1080, fps=30, q=None, title=None
             layer_cache.clear()
             layer_cache.update(key=key, actors=field_layers(u, v, w, m, rho, p, plev))
         for mesh_, kw, tag in layer_cache["actors"]:
+            if tag == "volume":
+                pl.add_volume(mesh_, **kw)
+                continue
             if tag == "shock":
                 kw = dict(kw, opacity=kw["opacity"] * shock_fade)
             pl.add_mesh(mesh_, **kw)
