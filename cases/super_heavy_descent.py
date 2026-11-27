@@ -345,7 +345,8 @@ def main(argv=None):
 
     if a.profile:
         from rocketcfd.profiling import profile_runner
-        profile_runner(runner, a.profile, loads=lambda: runner.loads(**REFERENCE, parts=PARTS))
+        profile_runner(runner, a.profile, loads=lambda: runner.loads(**REFERENCE, parts=PARTS),
+                       time_accurate=bool(a.time_accurate))
         return None
 
     t0 = time.time()

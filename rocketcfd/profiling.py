@@ -89,8 +89,10 @@ def _print_breakdown(title, ker, wall, per, unit):
         print(f"    {ms / per:9.2f} ms/{unit}  {n / per:7.1f} launches/{unit}  {k}")
 
 
-def profile_runner(runner, n=20, loads=None, warm=30):
-    """runner: Solver or PatchGrid (already built). loads: callable doing one load integration."""
+def profile_runner(runner, n=20, loads=None, warm=30, time_accurate=False):
+    """runner: Solver or PatchGrid (already built). loads: callable doing one load integration.
+    time_accurate: time the explicit steps as a time-accurate run takes them (global step; the
+    WENO5-Z kernels are only used there) instead of local time steps."""
     patched = hasattr(runner, "grids")
     base = runner.base if patched else runner
     grids = runner.grids if patched else [runner]
@@ -103,9 +105,9 @@ def profile_runner(runner, n=20, loads=None, warm=30):
 
     def explicit(k, first=0):
         if patched:
-            runner.run_explicit(k, chunk=k, first_order_steps=first)
+            runner.run_explicit(k, chunk=k, first_order_steps=first, time_accurate=time_accurate)
         else:
-            runner.run(k, chunk=k, first_order_steps=first, steady=True)
+            runner.run(k, chunk=k, first_order_steps=first, steady=not time_accurate)
 
     def implicit(k, first=0):
         kw = dict(chunk=k, first_order_steps=first, cfl_start=1.0, cfl_max=1.0, cfl_ramp=1)
@@ -123,7 +125,8 @@ def profile_runner(runner, n=20, loads=None, warm=30):
     print(f"warm-up ({warm + 6} steps, includes kernel compilation): {time.perf_counter() - t0:.1f} s")
 
     out = {}
-    for name, fn, unit in (("explicit SSP-RK2 local-time step", explicit, "step"),
+    for name, fn, unit in ((f"explicit SSP-RK2 {'time-accurate' if time_accurate else 'local-time'} step",
+                            explicit, "step"),
                            ("implicit iteration (red-black DP-LUR, 8 sweeps)", implicit, "iter")):
         _sync(dev)
         t0 = time.perf_counter()
