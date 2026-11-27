@@ -299,6 +299,10 @@ def main(argv=None):
                     help="schlieren: 2-D side-on schlieren film of the snapshots (no model); flow: the 3-D model "
                          "with tracer streaks through the recorded flow; flow-orbit: the same on a steady result")
     ap.add_argument("--plane", choices=["xz", "xy"], default="xz", help="schlieren: plane through the axis")
+    ap.add_argument("--xlim", type=float, nargs=2, default=None, metavar=("X0", "X1"),
+                    help="schlieren: zoom to this axial window [m] (x from the engine end)")
+    ap.add_argument("--ylim", type=float, nargs=2, default=None, metavar=("Y0", "Y1"),
+                    help="schlieren: zoom to this cross window [m] (recorded out to +/-15 m)")
     ap.add_argument("--camera", choices=["three-quarter", "fins", "flyby"], default="three-quarter",
                     help="flow: framing (flyby: wide, then a push in along the hull to the fins)")
     ap.add_argument("--no-vortices", action="store_true", help="flow: no vortex surfaces")
@@ -323,7 +327,10 @@ def main(argv=None):
     out = a.out or os.path.join(a.folder, f"cinematic_{a.mode}_{tag}.{ext}")
     prog = lambda i, n: print(f"frame {i}/{n}", flush=True)
     if a.mode == "schlieren":
-        render_schlieren2d(a.folder, out, a.plane, a.width, a.height, a.fps, title=a.title, progress=prog)
+        if (a.xlim or a.ylim) and not a.out:
+            out = out[:-4] + "_zoom.mp4"
+        render_schlieren2d(a.folder, out, a.plane, a.width, a.height, a.fps, title=a.title, progress=prog,
+                           xlim=a.xlim, ylim=a.ylim)
     elif a.mode in ("flow", "flow-orbit"):
         if a.still_frame is not None and not a.out:
             out = out[:-4] + f"_f{a.still_frame}.png"
@@ -418,7 +425,7 @@ def _schlieren_layers(mesh, plane, snap0):
 
 
 def render_schlieren2d(folder, out, plane="xz", width=1920, height=1080, fps=30, k=5.0, title=None,
-                       progress=None):
+                       progress=None, xlim=None, ylim=None):
     """Side-on numerical schlieren of the recorded snapshots, like a wind-tunnel schlieren film:
     gradient magnitude on the plane through the axis (dark = steep), the vehicle a black silhouette.
 
@@ -437,6 +444,10 @@ def render_schlieren2d(folder, out, plane="xz", width=1920, height=1080, fps=30,
     layers, kind = _schlieren_layers(mesh, plane, np.load(files[0]))
     base = layers[0]
     a0, a1, b0, b1 = base[1][0], base[1][-1], base[2][0], base[2][-1]
+    if xlim:                                                    # zoom: crop to this window [m]
+        a0, a1 = max(a0, xlim[0]), min(a1, xlim[1])
+    if ylim:
+        b0, b1 = max(b0, ylim[0]), min(b1, ylim[1])
     hp = max((a1 - a0) / width, (b1 - b0) / height)            # metres per pixel, fit the frame
     A = a0 + hp * (np.arange(int((a1 - a0) / hp)) + 0.5)
     B = b0 + hp * (np.arange(int((b1 - b0) / hp)) + 0.5)
@@ -446,6 +457,7 @@ def render_schlieren2d(folder, out, plane="xz", width=1920, height=1080, fps=30,
     prep = []
     solid_img = np.zeros((len(A), len(B)))
     for name, a_, b_, sol, h, get in layers:
+        h = round(h, 4)
         ia = slice(np.searchsorted(A, a_[0]), np.searchsorted(A, a_[-1], "right"))
         ib = slice(np.searchsorted(B, b_[0]), np.searchsorted(B, b_[-1], "right"))
         if ia.stop <= ia.start or ib.stop <= ib.start:
@@ -454,16 +466,42 @@ def render_schlieren2d(folder, out, plane="xz", width=1920, height=1080, fps=30,
         pts = np.stack([AA.ravel(), BB.ravel()], -1)
         fill = distance_transform_edt(sol, return_distances=False, return_indices=True) if sol.any() and (~sol).any() else None
         solid_img[ia, ib] = RegularGridInterpolator((a_, b_), sol.astype(float))(pts).reshape(AA.shape)
-        prep.append((a_, b_, sol, get, fill, ia, ib, pts, AA.shape))
+        prep.append((h, a_, b_, sol, get, fill, ia, ib, pts, AA.shape))
+    # refinement levels (patches of one cell size), coarsest first. Each level is blended in over a
+    # few of its own cells from the edge of its covered area, and the thin gaps between
+    # neighbouring patches (interiors only are recorded) are filled from the nearest patch pixel,
+    # so no patch outlines show
+    from scipy.ndimage import binary_closing
+    levels = []
+    for h in sorted({P[0] for P in prep}, reverse=True):
+        members = [P for P in prep if P[0] == h]
+        cov = np.zeros((len(A), len(B)), bool)
+        for P in members:
+            cov[P[6], P[7]] = True
+        if h == prep[0][0]:
+            levels.append((members, None, None, None))
+            continue
+        gap = max(2, int(np.ceil(2.5 * h / hp)))
+        closed = binary_closing(cov, iterations=gap) | cov
+        near = distance_transform_edt(~cov, return_distances=False, return_indices=True)
+        dist = distance_transform_edt(closed) * hp
+        wgt = np.clip(dist / (3.0 * h), 0.0, 1.0)
+        levels.append((members, cov, closed, (near, wgt)))
 
     def grad_image(snap):
         g_img = np.zeros((len(A), len(B)))
-        for a_, b_, sol, get, fill, ia, ib, pts, shp in prep:
-            f = get(snap)
-            if fill is not None:
-                f = f[tuple(fill)]                                # walls: no step into solid values
-            ga, gb = np.gradient(f, a_, b_)
-            g_img[ia, ib] = RegularGridInterpolator((a_, b_), np.hypot(ga, gb))(pts).reshape(shp)
+        for members, cov, closed, aux in levels:
+            g_lev = g_img if cov is None else np.zeros_like(g_img)
+            for h, a_, b_, sol, get, fill, ia, ib, pts, shp in members:
+                f = get(snap)
+                if fill is not None:
+                    f = f[tuple(fill)]                            # walls: no step into solid values
+                ga, gb = np.gradient(f, a_, b_)
+                g_lev[ia, ib] = RegularGridInterpolator((a_, b_), np.hypot(ga, gb))(pts).reshape(shp)
+            if cov is not None:
+                near, wgt = aux
+                g_lev = g_lev[tuple(near)]                         # gaps between patches
+                g_img = np.where(closed, wgt * g_lev + (1.0 - wgt) * g_img, g_img)
         return g_img
 
     body = solid_img > 0.5
@@ -482,7 +520,8 @@ def render_schlieren2d(folder, out, plane="xz", width=1920, height=1080, fps=30,
         frame[oy:oy + len(B), ox:ox + len(A)] = (255 * img.T[::-1]).astype(np.uint8)
         im = Image.fromarray(frame).convert("RGB")
         txt = (title + "   " if title else "") + f"t = {float(snap['t']) * 1e3:.1f} ms"
-        ImageDraw.Draw(im).text((width // 100, height // 60), txt, fill=(255, 255, 255), font=font)
+        ImageDraw.Draw(im).text((width // 100, height // 60), txt, fill=(255, 255, 255), font=font,
+                                stroke_width=max(2, height // 400), stroke_fill=(0, 0, 0))
         writer.append_data(np.asarray(im))
         if progress:
             progress(i + 1, len(files))
