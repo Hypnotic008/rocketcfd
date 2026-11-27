@@ -31,7 +31,29 @@ guessed aero coefficients in CatchSim (`quatsim/aero.py`).
 | Engine plumes (nozzle-exit inflow), landing burns (`--engines`), hot staging (`cases/hot_staging.py`) | done, underexpanded-jet check |
 | Probes (time histories, spectra), restarts across grids / physics | done |
 
-### What changed in the latest round (Nov 25, evening)
+### What changed in the latest round (Nov 27)
+
+* **LES numerics as in NASA LAVA.** `--scheme weno5z` gives fifth-order WENO-Z reconstruction:
+  4-6x less error on smooth vortical flow, a sharper Sod shock tube, and the same Mach 4 bow
+  shock against an immersed wall. See
+  [LES numerics and refinement](#les-numerics-and-refinement-in-the-style-of-nasa-lava).
+* **Averaged-criterion refinement** (Mozaffari et al. 2022). Every `--les` run records the
+  time-averaged error criterion. `--adapt-from <run>` then places patches where it is largest,
+  within a cell budget (`--adapt-cells`), with `--adapt-goal loads` for load-focused runs.
+* **Restarts onto new grids.**
+  - Near-wall, solid and non-finite cells are re-seeded from clean flow; this fixed the step-50
+    blow-ups.
+  - A change of windward side turns the old crossflow.
+  - `ROCKETCFD_TRACE=N` names the first grid and cell that goes bad.
+* **Movies.**
+  - Schlieren films composite every grid at full resolution, with `--xlim/--ylim` to zoom.
+  - The flow movie gains `--no-streaks`, `--oil-flow` (oil-flow lines on the hull),
+    `--volume` (3-D schlieren smoke), `--tween N` (smooth in-between frames) and `--start K`.
+  - Shock and vortex surfaces are cut from every patch at its own resolution and smoothed.
+  - `--mode buffet` draws mean Cp and Cp_rms maps.
+* **Snapshots** are written on a background thread, so the GPU no longer waits for compression.
+
+### Earlier round (Nov 25, evening)
 
 * **Desktop app** (`python -m rocketcfd.app`, or double-click `rocketcfd_app.bat`): see
   [Desktop app](#desktop-app) below.
