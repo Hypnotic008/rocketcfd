@@ -1428,7 +1428,7 @@ def wall_stiff_kernel(W: wp.array4d(dtype=wp.float32), ix: wp.array(dtype=wp.flo
 # then adds the wall fluxes (thin-wall faces, wall function) and writes R. Same arithmetic as
 # residual_kernel (tests/split_residual.py compares the two).
 
-def _make_face_kernel(D: int, VISC: int):
+def _make_face_kernel(D: int, VISC: int, WENO: int = 0):
     DI = 1 if D == 0 else 0
     DJ = 1 if D == 1 else 0
     DK = 1 if D == 2 else 0
@@ -1454,7 +1454,7 @@ def _make_face_kernel(D: int, VISC: int):
             # WENO5-Z (kind bit 3) where its six-cell stencil fits inside the padded array and
             # crosses no thin wall; MUSCL elsewhere (domain / patch edges, next to fin plates)
             use_w = int(0)
-            if (kind & 8) != 0 and order > 0.0 and bLL == 0 and bRR == 0:
+            if wp.static(WENO != 0) and order > 0.0 and bLL == 0 and bRR == 0:
                 ia = I * wp.static(DI) + J * wp.static(DJ) + K * wp.static(DK)
                 if ia >= 2 and ia + 3 < W.shape[wp.static(D + 1)]:
                     b2L = (blk[I - wp.static(2 * DI), J - wp.static(2 * DJ), K - wp.static(2 * DK)] >> wp.static(D)) & 1
@@ -1468,10 +1468,13 @@ def _make_face_kernel(D: int, VISC: int):
                             for o in range(-2, 4):
                                 if vp.fluid[I + o * wp.static(DI), J + o * wp.static(DJ), K + o * wp.static(DK)] < 0.5:
                                     use_w = 0
-            if use_w != 0:
-                q2 = load(W, I - wp.static(2 * DI), J - wp.static(2 * DJ), K - wp.static(2 * DK))
-                q3 = load(W, I + wp.static(3 * DI), J + wp.static(3 * DJ), K + wp.static(3 * DK))
-                f = weno_face_flux(q2, qm, qa, qb, qp, q3, wp.static(D), g, kind, hl)
+            if wp.static(WENO != 0):
+                if use_w != 0:
+                    q2 = load(W, I - wp.static(2 * DI), J - wp.static(2 * DJ), K - wp.static(2 * DK))
+                    q3 = load(W, I + wp.static(3 * DI), J + wp.static(3 * DJ), K + wp.static(3 * DK))
+                    f = weno_face_flux(q2, qm, qa, qb, qp, q3, wp.static(D), g, kind, hl)
+                else:
+                    f = face_flux(qm, qa, qb, qp, wp.static(D), g, order, kind, hl, float(1 - bLL), float(1 - bRR))
             else:
                 f = face_flux(qm, qa, qb, qp, wp.static(D), g, order, kind, hl, float(1 - bLL), float(1 - bRR))
             if wp.static(VISC != 0):
@@ -1559,6 +1562,8 @@ def _make_div_kernel(D: int, VISC: int):
 
 
 FACE_KERNELS = [[_make_face_kernel(d, v) for d in range(3)] for v in (0, 1)]
+# WENO5-Z variants, compiled separately so the default kernels keep their register budget
+FACE_KERNELS_WENO = [[_make_face_kernel(d, v, 1) for d in range(3)] for v in (0, 1)]
 DIV_KERNELS = [[_make_div_kernel(d, v) for d in range(3)] for v in (0, 1)]
 
 

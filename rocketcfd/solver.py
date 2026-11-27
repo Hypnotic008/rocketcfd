@@ -929,8 +929,9 @@ class Solver:
                 if self._active_flux[d] != 0:
                     dims = list(self.n)
                     dims[d] += 1
-                    self._L(K.FACE_KERNELS[visc][d], tuple(dims), [w["W"], w["S"], w["blk"], self.gamma, float(order),
-                                                                  kind, self._vp, w["F"]])
+                    fk = K.FACE_KERNELS_WENO if (kind & 8) else K.FACE_KERNELS
+                    self._L(fk[visc][d], tuple(dims), [w["W"], w["S"], w["blk"], self.gamma, float(order),
+                                                       kind, self._vp, w["F"]])
                     self._L(K.DIV_KERNELS[visc][d], self.n, [w["W"], w[("ix", "iy", "iz")[d]], self.gamma, w["blk"],
                                                              self._vp, w["F"], first, w["R"]])
                     first = 0
