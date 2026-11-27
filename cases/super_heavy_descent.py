@@ -254,7 +254,19 @@ def main(argv=None):
         print(f"note: {s.n_ib_fallback} ghost cells used nearest-fluid fallback (thin features)")
     if a.restart:
         from rocketcfd import restart
-        restart.load(runner, a.restart)
+        import json as _json
+        lj = os.path.join(a.restart if os.path.isdir(a.restart) else os.path.dirname(a.restart), "loads.json")
+        rot = 0.0
+        if os.path.exists(lj):
+            oc = _json.load(open(lj))
+            ow = oc.get("condition_windward")
+            if ow is not None and abs((a.windward - ow + 180) % 360 - 180) > 0.5:
+                rot = float(_az(a.windward) - _az(ow))
+            co = oc.get("condition", {})
+            if abs(co.get("aoa_from_engines_first", a.aoa) - a.aoa) > 0.5 or abs(co.get("mach", a.mach) - a.mach) > 0.02:
+                print(f"note: restart flow was M {co.get('mach')} aoa {co.get('aoa_from_engines_first')}; "
+                      f"expect a longer start-up transient")
+        restart.load(runner, a.restart, rotate_x=rot)
 
     # steps for the requested number of flow-throughs (estimated from the freestream)
     cs = c

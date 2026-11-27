@@ -62,8 +62,42 @@ def _centres(faces):
     return out
 
 
-def load(runner, path, gamma=None, verbose=True):
-    """Fill `runner` (Solver or PatchGrid) from a restart file. Returns 'exact' or 'interpolated'."""
+def _reseed_near_walls(n, vals, h_src, verbose=True, band=1.5):
+    """New fluid cells within `band` old cells of a wall (body or thin fin plate) take the state of
+    the nearest new fluid cell clear of the walls.
+
+    Interpolating from the old grid there mixes in its solid and immersed-boundary ghost cells,
+    which hold mirrored (wall-reflected) states; on a finer new grid around thin grid-fin plates
+    those land in the free flow and an LES restarted that way blew up within 50 steps at the
+    windward fin. The solver rebuilds the near-wall flow from the re-seeded state in a few steps."""
+    shape = h_src.shape
+    if not hasattr(n, "phi") or n.phi.shape != shape:
+        return
+    dist = np.asarray(n.phi, float).copy()
+    td = getattr(n, "_thin_dist", None)
+    if td is not None:
+        sub, d_thin = td
+        dist[sub] = np.minimum(dist[sub], d_thin)
+    fluid = np.asarray(n.fluid, bool)
+    near = fluid & (dist < band * h_src)
+    far = fluid & ~near
+    if not near.any() or not far.any():
+        return
+    from scipy.ndimage import distance_transform_edt
+    idx = distance_transform_edt(~far, return_distances=False, return_indices=True)
+    flat = np.ravel_multi_index(tuple(idx), shape)[near]
+    V = vals.reshape(vals.shape[0], -1)
+    nz = np.flatnonzero(near.ravel())
+    V[:, nz] = V[:, flat]
+    if verbose:
+        print(f"restart: {len(nz)} near-wall cells re-seeded from the flow clear of the walls")
+
+
+def load(runner, path, gamma=None, verbose=True, rotate_x=0.0):
+    """Fill `runner` (Solver or PatchGrid) from a restart file. Returns 'exact' or 'interpolated'.
+
+    rotate_x [rad]: turn the old velocity vectors about the x axis (a restart at a different
+    windward side). Any rotation, or a different grid, goes through the interpolation path."""
     from scipy.interpolate import RegularGridInterpolator
     old, t, step = _read(path)
     new = _grids(runner)
@@ -73,7 +107,7 @@ def load(runner, path, gamma=None, verbose=True):
         all(len(o["faces"][d]) == len(n.faces[d]) and np.allclose(o["faces"][d], n.faces[d]) for d in range(3))
         for o, n in zip(old, new))
     with torch.no_grad():
-        if same:
+        if same and not rotate_x:
             for o, n in zip(old, new):
                 n.U.copy_(torch.as_tensor(o["U"], dtype=n.dtype, device=n.device))
                 if n.turbulence and "K" in o:
@@ -89,11 +123,15 @@ def load(runner, path, gamma=None, verbose=True):
         # interpolation: primitive variables from the finest old grid containing each point
         vol = [float(np.prod([np.min(np.diff(o["faces"][d])) for d in range(3)])) for o in old]
         order = np.argsort(vol)                                    # finest first
-        interps = []
+        interps, h_old = [], []
         for i in order:
+            h_old.append(float(max(np.max(np.diff(o["faces"][d])) for d in range(3))))
             o = old[i]
             ax = _centres(o["faces"])
             W = cons_to_prim(torch.as_tensor(o["U"], dtype=torch.float64), gam, 1e-9, 1e-6).numpy()
+            if rotate_x:
+                cr, sr = np.cos(rotate_x), np.sin(rotate_x)
+                W[2], W[3] = cr * W[2] - sr * W[3], sr * W[2] + cr * W[3]
             fields = [W[c] for c in range(5)]
             if "K" in o:
                 fields += [o["K"] / np.maximum(W[0], 1e-12), o["O"] / np.maximum(W[0], 1e-12)]
@@ -106,20 +144,24 @@ def load(runner, path, gamma=None, verbose=True):
             P = np.stack([X.ravel(), Y.ravel(), Z.ravel()], -1)
             done = np.zeros(len(P), bool)
             vals = np.zeros((7, len(P)))
+            h_src = np.zeros(len(P))                              # cell size of the old grid used
             have_turb = False
-            for lo, hi, its in interps:
+            for (lo, hi, its), hs in zip(interps, h_old):
                 ins = ~done & np.all((P >= lo) & (P <= hi), axis=1)
                 if not ins.any():
                     continue
                 for c, it in enumerate(its):
                     vals[c, ins] = it(P[ins])
+                h_src[ins] = hs
                 have_turb |= len(its) == 7
                 done |= ins
             if (~done).any():                                     # outside every old grid: nearest
                 lo, hi, its = interps[-1]
                 for c, it in enumerate(its):
                     vals[c, ~done] = it(np.clip(P[~done], lo, hi))
+                h_src[~done] = h_old[-1]
             shape = X.shape
+            _reseed_near_walls(n, vals, h_src.reshape(shape), verbose)
             W = vals[:5].reshape((5,) + shape)
             W[0] = np.maximum(W[0], 1e-6)
             W[4] = np.maximum(W[4], 1e-3)
@@ -134,5 +176,6 @@ def load(runner, path, gamma=None, verbose=True):
                     n.K1_buf.copy_(n.K_buf)
                     n.O1_buf.copy_(n.O_buf)
     if verbose:
-        print(f"restart: interpolated from {len(old)} old grid(s) onto {len(new)} new grid(s)")
+        rot = f", crossflow turned {np.degrees(rotate_x):+.0f} deg" if rotate_x else ""
+        print(f"restart: interpolated from {len(old)} old grid(s) onto {len(new)} new grid(s){rot}")
     return "interpolated"
