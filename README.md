@@ -478,6 +478,21 @@ Each flow frame has five layers:
 The background is graded, and translucent layers are depth-peeled so they stack correctly.
 `--still-frame K` writes frame K as a PNG, to preview a look before rendering the whole movie.
 
+More options for the flow movie:
+- `--no-streaks`: drop the tracer streaks, leaving the surfaces and the plane.
+- `--oil-flow`: oil-flow lines on the hull, as in a wind-tunnel oil-flow test. They come from the
+  near-wall velocity, taken 0.45 m off the wall and integrated on the surface. They show
+  separation and attachment lines and the flow around the chines.
+- `--refine N`: the shock and vortex surfaces are cut from every patch at its own resolution and
+  from the base flow resampled N times finer (cubic), then smoothed, instead of in cell-sized
+  facets. The default is 2 on volumes recorded coarser than 0.45 m, else 1.
+- `--start K`: skip the first K snapshots, for example the transient after a restart onto a new
+  grid.
+
+The schlieren film (`--mode schlieren`) composites every grid on the plane: the full-resolution
+base plane plus every patch, finest on top, blended without seams. `--xlim X0 X1 --ylim Y0 Y1`
+zooms it, for example on the fins: `--xlim 44 80 --ylim -10.2 10.2`.
+
 Refinement patches (for example `--fin-h 0.06` around the grid fins) are recorded into the 3-D
 snapshots at the same stride as the base grid, capped at 8 M patch cells. The flow movies sample
 the finest grid at every point, so the streaks thread the fin lattice from the 6 cm solution and
@@ -549,6 +564,57 @@ new run from it: on the same grids it continues exactly; on other grids or with 
 fields are interpolated from the finest old grid at each point. Useful for continuing a run that
 stopped early, refining a converged run, or starting `--les` / `--turbulent` from a converged
 inviscid solution (which skips most of the start-up).
+
+## LES numerics and refinement in the style of NASA LAVA
+
+NASA's LAVA Cartesian solver, whose launch-vehicle videos set the look we're after, uses
+fifth-order WENO-Z shock capturing on block-structured Cartesian refinement with immersed
+boundaries. It advances every refinement level with one time step, as here, and tags refinement
+by gradients and vorticity, with the threshold tuned to a requested cell budget (Kiris et al.,
+Aerosp. Sci. Technol. 55, 2016). Two pieces of that are now in rocketcfd.
+
+**`--scheme weno5z`**: fifth-order WENO-Z reconstruction (Borges et al. 2008) of the primitive
+variables, in place of Koren MUSCL. It is used in time-accurate runs only. Steady and implicit
+solves keep Koren: the implicit Mach 4 cylinder diverged with WENO. Koren is also used wherever
+the six-cell stencil doesn't fit:
+- the domain and patch edges
+- next to thin walls (fin plates)
+- wherever the stencil touches a non-fluid cell; on the immersed wall the mirrored ghost states
+  made the stagnation pressure 3.6 % low.
+
+The WENO kernels are compiled separately, so Koren runs are unaffected.
+
+| Check | Koren | WENO5-Z |
+|---|---|---|
+| Isentropic vortex, L1(rho), N = 32 / 64 (`tests/vortex_order.py`) | 5.4e-3 / 7.3e-4 | 9.7e-4 / 1.7e-4 |
+| Sod shock tube, L1(rho) (`tests/limiter_shocks.py`) | 0.00144 | 0.00112 |
+| Mach 4 cylinder, time-accurate: standoff vs Billig / p_stag vs Rayleigh (`tests/weno_ib_shock.py`) | +12.2 % / +0.6 % | +12.2 % / +0.7 % |
+| Taylor-Green 32^3, dissipation peak time, no model / Vreman (DNS ~9) (`tests/taylor_green.py --limiter weno5z`) | 7.0 / 5.5 | 7.5 / 6.0 |
+
+That is 4-6x less error on smooth vortical flow, and a later, more DNS-like breakdown. The
+measured order is 2.5, not 5: the time stepping (SSP-RK2) and the one-point face quadrature are
+second order. The lower error is what shows in vortices and wakes.
+
+**Averaged-criterion refinement** (Mozaffari, Guilmineau, Visonneau & Wackers, Comput. Fluids
+232, 2022). An LES grid that follows every eddy keeps changing under the turbulence it resolves.
+Their fix is to refine on the time average of the instantaneous criterion, which settles on the
+shock layers, the wake and the shear layers. The criterion is the Hessian error indicator
+`C = max(|H(p)|, rho U |H(u)|, rho U |H(v)|, rho U |H(w)|)^1/2`.
+
+Every `--les` run records it on the base grid every 50 steps into `adapt_criterion.npz`
+(`--no-adapt-record` turns it off). The next run places patches of `--adapt-h` cells where
+C h is largest, inside a box around the vehicle, with the threshold set from a
+`--adapt-cells` budget (as in LAVA). It skips regions an existing patch already refines as
+finely:
+
+```bash
+# 1. any LES run records the averaged criterion
+python cases/super_heavy_descent.py --h 0.3 --fins parametric --fin-h 0.04 --aoa 15 --windward 90 --les --scheme weno5z --flowthroughs 2 --out results/les_a
+# 2. refine where it is largest (3 M cells of 15 cm), restart from run 1
+python cases/super_heavy_descent.py --h 0.3 --fins parametric --fin-h 0.04 --aoa 15 --windward 90 --les --scheme weno5z --adapt-from results/les_a --adapt-h 0.15 --adapt-cells 3e6 --restart results/les_a --flowthroughs 3 --snapshots 400 --snap-volume 1 --out results/les_b
+```
+
+Add `--dry-run` to the second command to see the patch count and memory first.
 
 ## Probes: time histories and spectra
 
