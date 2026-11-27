@@ -16,6 +16,7 @@ MOVIES = [
     ("Flow through the grid fins, close-up (needs 3-D snapshots)", "-m rocketcfd.cinematic", ["--mode", "flow", "--camera", "fins"]),
     ("Flow fly-by: wide view, then in along the hull to the fins (needs 3-D snapshots)", "-m rocketcfd.cinematic", ["--mode", "flow", "--camera", "flyby"]),
     ("Schlieren film, side view, no model (needs 3-D snapshots)", "-m rocketcfd.cinematic", ["--mode", "schlieren"]),
+    ("Buffet maps: mean Cp and Cp rms on the hull (PNG, unsteady runs)", "-m rocketcfd.cinematic", ["--mode", "buffet"]),
     ("Flow streaks on a steady result (camera drift)", "-m rocketcfd.cinematic", ["--mode", "flow-orbit"]),
     ("Cinematic: flow evolving (LAVA style, needs 3-D snapshots)", "-m rocketcfd.cinematic", ["--mode", "evolve", "--style", "lava"]),
     ("Cinematic: orbit around the steady flow (LAVA style)", "-m rocketcfd.cinematic", ["--mode", "orbit", "--style", "lava"]),

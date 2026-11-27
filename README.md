@@ -495,6 +495,15 @@ More options for the flow movie:
 - `--start K`: skip the first K snapshots, for example the transient after a restart onto a new
   grid.
 
+**Buffet maps** (`--mode buffet`, a PNG): the mean surface pressure and its fluctuation (Cp_rms,
+the standard deviation over the snapshots) on the windward and leeward sides. They show where
+an LES buffets the hull, the fin roots and the engine end. Use snapshots of developed flow:
+skip the start-up with `--start`.
+
+```bash
+python -m rocketcfd.cinematic results/les_hull15 --mode buffet --start 100
+```
+
 The schlieren film (`--mode schlieren`) composites every grid on the plane: the full-resolution
 base plane plus every patch, finest on top, blended without seams. `--xlim X0 X1 --ylim Y0 Y1`
 zooms it, for example on the fins: `--xlim 44 80 --ylim -10.2 10.2`.

@@ -295,7 +295,8 @@ def render_evolve(folder, out, style="lava", width=1920, height=1080, fps=30, q=
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("folder")
-    ap.add_argument("--mode", choices=["still", "orbit", "evolve", "schlieren", "flow", "flow-orbit"], default="still",
+    ap.add_argument("--mode", choices=["still", "orbit", "evolve", "schlieren", "flow", "flow-orbit", "buffet"],
+                    default="still",
                     help="schlieren: 2-D side-on schlieren film of the snapshots (no model); flow: the 3-D model "
                          "with tracer streaks through the recorded flow; flow-orbit: the same on a steady result")
     ap.add_argument("--plane", choices=["xz", "xy"], default="xz", help="schlieren: plane through the axis")
@@ -334,10 +335,14 @@ def main(argv=None):
     ap.add_argument("--q", type=float, default=None, help="Q-criterion level (default: automatic)")
     ap.add_argument("--title", default=None)
     a = ap.parse_args(argv)
-    ext = "png" if a.mode == "still" else "mp4"
+    ext = "png" if a.mode in ("still", "buffet") else "mp4"
     tag = a.style if a.mode in ("still", "orbit", "evolve") else (a.plane if a.mode == "schlieren" else a.camera)
     out = a.out or os.path.join(a.folder, f"cinematic_{a.mode}_{tag}.{ext}")
     prog = lambda i, n: print(f"frame {i}/{n}", flush=True)
+    if a.mode == "buffet":
+        out = a.out or os.path.join(a.folder, "buffet_cp.png")
+        print("wrote", render_buffet(a.folder, out, a.width, a.height, start=a.start, title=a.title))
+        return
     if a.mode == "schlieren":
         if (a.xlim or a.ylim) and not a.out:
             out = out[:-4] + "_zoom.mp4"
@@ -386,6 +391,74 @@ def add_vehicle(pl, body, fins, color="#c9ced6"):
     pl.add_mesh(body, color=color, ambient=0.22, diffuse=0.75, specular=0.5, specular_power=30, smooth_shading=True)
     for f in fins:
         pl.add_mesh(f, color="#9aa2ad", ambient=0.25, diffuse=0.7, specular=0.3)
+
+
+# ---------------------------------------------------------------- buffet maps (LES statistics)
+def render_buffet(folder, out, width=1920, height=1080, start=0, title=None):
+    """Mean surface pressure and its fluctuation (Cp_rms) over the recorded snapshots, on the
+    windward and leeward sides: where an unsteady (LES) run buffets the hull and the fins'
+    surroundings. Uses the surface Cp every snapshot records; skip a start-up transient with
+    `start`. Cp_rms is the standard deviation over the snapshots, so it needs a run whose
+    snapshots span at least a flow-through or two of developed flow."""
+    from scipy.spatial import cKDTree
+    from .vehicles.super_heavy import _az
+    sd = os.path.join(folder, "snapshots")
+    mesh = dict(np.load(os.path.join(sd, "mesh.npz")))
+    files = sorted(glob.glob(os.path.join(sd, "snap_*.npz")))[start:]
+    if len(files) < 3:
+        raise SystemExit("buffet maps need at least 3 snapshots")
+    cps = np.stack([np.load(f)["cp"].astype(np.float32) for f in files])
+    ts = [float(np.load(f)["t"]) for f in (files[0], files[-1])]
+    mean, rms = cps.mean(0), cps.std(0)
+    meta = {}
+    mp = os.path.join(folder, "loads.json")
+    if os.path.exists(mp):
+        with open(mp) as fh:
+            meta = json.load(fh)
+    body, fins = vehicle_meshes(meta)
+    # the recorded surface is the base grid's (coarse): inverse-distance weights over the 6 nearest
+    # of its points onto the display mesh, instead of nearest-point blocks
+    dist, idx = cKDTree(mesh["xyz"].astype(float)).query(np.asarray(body.points), k=6)
+    wts = 1.0 / np.maximum(dist, 1e-3) ** 2
+    wts /= wts.sum(1, keepdims=True)
+    body = body.copy()
+    body.point_data["Cp mean"] = (mean[idx] * wts).sum(1)
+    body.point_data["Cp rms"] = (rms[idx] * wts).sum(1)
+    tw = _az(float(meta.get("condition_windward", 180.0)))
+    wdir = np.array([0.0, np.cos(tw), np.sin(tw)])           # the side the air comes from
+    up = np.array([0.0, -np.sin(tw), np.cos(tw)])
+    bb = body.bounds
+    fb = np.array([f_.bounds for f_ in fins]) if fins else np.array([bb])
+    span = max(fb[:, 3].max(), fb[:, 5].max(), bb[3], bb[5]) - min(fb[:, 2].min(), fb[:, 4].min(), bb[2], bb[4])
+    c = np.array([(bb[0] + bb[1]) / 2, 0.0, 0.0])
+    D = 1.05 * (bb[1] - bb[0])
+    hi_m = float(max(abs(np.percentile(mean, 2)), abs(np.percentile(mean, 98)), 0.05))
+    hi_r = float(max(np.percentile(rms, 99.5), 1e-4))
+    # four full-width rows (the booster is ~8:1): mean windward / leeward, rms windward / leeward
+    pl = pv.Plotter(off_screen=True, window_size=(width, height), shape=(4, 1), border=False)
+    rows = [("Cp mean", "coolwarm", [-hi_m, hi_m], "windward", 1.0), ("Cp mean", "coolwarm", [-hi_m, hi_m], "leeward", -1.0),
+            ("Cp rms", "magma", [0.0, hi_r], "windward", 1.0), ("Cp rms", "magma", [0.0, hi_r], "leeward", -1.0)]
+    for r_, (fld, cmap, clim, side, sgn) in enumerate(rows):
+        pl.subplot(r_, 0)
+        pl.set_background("#05070d", top="#141c2c")
+        pl.add_mesh(body, scalars=fld, cmap=cmap, clim=clim, smooth_shading=True, ambient=0.35, diffuse=0.7,
+                    specular=0.2, show_scalar_bar=True,
+                    scalar_bar_args=dict(title=fld, color="white", vertical=True, height=0.72, width=0.018,
+                                         position_x=0.95, position_y=0.12, fmt="%.2f", title_font_size=11,
+                                         label_font_size=10, n_labels=3))
+        for f_ in fins:
+            pl.add_mesh(f_, color="#8d949e", ambient=0.3)
+        pl.add_text(f"{fld}, {side} side", position="upper_left", font_size=9, color="#c8ccd4")
+        pl.camera_position = [tuple(c + sgn * D * wdir), tuple(c), tuple(up)]
+        pl.enable_parallel_projection()
+        aspect = width / (height / 4.0)
+        pl.camera.parallel_scale = 0.5 * max(1.08 * (bb[1] - bb[0]) / aspect, 1.08 * span)
+    pl.subplot(3, 0)
+    pl.add_text((title + "   " if title else "") + f"{len(files)} snapshots, t = {ts[0]*1e3:.0f}-{ts[1]*1e3:.0f} ms",
+                position="lower_left", font_size=9, color="#9aa3b0")
+    pl.screenshot(out)
+    pl.close()
+    return out
 
 
 # ---------------------------------------------------------------- 2-D schlieren movie (no model)
