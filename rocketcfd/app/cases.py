@@ -86,6 +86,17 @@ def _sh_fields():
         Field("les", "Unsteady LES (wall-modelled)", "bool", False, "Time-accurate large-eddy simulation with the "
               "Vreman subgrid model and an equilibrium wall model: for unsteady wakes and movies. Use with "
               "Snapshots.", G5),
+        Field("scheme", "Reconstruction scheme", "choice", "koren", "koren: third-order MUSCL (default). weno5z: "
+              "fifth-order WENO-Z as in NASA LAVA, less numerical dissipation: sharper vortices and wakes in "
+              "LES. Time-accurate runs only (steady / implicit solves use koren).", G5,
+              choices=["koren", "weno5z"]),
+        Field("adapt-from", "Refine from LES (folder)", "text", "", "An earlier LES run's results folder: add "
+              "refinement patches where its time-averaged error criterion is largest (Mozaffari et al. 2022).",
+              G5, advanced=True),
+        Field("adapt-h", "Adapted patch cell size [m]", "float", 0.15, "", G5, lo=0.02, hi=1.0, step=0.01,
+              advanced=True),
+        Field("adapt-cells", "Adapted patch cell budget", "float", 3e6, "Number of new cells the adapted patches "
+              "may use (sets the refinement threshold, as in LAVA).", G5, lo=1e4, hi=5e7, step=5e5, advanced=True),
         Field("implicit", "Implicit solver", "bool", False, "Implicit steady solver: far fewer iterations. "
               "On automatically with refinement patches.", G5),
         Field("explicit", "Force explicit (with patches)", "bool", False, "Explicit local time steps on the patch "
