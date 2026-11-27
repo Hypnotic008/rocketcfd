@@ -369,62 +369,121 @@ def add_vehicle(pl, body, fins, color="#c9ced6"):
 
 
 # ---------------------------------------------------------------- 2-D schlieren movie (no model)
-def render_schlieren2d(folder, out, plane="xz", width=1920, height=1080, fps=30, k=6.0, h_img=0.06,
-                       title=None, progress=None):
-    """Side-on numerical schlieren of the recorded 3-D snapshots, like a wind-tunnel schlieren film:
-    density gradient on the plane through the axis, dark = steep; the vehicle is a black silhouette."""
+def _schlieren_layers(mesh, plane, snap0):
+    """Every grid that has data on the plane through the axis, coarsest first:
+    (name, a axis, b axis, solid 2-D, cell size, getter(snap) -> field 2-D, kind)."""
+    b_key = "y" if plane == "xy" else "z"
+    dens = f"rho_{plane}" in snap0
+    layers = []
+    # base grid: full-resolution plane (density on new runs, Mach on older ones)
+    a_ax, b_ax = mesh["x"].astype(float), mesh[b_key].astype(float)
+    key = f"rho_{plane}" if dens else f"mach_{plane}"
+    h0 = float(min(np.min(np.diff(a_ax)), np.min(np.diff(b_ax))))
+    layers.append(("base", a_ax, b_ax, mesh[f"solid_{plane}"].astype(bool), h0,
+                   (lambda sn, k=key: sn[k].astype(np.float32).astype(float))))
+    n_pp = int(mesh.get("n_plane_patches", 0))
+    if n_pp and dens:
+        for k in range(n_pp):
+            if f"pp{k}_{plane}_a" not in mesh:
+                continue
+            a_, b_ = mesh[f"pp{k}_{plane}_a"].astype(float), mesh[f"pp{k}_{plane}_b"].astype(float)
+            h = float(min(np.min(np.diff(a_)), np.min(np.diff(b_))))
+            layers.append((f"pp{k}", a_, b_, mesh[f"pp{k}_{plane}_solid"].astype(bool), h,
+                           (lambda sn, k=k: sn[f"pp{k}_{plane}_rho"].astype(np.float32).astype(float))))
+    else:
+        # older runs: slice the recorded patch volumes (strided) where they reach the plane
+        gam = float(mesh.get("gamma", 1.4))
+        p_inf = float(mesh["p_inf"])
+        for k in range(int(mesh.get("n_patches", 0))):
+            c = mesh[f"p{k}_{'z' if plane == 'xy' else 'y'}"].astype(float)
+            if len(c) < 2:
+                continue
+            j = int(np.argmin(np.abs(c)))
+            if abs(c[j]) > 0.5 * float(np.max(np.diff(c))) + 1e-9:
+                continue
+            a_, b_ = mesh[f"p{k}_x"].astype(float), mesh[f"p{k}_{b_key}"].astype(float)
+            take = (lambda A, j=j: A[:, :, j]) if plane == "xy" else (lambda A, j=j: A[:, j, :])
+            h = float(min(np.min(np.diff(a_)), np.min(np.diff(b_))))
+
+            def get(sn, k=k, take=take):
+                r = take(sn[f"p{k}_rho"]).astype(float)
+                if dens:
+                    return r
+                u, v, w = (take(sn[f"p{k}_{c_}"]).astype(float) for c_ in "uvw")
+                pr = np.maximum(take(sn[f"p{k}_dp"]).astype(float) + p_inf, 1e-6)
+                return np.sqrt(u * u + v * v + w * w) / np.sqrt(gam * pr / np.maximum(r, 1e-9))
+            layers.append((f"p{k}", a_, b_, take(mesh[f"p{k}_solid"]).astype(bool), h, get))
+    layers.sort(key=lambda L: -L[4])
+    return layers, ("density" if dens else "Mach number")
+
+
+def render_schlieren2d(folder, out, plane="xz", width=1920, height=1080, fps=30, k=5.0, title=None,
+                       progress=None):
+    """Side-on numerical schlieren of the recorded snapshots, like a wind-tunnel schlieren film:
+    gradient magnitude on the plane through the axis (dark = steep), the vehicle a black silhouette.
+
+    Composites every grid on the plane, finest on top: the base grid at full resolution plus the
+    refinement patches (e.g. 4 cm around the grid fins). Runs recorded before full-resolution
+    density planes existed use the full-resolution Mach planes instead (shocks look the same)."""
     import imageio.v2 as iio
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+    from PIL import Image, ImageDraw, ImageFont
     from scipy.interpolate import RegularGridInterpolator
+    from scipy.ndimage import distance_transform_edt
     sd = os.path.join(folder, "snapshots")
     mesh = dict(np.load(os.path.join(sd, "mesh.npz")))
-    if "vx" not in mesh:
-        raise SystemExit("needs 3-D snapshots: run with --snapshots N --snap-volume 1")
     files = sorted(glob.glob(os.path.join(sd, "snap_*.npz")))
-    x, y, z = mesh["vx"].astype(float), mesh["vy"].astype(float), mesh["vz"].astype(float)
-    if plane == "xz":
-        j = int(np.argmin(np.abs(y)))
-        a_ax, b_ax, take = x, z, (lambda A: A[:, j, :])
-    else:
-        j = int(np.argmin(np.abs(z)))
-        a_ax, b_ax, take = x, y, (lambda A: A[:, :, j])
-    solid = take(mesh["vol_solid"]).astype(float)
-    # uniform image grid (the solver grid is stretched)
-    A = np.arange(a_ax[0], a_ax[-1], h_img)
-    B = np.arange(b_ax[0], b_ax[-1], h_img)
-    AA, BB = np.meshgrid(A, B, indexing="ij")
-    pts = np.stack([AA.ravel(), BB.ravel()], -1)
-    mask = RegularGridInterpolator((a_ax, b_ax), solid, bounds_error=False, fill_value=0.0)(pts).reshape(AA.shape) > 0.5
+    if not files:
+        raise SystemExit(f"no snapshots in {sd}")
+    layers, kind = _schlieren_layers(mesh, plane, np.load(files[0]))
+    base = layers[0]
+    a0, a1, b0, b1 = base[1][0], base[1][-1], base[2][0], base[2][-1]
+    hp = max((a1 - a0) / width, (b1 - b0) / height)            # metres per pixel, fit the frame
+    A = a0 + hp * (np.arange(int((a1 - a0) / hp)) + 0.5)
+    B = b0 + hp * (np.arange(int((b1 - b0) / hp)) + 0.5)
+    print(f"schlieren ({kind} gradient, plane {plane}): {len(layers)} grids, finest "
+          f"{min(L[4] for L in layers) * 100:.0f} cm, {hp * 100:.1f} cm per pixel")
+    # per layer: the pixel rectangle it covers, and the nearest-fluid fill for its solid cells
+    prep = []
+    solid_img = np.zeros((len(A), len(B)))
+    for name, a_, b_, sol, h, get in layers:
+        ia = slice(np.searchsorted(A, a_[0]), np.searchsorted(A, a_[-1], "right"))
+        ib = slice(np.searchsorted(B, b_[0]), np.searchsorted(B, b_[-1], "right"))
+        if ia.stop <= ia.start or ib.stop <= ib.start:
+            continue
+        AA, BB = np.meshgrid(A[ia], B[ib], indexing="ij")
+        pts = np.stack([AA.ravel(), BB.ravel()], -1)
+        fill = distance_transform_edt(sol, return_distances=False, return_indices=True) if sol.any() and (~sol).any() else None
+        solid_img[ia, ib] = RegularGridInterpolator((a_, b_), sol.astype(float))(pts).reshape(AA.shape)
+        prep.append((a_, b_, sol, get, fill, ia, ib, pts, AA.shape))
 
     def grad_image(snap):
-        # gradient on the solver grid (no interpolation overshoot at shocks), then linear resampling
-        rho = take(snap["vol_rho"].astype(np.float32)).astype(float)
-        ga, gb = np.gradient(rho, a_ax, b_ax)
-        g = np.hypot(ga, gb)
-        g[solid > 0.5] = 0.0
-        return RegularGridInterpolator((a_ax, b_ax), g, bounds_error=False, fill_value=0.0)(pts).reshape(AA.shape)
+        g_img = np.zeros((len(A), len(B)))
+        for a_, b_, sol, get, fill, ia, ib, pts, shp in prep:
+            f = get(snap)
+            if fill is not None:
+                f = f[tuple(fill)]                                # walls: no step into solid values
+            ga, gb = np.gradient(f, a_, b_)
+            g_img[ia, ib] = RegularGridInterpolator((a_, b_), np.hypot(ga, gb))(pts).reshape(shp)
+        return g_img
 
-    ref = float(np.percentile(grad_image(np.load(files[-1]))[~mask], 99.0)) or 1.0
-    dpi = 100
-    writer = iio.get_writer(out, fps=fps, codec="libx264", quality=8, macro_block_size=8)
+    body = solid_img > 0.5
+    ref = float(np.percentile(grad_image(np.load(files[-1]))[~body], 99.0)) or 1.0
+    try:
+        font = ImageFont.truetype("DejaVuSans.ttf", max(14, height // 50))
+    except OSError:
+        font = ImageFont.load_default()
+    ox, oy = (width - len(A)) // 2, (height - len(B)) // 2
+    writer = iio.get_writer(out, fps=fps, codec="libx264", quality=9, macro_block_size=8)
     for i, fpath in enumerate(files):
         snap = np.load(fpath)
-        g = grad_image(snap)
-        img = np.exp(-k * np.minimum(g / ref, 1.0))
-        img[mask] = 0.0
-        fig = plt.figure(figsize=(width / dpi, height / dpi), dpi=dpi, facecolor="black")
-        ax = fig.add_axes([0, 0, 1, 1])
-        ax.imshow(img.T, origin="lower", cmap="gray", vmin=0.0, vmax=1.0, extent=(A[0], A[-1], B[0], B[-1]),
-                  interpolation="bicubic", aspect="equal")
-        ax.set_axis_off()
+        img = np.exp(-k * np.minimum(grad_image(snap) / ref, 1.0))
+        img *= np.clip(1.0 - (solid_img - 0.35) / 0.3, 0.0, 1.0)  # anti-aliased black silhouette
+        frame = np.zeros((height, width), np.uint8)
+        frame[oy:oy + len(B), ox:ox + len(A)] = (255 * img.T[::-1]).astype(np.uint8)
+        im = Image.fromarray(frame).convert("RGB")
         txt = (title + "   " if title else "") + f"t = {float(snap['t']) * 1e3:.1f} ms"
-        ax.text(0.01, 0.97, txt, transform=ax.transAxes, color="white", fontsize=14, va="top")
-        fig.canvas.draw()
-        frame = np.asarray(fig.canvas.buffer_rgba())[..., :3]
-        plt.close(fig)
-        writer.append_data(frame)
+        ImageDraw.Draw(im).text((width // 100, height // 60), txt, fill=(255, 255, 255), font=font)
+        writer.append_data(np.asarray(im))
         if progress:
             progress(i + 1, len(files))
     writer.close()

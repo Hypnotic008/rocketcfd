@@ -90,6 +90,29 @@ class SnapshotRecorder:
                              f"p{k}_solid": (~g.fluid)[ii[0]][:, ii[1]][:, :, ii[2]]})
                 self.patches.append((g, ii))
             mesh["n_patches"] = len(self.patches)
+        # the two planes through the axis at full resolution on every patch that reaches them
+        # (2-D, so cheap): sharp schlieren films from the finest grid, whatever the volume stride
+        self.plane_patches = []
+        for g in (patches or []):
+            k = len(self.plane_patches)
+            inn = [np.arange(NG, len(a_) - NG) for a_ in g.axes]
+            ent = {}
+            for name, d in (("xy", 2), ("xz", 1)):
+                c = g.axes[d][inn[d]]
+                j = int(np.argmin(np.abs(c)))
+                h = float(np.max(np.diff(c))) if len(c) > 1 else 1.0
+                if abs(c[j]) <= 0.5 * h + 1e-9:
+                    ent[name] = int(inn[d][j])
+            if not ent:
+                continue
+            for name, jj in ent.items():
+                b = 1 if name == "xy" else 2
+                mesh[f"pp{k}_{name}_a"] = g.axes[0][inn[0]].astype(np.float32)
+                mesh[f"pp{k}_{name}_b"] = g.axes[b][inn[b]].astype(np.float32)
+                sol = ~g.fluid
+                mesh[f"pp{k}_{name}_solid"] = (sol[inn[0]][:, inn[1], jj] if name == "xy" else sol[inn[0]][:, jj][:, inn[2]])
+            self.plane_patches.append((g, inn, ent))
+        mesh["n_plane_patches"] = len(self.plane_patches)
         np.savez_compressed(os.path.join(self.dir, "mesh.npz"), **mesh)
         self.k = 0
 
@@ -113,7 +136,9 @@ class SnapshotRecorder:
         kr = torch.as_tensor(self.kr, device=W.device)
         m_xz = mach[ir][:, self.jy0][:, kr].half().cpu().numpy()
         m_xy = mach[ir][:, jr][:, :, self.kz0].half().cpu().numpy()
-        out = dict(cp=cp, mach_xz=m_xz, mach_xy=m_xy, step=step, t=t)
+        out = dict(cp=cp, mach_xz=m_xz, mach_xy=m_xy, step=step, t=t,
+                   rho_xz=W[0][ir][:, self.jy0][:, kr].half().cpu().numpy(),
+                   rho_xy=W[0][ir][:, jr][:, :, self.kz0].half().cpu().numpy())
         if self.vs:
             vi, vj, vk = (torch.as_tensor(a_, device=W.device) for a_ in (self.vi, self.vj, self.vk))
             sub = lambda a_: a_[vi][:, vj][:, :, vk]
@@ -131,5 +156,15 @@ class SnapshotRecorder:
             subp = lambda a_: a_[pi_][:, pj][:, :, pk].half().cpu().numpy()
             out[f"p{k}_rho"], out[f"p{k}_u"], out[f"p{k}_v"], out[f"p{k}_w"] = (subp(Wg[c]) for c in range(4))
             out[f"p{k}_dp"] = (Wg[4][pi_][:, pj][:, :, pk] - self.p_inf).half().cpu().numpy()
+        for k, (g, inn, ent) in enumerate(self.plane_patches):
+            Wg = self._device_primitive(g)
+            r = Wg[0]
+            i0 = torch.as_tensor(inn[0], device=r.device)
+            for name, jj in ent.items():
+                if name == "xy":
+                    pl = r[i0][:, torch.as_tensor(inn[1], device=r.device), jj]
+                else:
+                    pl = r[i0][:, jj][:, torch.as_tensor(inn[2], device=r.device)]
+                out[f"pp{k}_{name}_rho"] = pl.half().cpu().numpy()
         np.savez_compressed(os.path.join(self.dir, f"snap_{self.k:04d}.npz"), **out)
         self.k += 1
