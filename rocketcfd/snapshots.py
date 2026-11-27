@@ -9,6 +9,7 @@ For a physically time-accurate movie run with --time-accurate (global time step,
 cell every step); in steady mode the frames show the path to convergence instead.
 """
 import os
+from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import torch
 
@@ -166,5 +167,22 @@ class SnapshotRecorder:
                 else:
                     pl = r[i0][:, jj][:, torch.as_tensor(inn[2], device=r.device)]
                 out[f"pp{k}_{name}_rho"] = pl.half().cpu().numpy()
-        np.savez_compressed(os.path.join(self.dir, f"snap_{self.k:04d}.npz"), **out)
+        self._write(os.path.join(self.dir, f"snap_{self.k:04d}.npz"), out)
         self.k += 1
+
+    def _write(self, path, out):
+        """Compress and write on a background thread (zlib releases the GIL), so the solver keeps
+        stepping: a full-resolution snapshot is ~50 MB and took seconds of GPU idle time each.
+        At most two writes queue up; the data is already copied off the GPU."""
+        if not hasattr(self, "_pool"):
+            self._pool, self._pending = ThreadPoolExecutor(max_workers=1), []
+        self._pending = [f for f in self._pending if not f.done()]
+        while len(self._pending) >= 2:
+            self._pending.pop(0).result()
+        self._pending.append(self._pool.submit(np.savez_compressed, path, **out))
+
+    def close(self):
+        """Wait for the queued snapshot writes (also done at interpreter exit)."""
+        for f in getattr(self, "_pending", []):
+            f.result()
+        self._pending = []

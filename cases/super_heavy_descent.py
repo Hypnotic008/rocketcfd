@@ -405,6 +405,8 @@ def main(argv=None):
     else:
         s.run(nsteps, chunk=chunk, first_order_steps=400, report=report, steady=not a.time_accurate,
               snapshot=snap)
+    if a.snapshots:
+        rec.close()                        # queued background snapshot writes
     wall = time.time() - t0
     if prb is not None:
         prb.save()
