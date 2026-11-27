@@ -28,13 +28,35 @@ STYLES = ("lava", "schlieren", "mach", "pressure", "plume")
 
 
 # ---------------------------------------------------------------- data
+def _pressure(dp, rho, u, v, w, mesh, gam=1.4, v_inf=None):
+    """Pressure from a snapshot's p - p_inf. Snapshots recorded before Nov 27 stored it as
+    float16, which overflows (inf) above 65504 Pa: behind a Mach 2.8 bow shock the stagnation
+    region reaches ~220 kPa. Those cells are rebuilt from the total enthalpy, which is the same
+    everywhere in adiabatic flow (shocks included): p = rho (g-1)/g (H0 - |u|^2 / 2)."""
+    p_inf = float(mesh["p_inf"])
+    p = np.asarray(dp, float) + p_inf
+    bad = ~np.isfinite(p)
+    if bad.any():
+        rho_inf = float(mesh.get("rho_inf", np.nan))
+        U2 = u * u + v * v + w * w
+        if v_inf is None:
+            v_inf = float(np.sqrt(np.nanpercentile(U2[np.isfinite(U2)], 95)))
+        if not np.isfinite(rho_inf):
+            rho_inf = float(np.nanmedian(rho[np.isfinite(rho)]))
+        H0 = gam / (gam - 1.0) * p_inf / rho_inf + 0.5 * v_inf * v_inf
+        p[bad] = np.maximum(rho[bad] * (gam - 1.0) / gam * (H0 - 0.5 * U2[bad]), 1e-3 * p_inf)
+    return p
+
+
 def _snap_grid(mesh, snap):
     x, y, z = mesh["vx"], mesh["vy"], mesh["vz"]
     g = pv.RectilinearGrid(x, y, z)
     p_inf = float(mesh["p_inf"])
     f = dict(rho=snap["vol_rho"].astype(np.float32), u=snap["vol_u"].astype(np.float32),
              v=snap["vol_v"].astype(np.float32), w=snap["vol_w"].astype(np.float32),
-             p=snap["vol_dp"].astype(np.float32) + p_inf)
+             p=_pressure(snap["vol_dp"].astype(np.float32), snap["vol_rho"].astype(np.float32),
+                         snap["vol_u"].astype(np.float32), snap["vol_v"].astype(np.float32),
+                         snap["vol_w"].astype(np.float32), mesh).astype(np.float32))
     solid = mesh["vol_solid"]
     for k in f:
         if k in ("u", "v", "w"):
@@ -503,7 +525,8 @@ def _schlieren_layers(mesh, plane, snap0):
                 if dens:
                     return r
                 u, v, w = (take(sn[f"p{k}_{c_}"]).astype(float) for c_ in "uvw")
-                pr = np.maximum(take(sn[f"p{k}_dp"]).astype(float) + p_inf, 1e-6)
+                pr = np.maximum(_pressure(take(sn[f"p{k}_dp"]).astype(float), r, u, v, w,
+                                          dict(p_inf=p_inf, rho_inf=mesh.get("rho_inf", np.nan)), gam), 1e-6)
                 return np.sqrt(u * u + v * v + w * w) / np.sqrt(gam * pr / np.maximum(r, 1e-9))
             layers.append((f"p{k}", a_, b_, take(mesh[f"p{k}_solid"]).astype(bool), h, get))
     layers.sort(key=lambda L: -L[4])
@@ -704,9 +727,18 @@ class _FinestGrid:
         from scipy.interpolate import RegularGridInterpolator as RGI
         self.levels = []
         order = sorted(levels, key=lambda L: -min(float(np.min(np.diff(a))) for a in L[0]))
-        for axes, fields in order:
-            ints = {k: RGI(axes, a, bounds_error=False, fill_value=0.0) for k, a in fields.items()}
+        for n_, (axes, fields) in enumerate(order):
             lo = np.array([a[0] for a in axes]); hi = np.array([a[-1] for a in axes])
+            if n_ == 0:
+                ints = {k: RGI(axes, a, bounds_error=False, fill_value=0.0) for k, a in fields.items()}
+            else:
+                # a recorded patch spans its cell centres only: half a cell short of its box on
+                # every side, so points between two neighbouring patches fell back to the coarse
+                # grid (stripes across the hull Cp at every patch edge). Each patch covers its
+                # full box, extrapolating linearly over that half cell.
+                h = np.array([float(np.min(np.diff(a))) if len(a) > 1 else 0.0 for a in axes])
+                lo, hi = lo - 0.51 * h, hi + 0.51 * h
+                ints = {k: RGI(axes, a, bounds_error=False, fill_value=None) for k, a in fields.items()}
             self.levels.append((lo, hi, ints))
 
     # which points fall in which patch: the same body / oil-flow points against the same patches
@@ -957,13 +989,14 @@ def render_flow(folder, out, width=1920, height=1080, fps=30, q=None, title=None
 
         n_p = int(mesh.get("n_patches", 0))
         gam = float(mesh.get("gamma", 1.4))
+        v_cond = (meta.get("condition") or {}).get("V")
 
         def frame_fields(i):
             s = np.load(files[i])
             u, v, w = (s[k].astype(np.float32).astype(float) for k in ("vol_u", "vol_v", "vol_w"))
             u[solid], v[solid], w[solid] = 0, 0, 0
             rho = s["vol_rho"].astype(np.float32).astype(float)
-            p = s["vol_dp"].astype(np.float32).astype(float) + p_inf
+            p = _pressure(s["vol_dp"].astype(np.float32), rho, u, v, w, mesh, gam, v_cond)
             return u, v, w, s["mach_vol"].astype(np.float32).astype(float), rho, p, float(s["t"])
 
         def patch_levels(i):
@@ -975,8 +1008,10 @@ def render_flow(folder, out, width=1920, height=1080, fps=30, q=None, title=None
                 if f"p{k}_u" not in s:
                     continue
                 g = lambda n: s[f"p{k}_{n}"].astype(np.float32).astype(float)
-                out.append(_patch_level(*(mesh[f"p{k}_{a}"].astype(float) for a in "xyz"), g("u"), g("v"), g("w"),
-                                        g("rho"), g("dp") + p_inf, mesh[f"p{k}_solid"].astype(bool), gam))
+                uk, vk, wk, rk = g("u"), g("v"), g("w"), g("rho")
+                out.append(_patch_level(*(mesh[f"p{k}_{a}"].astype(float) for a in "xyz"), uk, vk, wk, rk,
+                                        _pressure(g("dp"), rk, uk, vk, wk, mesh, gam, v_cond),
+                                        mesh[f"p{k}_solid"].astype(bool), gam))
             return out
         nfr = len(files)
     else:
@@ -1147,7 +1182,7 @@ def render_flow(folder, out, width=1920, height=1080, fps=30, q=None, title=None
                     vx_all.append(iso)
         if vol_levels:
             # uniform voxels over the framing box, each from the finest grid there
-            hv = max(0.25, (box[1] - box[0]) / 360.0)
+            hv = max(0.35, (box[1] - box[0]) / 260.0)            # ~3 M voxels: ray casting is CPU-bound
             dims = [int((box[2 * d + 1] - box[2 * d]) / hv) + 1 for d in range(3)]
             img = pv.ImageData(dimensions=dims, spacing=(hv, hv, hv), origin=(box[0], box[2], box[4]))
             fgv = _FinestGrid(vol_levels)

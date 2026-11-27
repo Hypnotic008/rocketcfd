@@ -153,13 +153,15 @@ class SnapshotRecorder:
             out["vol_u"] = sub(W[1]).half().cpu().numpy()
             out["vol_v"] = sub(W[2]).half().cpu().numpy()
             out["vol_w"] = sub(W[3]).half().cpu().numpy()
-            out["vol_dp"] = (sub(W[4]) - self.p_inf).half().cpu().numpy()
+            # float32: p - p_inf overflows float16 (65504 Pa) behind a strong bow shock (Mach 2.8:
+            # ~220 kPa at the stagnation point), and those cells came back as inf
+            out["vol_dp"] = (sub(W[4]) - self.p_inf).float().cpu().numpy()
         for k, (g, ii) in enumerate(self.patches):
             Wg = self._device_primitive(g)               # (may share a scratch buffer: copy out now)
             pi_, pj, pk = (torch.as_tensor(a_, device=Wg.device) for a_ in ii)
             subp = lambda a_: a_[pi_][:, pj][:, :, pk].half().cpu().numpy()
             out[f"p{k}_rho"], out[f"p{k}_u"], out[f"p{k}_v"], out[f"p{k}_w"] = (subp(Wg[c]) for c in range(4))
-            out[f"p{k}_dp"] = (Wg[4][pi_][:, pj][:, :, pk] - self.p_inf).half().cpu().numpy()
+            out[f"p{k}_dp"] = (Wg[4][pi_][:, pj][:, :, pk] - self.p_inf).float().cpu().numpy()
         for k, (g, inn, ent) in enumerate(self.plane_patches):
             Wg = self._device_primitive(g)
             r = Wg[0]
