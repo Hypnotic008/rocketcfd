@@ -311,6 +311,10 @@ def main(argv=None):
                     help="flow: backdrop plane through the axis")
     ap.add_argument("--no-shocks", action="store_true", help="flow: no shock surfaces")
     ap.add_argument("--trail", type=int, default=14, help="flow: streak length in frames")
+    ap.add_argument("--no-streaks", action="store_true", help="flow: no tracer streaks")
+    ap.add_argument("--refine", type=int, default=None,
+                    help="flow: cut the shock / vortex surfaces from the flow resampled this many times finer "
+                         "(default: 2 on volumes recorded coarser than 0.45 m, else 1)")
     ap.add_argument("--still-frame", type=int, default=None, help="flow: write only this frame, as a PNG")
     ap.add_argument("--style", choices=STYLES, default="lava")
     ap.add_argument("--out", default=None, help="output file (default: in the results folder)")
@@ -337,7 +341,7 @@ def main(argv=None):
         render_flow(a.folder, out, a.width, a.height, a.fps, a.q, a.title, a.frames,
                     "evolve" if a.mode == "flow" else "orbit", prog, not a.no_vortices, a.camera,
                     surface=a.surface, plane=a.flow_plane, shocks=not a.no_shocks, trail=a.trail,
-                    still_frame=a.still_frame)
+                    still_frame=a.still_frame, streaks=not a.no_streaks, refine=a.refine)
     elif a.mode == "still":
         render_still(a.folder, out, a.style, a.width, a.height, a.q, a.title)
     elif a.mode == "orbit":
@@ -637,7 +641,41 @@ def _patch_level(x, y, z, u, v, w, rho, p, solid, gamma=1.4):
     """One refinement patch as a _FinestGrid level (velocity, Mach, solid, wall-filled pressure)."""
     u, v, w = (np.where(solid, 0.0, a) for a in (u, v, w))
     mach = np.sqrt(u * u + v * v + w * w) / np.sqrt(gamma * np.maximum(p, 1e-6) / np.maximum(rho, 1e-9))
-    return ((x, y, z), dict(u=u, v=v, w=w, mach=mach, solid=solid.astype(float), pf=_fill_solid(p, solid)))
+    return ((x, y, z), dict(u=u, v=v, w=w, mach=mach, solid=solid.astype(float), pf=_fill_solid(p, solid),
+                            rho=_fill_solid(rho, solid)))
+
+
+def _refine_box(x, y, z, fields, box, factor=2):
+    """Crop the fields to `box` and resample them `factor` times finer (cubic): the iso-surfaces
+    cut from the result follow the data smoothly instead of in cell-sized facets."""
+    from scipy.ndimage import zoom
+    sl = []
+    for a_, lo, hi in ((x, box[0], box[1]), (y, box[2], box[3]), (z, box[4], box[5])):
+        i0 = max(int(np.searchsorted(a_, lo)) - 2, 0)
+        i1 = min(int(np.searchsorted(a_, hi)) + 2, len(a_))
+        sl.append(slice(i0, i1))
+    sl = tuple(sl)
+    axes = [a_[s_] for a_, s_ in zip((x, y, z), sl)]
+    if factor <= 1:
+        return axes, {k: a[sl] for k, a in fields.items()}
+    new_axes = [zoom(a_, factor, order=1) for a_ in axes]
+    out = {}
+    for k, a in fields.items():
+        out[k] = zoom(a[sl].astype(np.float32), factor, order=1 if k == "solid" else 3, mode="nearest")
+    return new_axes, out
+
+
+def _patch_boxes(plevels):
+    return [(np.array([a[0] for a in ax_]), np.array([a[-1] for a in ax_])) for ax_, _ in plevels]
+
+
+def _mask_boxes(axes, arr, boxes, value):
+    """Set `arr` to `value` inside each box (where a finer patch draws its own surfaces)."""
+    for lo, hi in boxes:
+        ii = [slice(int(np.searchsorted(a_, lo[d], "right")), int(np.searchsorted(a_, hi[d], "left")))
+              for d, a_ in enumerate(axes)]
+        arr[tuple(ii)] = value
+    return arr
 
 
 def _rgrid(x, y, z, **fields):
@@ -733,7 +771,7 @@ def _streak_poly(tr, mach_interp, fade=1.6, m_inf=None, dm=0.3):
 
 def render_flow(folder, out, width=1920, height=1080, fps=30, q=None, title=None, frames=360, mode="evolve",
                 progress=None, show_vortices=True, camera="three-quarter", surface="cp", plane="schlieren",
-                shocks=True, trail=14, still_frame=None):
+                shocks=True, trail=14, still_frame=None, streaks=True, refine=None):
     """The full 3-D model (body + grid fins) with the flow around it, LAVA-style:
 
       * tracer streaks through the hull boundary layer and the fins, coloured by Mach, with fading
@@ -746,7 +784,10 @@ def render_flow(folder, out, width=1920, height=1080, fps=30, q=None, title=None
       * a graded background, depth-peeled transparency and a slow camera move.
 
     mode 'evolve': the recorded snapshots (particles carried by the changing flow); 'orbit': the
-    steady flow.vtk with a slow camera move. still_frame=k: write frame k only, as a PNG (out)."""
+    steady flow.vtk with a slow camera move. still_frame=k: write frame k only, as a PNG (out).
+    streaks=False: no tracer streaks (surfaces and plane only). refine: the shock and vortex
+    surfaces are cut from the flow resampled this many times finer (cubic), and from every
+    refinement patch at its own resolution, so they follow the data instead of cell facets."""
     meta = {}
     mp = os.path.join(folder, "loads.json")
     if os.path.exists(mp):
@@ -810,6 +851,9 @@ def render_flow(folder, out, width=1920, height=1080, fps=30, q=None, title=None
         patch_levels = lambda i: steady_patches
         nfr = frames
     u0, v0, w0, m0, rho0, p0, _ = frame_fields(nfr - 1)
+    if refine is None:                    # auto: resample coarse (strided) volumes to ~0.3 m
+        h_rec = float(np.median(np.diff(x)))
+        refine = 2 if h_rec > 0.45 else 1
     fluid = ~solid
     vmean = np.array([np.mean(a[fluid]) for a in (u0, v0, w0)])
     Vinf = float(np.linalg.norm(vmean))
@@ -881,7 +925,7 @@ def render_flow(folder, out, width=1920, height=1080, fps=30, q=None, title=None
     # warm up the tracers so the first frame is already full of streaks
     u, v, w, m, rho, p, _ = frame_fields(0)
     vel, im, isd = _interps(x, y, z, u, v, w, m, solid, patch_levels(0))
-    for _ in range(int(((26.0 if close else L) + up_d) / 1.2) + trail + 5):
+    for _ in range(int(((26.0 if close else L) + up_d) / 1.2) + trail + 5 if streaks else 0):
         tr.step(vel, isd, dt_draw)
     bar = dict(color="white", vertical=True, height=0.55, width=0.022, position_y=0.22, fmt="%.1f",
                title_font_size=14, label_font_size=12)
@@ -912,21 +956,52 @@ def render_flow(folder, out, width=1920, height=1080, fps=30, q=None, title=None
                 else:
                     acts.append_mesh(sl, scalars="mach", cmap="turbo", clim=mrange, opacity=0.6,
                                 show_scalar_bar=False, ambient=0.6, diffuse=0.4, specular=0.0)
-        # shock surfaces: translucent glass sheets where the density jumps
-        if shocks:
-            sh = _big_pieces(g.clip_box(box, invert=False).contour([s_lvl], scalars="sens"))
+        # shock and vortex surfaces: from the base flow resampled finer, plus every patch at its own
+        # resolution (the base draws nothing inside a patch)
+        boxes = _patch_boxes(plev)
+        grids_ = []
+        ax_r, f_r = _refine_box(x, y, z, dict(u=u, v=v, w=w, mach=m, rho=_fill_solid(rho, solid),
+                                              solid=solid.astype(float)), box, refine)
+        grids_.append((ax_r, f_r, True))
+        for ax_p, f_p in plev:
+            grids_.append((list(ax_p), dict(u=f_p["u"], v=f_p["v"], w=f_p["w"], mach=f_p["mach"], rho=f_p["rho"],
+                                            solid=f_p["solid"]), False))
+        sh_all, vx_all = [], []
+        for ax_, f_, is_base in grids_:
+            sol_ = f_["solid"] > 0.5
+            if shocks:
+                sn = _shock_sensor(f_["rho"], *ax_, sol_, wall_cells=2 * (refine if is_base else 1))
+                if is_base:
+                    sn *= max(refine, 1)           # per cell of the recorded grid, not the resampled one
+                    _mask_boxes(ax_, sn, boxes, 0.0)
+                gs = _rgrid(*ax_, sens=sn)
+                sh = gs.contour([s_lvl], scalars="sens")
+                if sh.n_points:
+                    sh_all.append(sh)
+            if show_vortices and ql:
+                gq = _rgrid(*ax_, u=f_["u"], v=f_["v"], w=f_["w"], mach=f_["mach"],
+                            rho=np.ones_like(f_["u"]), p=np.ones_like(f_["u"]))
+                gq.point_data["velocity"] = np.column_stack([gq.point_data[cc] for cc in "uvw"])
+                derived.add_to_grid(gq, ["Q"])
+                if is_base and boxes:
+                    qa = np.asarray(gq.point_data["Q"]).reshape(tuple(len(a_) for a_ in ax_[::-1])).transpose(2, 1, 0).copy()
+                    _mask_boxes(ax_, qa, boxes, -1.0)
+                    gq.point_data["Q"] = np.ascontiguousarray(qa.transpose(2, 1, 0)).reshape(-1)
+                iso = gq.contour([ql], scalars="Q")
+                if iso.n_points:
+                    vx_all.append(iso)
+        if sh_all:
+            sh = _big_pieces(pv.merge(sh_all).clip_box(box, invert=False), keep=12)
             if sh.n_points:
-                acts.append_mesh(sh.smooth(n_iter=25), tag="shock", color="#d8ecff", opacity=0.16, smooth_shading=True,
-                            specular=0.6, specular_power=40, ambient=0.3)
-        # vortex surfaces
-        if show_vortices and ql:
-            gq = _rgrid(x, y, z, u=u, v=v, w=w, mach=m, rho=np.ones_like(u), p=np.ones_like(u))
-            gq.point_data["velocity"] = np.column_stack([gq.point_data[cc] for cc in "uvw"])
-            derived.add_to_grid(gq, ["Q"])
-            iso = gq.contour([ql], scalars="Q")
+                acts.append_mesh(sh.smooth_taubin(n_iter=30, pass_band=0.08), tag="shock", color="#d8ecff",
+                                 opacity=0.16, smooth_shading=True, specular=0.6, specular_power=40, ambient=0.3)
+        if vx_all:
+            iso = pv.merge(vx_all)
             if iso.n_points:
-                acts.append_mesh(iso.smooth(n_iter=15), scalars="mach", cmap="turbo", clim=mrange, opacity=0.45,
-                            smooth_shading=True, show_scalar_bar=False, specular=0.4)
+                acts.append_mesh(iso.smooth_taubin(n_iter=25, pass_band=0.1), scalars="mach", cmap="turbo",
+                                 clim=mrange, opacity=0.45, smooth_shading=True, specular=0.4,
+                                 show_scalar_bar=not streaks,
+                                 scalar_bar_args=dict(title="Mach", position_x=0.94, **bar))
         return acts
 
     layer_cache = {}
@@ -935,9 +1010,10 @@ def render_flow(folder, out, width=1920, height=1080, fps=30, q=None, title=None
     for i in frames_to_draw:
         u, v, w, m, rho, p, t = frame_fields(i)
         plev = patch_levels(i)
-        vel, im, isd = _interps(x, y, z, u, v, w, m, solid, plev)
-        for _ in range(max(1, i - last_i) if still_frame is not None else 1):
-            tr.step(vel, isd, dt_draw)
+        if streaks:
+            vel, im, isd = _interps(x, y, z, u, v, w, m, solid, plev)
+            for _ in range(max(1, i - last_i) if still_frame is not None else 1):
+                tr.step(vel, isd, dt_draw)
         last_i = i
         # camera: slow drift around a three-quarter view (or a close-up of the fins)
         a = np.radians(-35 + 30 * i / max(nfr - 1, 1))
@@ -966,7 +1042,7 @@ def render_flow(folder, out, width=1920, height=1080, fps=30, q=None, title=None
                 kw = dict(kw, opacity=kw["opacity"] * shock_fade)
             pl.add_mesh(mesh_, **kw)
         # streaks: soft wide glow under a bright fading core
-        poly = _streak_poly(tr, im, m_inf=m_inf)
+        poly = _streak_poly(tr, im, m_inf=m_inf) if streaks else None
         if poly is not None:
             lw = 2.2 if close else 1.4
             pl.add_mesh(poly, scalars="mach", cmap="turbo", clim=mrange, line_width=lw * 3.2, opacity=0.08,
