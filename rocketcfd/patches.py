@@ -21,6 +21,7 @@ All grids' state arrays live in shared flat buffers (one per field), so the inte
 averaging are single gathers. Use `wall_patches` to generate a shell of patches around the
 walls of a body, and `PatchGrid.run` (implicit) to solve.
 """
+import os
 import time
 import numpy as np
 import torch
@@ -613,6 +614,11 @@ class PatchGrid:
         order_by_size = list(np.argsort(-self.rank))
         done = 0
         self._prime()
+        # per-step NaN trace for the first `trace` steps (env ROCKETCFD_TRACE=N, default 0):
+        # a NaN anywhere makes the global time step NaN and every grid goes bad within one step,
+        # so the 50-step check can no longer say where it started; this names the first grid,
+        # cell and the step at which it appeared
+        trace = int(os.environ.get("ROCKETCFD_TRACE", "0"))
         with torch.no_grad():
             while done < steps:
                 k = min(chunk, steps - done)
@@ -632,7 +638,12 @@ class PatchGrid:
                         g = self.grids[gi]
                         _, r = g._step_warp(order, want_res=(kk == k - 1), local=not time_accurate, dt_fixed=dt)
                         rs.append((g.n_fluid, r))
+                        if self.base.step_count + kk < trace:
+                            self._trace(gi, self.base.step_count + kk + 1, dt, "step")
                     self._restrict()
+                    if self.base.step_count + kk < trace:
+                        for gi in order_by_size:
+                            self._trace(gi, self.base.step_count + kk + 1, dt, "restrict")
                     if snapshot is not None and (self.base.step_count + kk + 1) % snapshot[0] == 0:
                         snapshot[1](self.base.step_count + kk + 1, self.base.t + float(tsum))
                 done += k
@@ -651,6 +662,28 @@ class PatchGrid:
                 if report and report(self):
                     break
         return self
+
+    def _trace(self, gi, step, dt, stage):
+        g = self.grids[gi]
+        U = g.U[:, NG:-NG, NG:-NG, NG:-NG]
+        bad = ~torch.isfinite(U).all(0) | (U[0] <= 0)
+        n = int(bad.sum())
+        if n == 0 and (dt is None or bool(torch.isfinite(dt))):
+            return
+        nz = torch.nonzero(bad)
+        msg = f"trace: step {step} after {stage} of grid {gi} (h {tuple(np.round(g.h, 3))}): {n} bad cells"
+        if dt is not None:
+            msg += f", dt {float(dt):.3e}"
+        if n:
+            lo_ = [float(g.axes[d][int(nz[:, d].min()) + NG]) for d in range(3)]
+            hi_ = [float(g.axes[d][int(nz[:, d].max()) + NG]) for d in range(3)]
+            i0 = nz[0].tolist()
+            ph = float(g.phi[i0[0] + NG, i0[1] + NG, i0[2] + NG])
+            td = getattr(g, "_thin_dist", None)
+            msg += (f", box ({', '.join(f'{v:.2f}' for v in lo_)}) .. ({', '.join(f'{v:.2f}' for v in hi_)}), "
+                    f"index {tuple(i0)} of {tuple(U.shape[1:])}, phi {ph:.3f} m")
+        raise FloatingPointError(msg + "; per-grid min dt: " + ", ".join(
+            f"{k}:{float(gg._stable_dt()):.2e}" for k, gg in enumerate(self.grids) if k < 60))
 
     def where_bad(self):
         """First grid / cell with a non-finite or non-physical state (for divergence messages)."""
