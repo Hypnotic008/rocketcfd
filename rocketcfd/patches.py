@@ -619,6 +619,8 @@ class PatchGrid:
         # so the 50-step check can no longer say where it started; this names the first grid,
         # cell and the step at which it appeared
         trace = int(os.environ.get("ROCKETCFD_TRACE", "0"))
+        for g in self.grids:
+            g.time_accurate_now = bool(time_accurate)
         with torch.no_grad():
             while done < steps:
                 k = min(chunk, steps - done)
@@ -740,6 +742,8 @@ class PatchGrid:
 
     def _implicit_run(self, iters, chunk, first_order_steps, report, cfl_max, cfl_start, cfl_ramp, sweeps,
                       snapshot):
+        for g in self.grids:
+            g.time_accurate_now = False                     # WENO5-Z: time-accurate runs only
         t0 = time.time()
         done = 0
         order_by_size = list(np.argsort(-self.rank))     # coarse to fine: patches see this iteration's base

@@ -71,6 +71,18 @@ def main(argv=None):
     ap.add_argument("--les", action="store_true",
                     help="unsteady wall-modelled LES (Vreman subgrid model + equilibrium wall model), "
                          "time-accurate explicit steps: unsteady wakes, movies (with --snapshots/--snap-volume)")
+    ap.add_argument("--scheme", default="koren", choices=["koren", "weno5z"],
+                    help="reconstruction: koren (kappa = 1/3 MUSCL) or weno5z (fifth-order WENO-Z, NASA "
+                         "LAVA's scheme: less numerical dissipation for LES; time-accurate runs only, "
+                         "steady / implicit solves keep Koren)")
+    ap.add_argument("--no-adapt-record", action="store_true",
+                    help="--les: do not record the time-averaged refinement criterion (adapt_criterion.npz)")
+    ap.add_argument("--adapt-from", default="",
+                    help="refine where an earlier LES's time-averaged criterion is largest "
+                         "(Mozaffari et al. 2022): that run's results folder")
+    ap.add_argument("--adapt-h", type=float, default=0.15, help="--adapt-from: cell size of the new patches [m]")
+    ap.add_argument("--adapt-cells", type=float, default=3e6,
+                    help="--adapt-from: cell budget of the new patches (sets the threshold, as LAVA's AMR)")
     ap.add_argument("--engines", default="none", choices=["none", "centre", "inner", "all"],
                     help="engines firing (landing / boostback burns, retropropulsion, plume visuals): "
                          "centre = 3, inner = 13 (centre + inner ring), all = 33. One perfect gas: the exhaust "
@@ -212,6 +224,15 @@ def main(argv=None):
             print(f"grid fin patches ({a.fin_h} m cells within {a.fin_shell} m of the fins):")
             patches += wall_patches(faces, a.fin_h, a.fin_shell, thin_sdf=thin_sdf, thin_box=thin_box,
                                     box=(64, 64, 64))
+    if a.adapt_from:
+        from rocketcfd.adapt import load_criterion, adapted_patches
+        crit = load_criterion(a.adapt_from)
+        reg = ((-0.3 * L, -25.0, -25.0), (1.6 * L, 25.0, 25.0))
+        print(f"averaged-criterion patches from {a.adapt_from} ({a.adapt_h} m, budget {a.adapt_cells/1e6:.1f} M cells):")
+        ap_, _ = adapted_patches(crit, faces, a.adapt_h, a.adapt_cells, existing=patches, region=reg)
+        patches += ap_
+        if not a.explicit:
+            a.implicit = not a.explicit
     if not a.uniform or patches:
         if a.dry_run:
             n = np.prod([len(f) - 1 for f in faces]) + sum(int(np.prod([len(f) - 1 for f in pf])) for pf in patches)
@@ -242,11 +263,11 @@ def main(argv=None):
     if patches:
         from rocketcfd.patches import PatchGrid
         runner = PatchGrid(faces, patches, fs, sdf=sdf, cfl=0.7, thin_sdf=thin_sdf, thin_box=thin_box,
-                           viscous=visc, turbulence=turb, jets=jets)
+                           viscous=visc, turbulence=turb, jets=jets, limiter=a.scheme)
         s = runner.base
     else:
         s = runner = Solver(lo, hi, a.h, fs, sdf=sdf, cfl=0.7, dtype=dtype, faces=faces, thin_sdf=thin_sdf,
-                            thin_box=thin_box, viscous=visc, turbulence=turb, jets=jets)
+                            thin_box=thin_box, viscous=visc, turbulence=turb, jets=jets, limiter=a.scheme)
     if jets:
         for g_ in (runner.grids if patches else [runner]):
             g_.jet_throttle = a.throttle
@@ -348,6 +369,12 @@ def main(argv=None):
         hooks.append((a.probe_every, prb.record))
         print(f"probes: {len(pts)} points every {a.probe_every} steps -> {a.out}/probes.npz"
               + (f" ({len(prb.missing)} outside the grid)" if len(prb.missing) else ""))
+    averager = None
+    if a.les and not a.no_adapt_record:
+        from rocketcfd.adapt import CriterionAverager
+        averager = CriterionAverager(s)
+        hooks.append((50, averager.record))
+        print(f"recording the time-averaged refinement criterion every 50 steps -> {a.out}/adapt_criterion.npz")
     snap = None
     if hooks:
         def _hook(step, t_):
@@ -418,6 +445,8 @@ def main(argv=None):
     write_vtk(f, f"{a.out}/flow.vtk")
     from rocketcfd import restart as _rs
     _rs.save(runner, f"{a.out}/restart.npz")
+    if averager is not None and averager.n:
+        averager.save(f"{a.out}/adapt_criterion.npz")
 
     # cross-section stations and 3-D surface pressure
     from rocketcfd.visual3d import plot_stations, surface_pressure, write_vtk_surface, render_surface, \

@@ -312,6 +312,8 @@ def main(argv=None):
     ap.add_argument("--no-shocks", action="store_true", help="flow: no shock surfaces")
     ap.add_argument("--trail", type=int, default=14, help="flow: streak length in frames")
     ap.add_argument("--no-streaks", action="store_true", help="flow: no tracer streaks")
+    ap.add_argument("--oil-flow", action="store_true",
+                    help="flow: surface oil-flow lines on the hull (near-wall flow, separation lines)")
     ap.add_argument("--start", type=int, default=0,
                     help="flow / schlieren: skip this many snapshots at the start (a start-up transient)")
     ap.add_argument("--refine", type=int, default=None,
@@ -343,7 +345,8 @@ def main(argv=None):
         render_flow(a.folder, out, a.width, a.height, a.fps, a.q, a.title, a.frames,
                     "evolve" if a.mode == "flow" else "orbit", prog, not a.no_vortices, a.camera,
                     surface=a.surface, plane=a.flow_plane, shocks=not a.no_shocks, trail=a.trail,
-                    still_frame=a.still_frame, streaks=not a.no_streaks, refine=a.refine, start=a.start)
+                    still_frame=a.still_frame, streaks=not a.no_streaks, refine=a.refine, start=a.start,
+                    oil=a.oil_flow)
     elif a.mode == "still":
         render_still(a.folder, out, a.style, a.width, a.height, a.q, a.title)
     elif a.mode == "orbit":
@@ -771,9 +774,47 @@ def _streak_poly(tr, mach_interp, fade=1.6, m_inf=None, dm=0.3):
     return poly
 
 
+class _OilFlow:
+    """Surface oil-flow lines: the velocity sampled a short distance off the wall along the
+    surface normal, projected onto the surface, and integrated ON the surface from a fixed set of
+    seed points (the same seeds every frame, so the pattern evolves rather than flickers)."""
+
+    def __init__(self, body, n_seeds=2600, offset=0.45, seed=3):
+        # body: a coarse (~0.25 m) hull surface; integrating on the 0.06 m display mesh is ~10x slower
+        b = body.triangulate().clean()
+        self.surf = b.compute_normals(cell_normals=False, split_vertices=False, auto_orient_normals=True)
+        self.pts = np.asarray(self.surf.points)
+        self.nrm = np.asarray(self.surf.point_data["Normals"])
+        self.offset = offset
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(self.surf.n_points, size=min(n_seeds, self.surf.n_points), replace=False)
+        self.source = pv.PolyData(self.pts[idx])
+
+    def lines(self, vel, v_ref):
+        V = vel(self.pts + self.offset * self.nrm)
+        vt = V - np.sum(V * self.nrm, 1, keepdims=True) * self.nrm
+        sp = np.linalg.norm(vt, axis=1)
+        m = self.surf.copy()
+        m.point_data["vt"] = vt
+        m.point_data["speed"] = sp / max(v_ref, 1e-9)
+        m.set_active_vectors("vt")
+        try:
+            sl = m.streamlines_from_source(self.source, vectors="vt", surface_streamlines=True,
+                                           integration_direction="both", initial_step_length=0.3,
+                                           step_unit="l", max_step_length=0.5, max_steps=300, max_length=9.0,
+                                           terminal_speed=1e-3 * max(v_ref, 1e-9), compute_vorticity=False)
+        except Exception:                   # noqa: BLE001
+            return None
+        if sl.n_points == 0:
+            return None
+        if "Normals" in sl.point_data:      # lift off the surface so the lines are not z-fought
+            sl.points = np.asarray(sl.points) + 0.04 * np.asarray(sl.point_data["Normals"])
+        return sl
+
+
 def render_flow(folder, out, width=1920, height=1080, fps=30, q=None, title=None, frames=360, mode="evolve",
                 progress=None, show_vortices=True, camera="three-quarter", surface="cp", plane="schlieren",
-                shocks=True, trail=14, still_frame=None, streaks=True, refine=None, start=0):
+                shocks=True, trail=14, still_frame=None, streaks=True, refine=None, start=0, oil=False):
     """The full 3-D model (body + grid fins) with the flow around it, LAVA-style:
 
       * tracer streaks through the hull boundary layer and the fins, coloured by Mach, with fading
@@ -787,7 +828,9 @@ def render_flow(folder, out, width=1920, height=1080, fps=30, q=None, title=None
 
     mode 'evolve': the recorded snapshots (particles carried by the changing flow); 'orbit': the
     steady flow.vtk with a slow camera move. still_frame=k: write frame k only, as a PNG (out).
-    streaks=False: no tracer streaks (surfaces and plane only). refine: the shock and vortex
+    oil=True: surface oil-flow lines on the hull (streamlines of the near-wall velocity
+    integrated on the surface, as in a wind-tunnel oil-flow test: separation and attachment
+    lines, the flow around the chines). streaks=False: no tracer streaks. refine: the shock and vortex
     surfaces are cut from the flow resampled this many times finer (cubic), and from every
     refinement patch at its own resolution, so they follow the data instead of cell facets."""
     meta = {}
@@ -916,6 +959,7 @@ def render_flow(folder, out, width=1920, height=1080, fps=30, q=None, title=None
         cp_hi = float(max(abs(np.percentile(cps, 5)), abs(np.percentile(cps, 95)), 0.05))
         cp_range = [-cp_hi, cp_hi]
 
+    oilf = _OilFlow(vehicle_meshes(meta, h=0.25)[0]) if oil else None
     pl = setup_plotter(width, height)
     try:
         pl.set_background("#02040a", top="#121c30")
@@ -1043,6 +1087,15 @@ def render_flow(folder, out, width=1920, height=1080, fps=30, q=None, title=None
             if tag == "shock":
                 kw = dict(kw, opacity=kw["opacity"] * shock_fade)
             pl.add_mesh(mesh_, **kw)
+        if oilf is not None:
+            if layer_cache.get("oil_key") != key:
+                vel_o = _interps(x, y, z, u, v, w, m, solid, plev)[0]
+                layer_cache["oil"] = oilf.lines(vel_o, Vinf)
+                layer_cache["oil_key"] = key
+            ol = layer_cache.get("oil")
+            if ol is not None:
+                pl.add_mesh(ol, scalars="speed", cmap="bone", clim=[0.0, 0.9], line_width=1.3, opacity=0.85,
+                            lighting=False, show_scalar_bar=False, render=False)
         # streaks: soft wide glow under a bright fading core
         poly = _streak_poly(tr, im, m_inf=m_inf) if streaks else None
         if poly is not None:

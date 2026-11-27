@@ -41,8 +41,8 @@ def run(n, limiter, backend="warp"):
 
 
 if __name__ == "__main__":
-    ns = [int(v) for v in sys.argv[1:]] or [32, 64, 128]
-    for lim in ("vanleer", "koren"):
+    ns = [int(v) for v in sys.argv[1:] if v.isdigit()] or [32, 64, 128]
+    for lim in ("vanleer", "koren", "weno5z"):
         errs = [run(n, lim) for n in ns]
         orders = [np.log2(errs[i] / errs[i + 1]) for i in range(len(errs) - 1)]
         print(f"{lim:8s} L1(rho) " + "  ".join(f"N={n}: {e:.2e}" for n, e in zip(ns, errs))

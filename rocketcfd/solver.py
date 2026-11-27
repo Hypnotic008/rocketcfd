@@ -55,7 +55,7 @@ def _limit(a, b, kind):
     """Limited slope; a = difference away from the face, b = across it (matters for Koren)."""
     if kind == "minmod":
         return torch.where(a * b > 0, torch.sign(a) * torch.minimum(a.abs(), b.abs()), torch.zeros_like(a))
-    if kind == "koren":
+    if kind in ("koren", "weno5z"):        # weno5z: Koren on the PyTorch path
         aa, bb = a.abs(), b.abs()
         v = torch.sign(a) * torch.minimum(torch.minimum(2.0 * bb, (aa + 2.0 * bb) / 3.0), 2.0 * aa)
         return torch.where(a * b > 0, v, torch.zeros_like(a))
@@ -334,6 +334,8 @@ class Solver:
             self.dist_buf = torch.ones((1, 1, 1), dtype=self.dtype, device=dev)
             self.fluid_buf = torch.ones((1, 1, 1), dtype=self.dtype, device=dev)
             self.mut_buf = torch.zeros((1, 1, 1), dtype=self.dtype, device=dev)
+            if self.limiter == "weno5z":           # WENO stays off stencils that touch the body
+                self.fluid_buf = torch.as_tensor(self.fluid.astype(np.float32), device=dev)
         vp.mut = wp.from_torch(self.mut_buf)
         vp.dist = wp.from_torch(self.dist_buf)
         vp.fluid = wp.from_torch(self.fluid_buf)
@@ -906,7 +908,11 @@ class Solver:
         lm = self.low_mach
         if lm == "auto":
             lm = np.linalg.norm(self.W_inf[1:4]) < np.sqrt(self.gamma * self.W_inf[4] / self.W_inf[0])
-        kind = {"vanleer": 0, "minmod": 1, "koren": 2}[self.limiter] + (4 if lm else 0)
+        # weno5z: WENO5-Z in the split face kernels (time-accurate runs), Koren MUSCL in the fused
+        # residual (tiles / steady) and wherever the WENO stencil does not fit
+        kind = {"vanleer": 0, "minmod": 1, "koren": 2, "weno5z": 2 + 8}[self.limiter] + (4 if lm else 0)
+        if not getattr(self, "time_accurate_now", False):
+            kind &= ~8
         args = [w["W"], w["S"], w["ix"], w["iy"], w["iz"], self._active_flux, self.gamma, float(order), kind, w["blk"],
                 self._vp]
         if tiles is None and self.split_residual:
@@ -1124,6 +1130,9 @@ class Solver:
         RK2 steps but converges in far fewer steps, especially on stretched or very fine
         near-wall grids. `t` does not advance (pseudo time has no physical meaning).
         """
+        # WENO5-Z only in time-accurate stepping (as in LAVA); steady / implicit solves at large
+        # pseudo-time steps use Koren MUSCL (the Mach 4 cylinder diverged implicit with WENO)
+        self.time_accurate_now = not (implicit or steady or local_dt)
         if implicit:
             if self.backend != "warp":
                 raise RuntimeError("the implicit solver needs the warp backend")

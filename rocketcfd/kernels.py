@@ -140,6 +140,51 @@ def face_flux(qm: vec5, qa: vec5, qb: vec5, qp: vec5, d: int, g: float, order: f
 
 
 @wp.func
+def weno5z(a: float, b: float, c: float, d: float, e: float):
+    """Fifth-order WENO-Z (Borges et al. 2008) value at the face between c and d from the
+    upwind-biased stencil a b c | d e (the scheme of NASA LAVA's Cartesian solver; Kiris et al.,
+    Aerosp. Sci. Technol. 55, 2016). Uniform-grid weights."""
+    b0 = 13.0 / 12.0 * (a - 2.0 * b + c) * (a - 2.0 * b + c) + 0.25 * (a - 4.0 * b + 3.0 * c) * (a - 4.0 * b + 3.0 * c)
+    b1 = 13.0 / 12.0 * (b - 2.0 * c + d) * (b - 2.0 * c + d) + 0.25 * (b - d) * (b - d)
+    b2 = 13.0 / 12.0 * (c - 2.0 * d + e) * (c - 2.0 * d + e) + 0.25 * (3.0 * c - 4.0 * d + e) * (3.0 * c - 4.0 * d + e)
+    t5 = wp.abs(b0 - b2)
+    eps = 1.0e-12 * (c * c + d * d) + 1.0e-30
+    a0 = 0.1 * (1.0 + t5 / (b0 + eps))
+    a1 = 0.6 * (1.0 + t5 / (b1 + eps))
+    a2 = 0.3 * (1.0 + t5 / (b2 + eps))
+    p0 = (2.0 * a - 7.0 * b + 11.0 * c) / 6.0
+    p1 = (-b + 5.0 * c + 2.0 * d) / 6.0
+    p2 = (2.0 * c + 5.0 * d - e) / 6.0
+    return (a0 * p0 + a1 * p1 + a2 * p2) / (a0 + a1 + a2)
+
+
+@wp.func
+def weno_face_flux(q2: vec5, qm: vec5, qa: vec5, qb: vec5, qp: vec5, q3: vec5, d: int, g: float,
+                   kind: int, hlle: int):
+    """Flux at the face between qa and qb with WENO5-Z reconstruction of the primitive variables
+    from the six cells q2 qm qa | qb qp q3. Falls back to MUSCL if a state comes out non-physical."""
+    qL = qa
+    qR = qb
+    for c in range(5):
+        qL[c] = weno5z(q2[c], qm[c], qa[c], qb[c], qp[c])
+        qR[c] = weno5z(q3[c], qp[c], qb[c], qa[c], qm[c])
+    if qL[0] <= 0.0 or qL[4] <= 0.0 or qR[0] <= 0.0 or qR[4] <= 0.0:
+        return face_flux(qm, qa, qb, qp, d, g, 1.0, kind, hlle, 1.0, 1.0)
+    if (kind & 4) != 0 and hlle == 0:
+        cL = wp.sqrt(g * qL[4] / qL[0])
+        cR = wp.sqrt(g * qR[4] / qR[0])
+        mL = wp.sqrt(qL[1] * qL[1] + qL[2] * qL[2] + qL[3] * qL[3]) / cL
+        mR = wp.sqrt(qR[1] * qR[1] + qR[2] * qR[2] + qR[3] * qR[3]) / cR
+        z = wp.min(1.0, wp.max(mL, mR))
+        for c in range(1, 4):
+            avg = 0.5 * (qL[c] + qR[c])
+            jmp = 0.5 * z * (qL[c] - qR[c])
+            qL[c] = avg + jmp
+            qR[c] = avg - jmp
+    return riemann(qL, qR, d, g, hlle)
+
+
+@wp.func
 def wall_flux(q: vec5, d: int, g: float, own_left: int):
     """Flux through a blocked (thin-wall) face: Riemann problem against the mirror state.
     Zero mass, energy and tangential-momentum flux; the normal momentum carries the wall pressure."""
@@ -1406,7 +1451,29 @@ def _make_face_kernel(D: int, VISC: int):
             bLL = (blk[I - wp.static(DI), J - wp.static(DJ), K - wp.static(DK)] >> wp.static(D)) & 1
             bRR = (blk[I + wp.static(DI), J + wp.static(DJ), K + wp.static(DK)] >> wp.static(D)) & 1
             hl = wp.max(S[I, J, K], S[I + wp.static(DI), J + wp.static(DJ), K + wp.static(DK)])
-            f = face_flux(qm, qa, qb, qp, wp.static(D), g, order, kind, hl, float(1 - bLL), float(1 - bRR))
+            # WENO5-Z (kind bit 3) where its six-cell stencil fits inside the padded array and
+            # crosses no thin wall; MUSCL elsewhere (domain / patch edges, next to fin plates)
+            use_w = int(0)
+            if (kind & 8) != 0 and order > 0.0 and bLL == 0 and bRR == 0:
+                ia = I * wp.static(DI) + J * wp.static(DJ) + K * wp.static(DK)
+                if ia >= 2 and ia + 3 < W.shape[wp.static(D + 1)]:
+                    b2L = (blk[I - wp.static(2 * DI), J - wp.static(2 * DJ), K - wp.static(2 * DK)] >> wp.static(D)) & 1
+                    b2R = (blk[I + wp.static(2 * DI), J + wp.static(2 * DJ), K + wp.static(2 * DK)] >> wp.static(D)) & 1
+                    if b2L == 0 and b2R == 0:
+                        use_w = 1
+                        # all six stencil cells in the fluid (no immersed-boundary ghost or solid
+                        # cell: there the mirrored states made WENO's stagnation pressure 3.6 %
+                        # low on the Mach 4 cylinder); the mask exists when vp.fluid is full size
+                        if vp.fluid.shape[0] > 1:
+                            for o in range(-2, 4):
+                                if vp.fluid[I + o * wp.static(DI), J + o * wp.static(DJ), K + o * wp.static(DK)] < 0.5:
+                                    use_w = 0
+            if use_w != 0:
+                q2 = load(W, I - wp.static(2 * DI), J - wp.static(2 * DJ), K - wp.static(2 * DK))
+                q3 = load(W, I + wp.static(3 * DI), J + wp.static(3 * DJ), K + wp.static(3 * DK))
+                f = weno_face_flux(q2, qm, qa, qb, qp, q3, wp.static(D), g, kind, hl)
+            else:
+                f = face_flux(qm, qa, qb, qp, wp.static(D), g, order, kind, hl, float(1 - bLL), float(1 - bRR))
             if wp.static(VISC != 0):
                 wall = int(0)
                 if vp.turb == 1:
