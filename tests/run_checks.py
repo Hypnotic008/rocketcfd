@@ -66,6 +66,12 @@ def check_weno():
                 f"{100*so_w:+.1f} % (Koren {100*so_k:+.1f} %), stagnation pressure {100*ps_w:+.1f} % (<3 %)")
 
 
+def check_adapt():
+    import adapt_budget as ab
+    ok = ab.main()
+    return ok, "averaged-criterion patches: within the cell budget, cover the largest criterion, skip finer patches"
+
+
 def check_backends():
     import subprocess
     r = subprocess.run([sys.executable, os.path.join(os.path.dirname(__file__), "compare_backends.py")],
@@ -103,7 +109,7 @@ def check_split_residual():
     return worst < 1e-4, f"split face/divergence residual vs fused kernel: worst relative difference {worst:.1e} (<1e-4)"
 
 
-CHECKS = dict(backends=check_backends, split_residual=check_split_residual, vortex=check_vortex, weno=check_weno,
+CHECKS = dict(backends=check_backends, split_residual=check_split_residual, vortex=check_vortex, weno=check_weno, adapt=check_adapt,
               shocks=check_shocks, low_mach=check_low_mach,
               patch_blasius=check_patch_blasius, patch_sphere=check_patch_sphere, carbuncle=check_carbuncle,
               patch_turbulent=check_patch_turbulent)
