@@ -107,7 +107,30 @@ guessed aero coefficients in CatchSim (`quatsim/aero.py`).
   quasi-steady pitch damping, fin control derivatives and hinge moments).
 * **Checks**: `tests/run_checks.py` runs the verification cases with PASS / FAIL.
 
-### Next runs on the GPU (in this order)
+### Next LES runs (after the Nov 27 round)
+
+```bash
+git pull
+python tests/run_checks.py weno adapt                        # the new pieces on this machine
+# speed of the WENO kernels on this GPU vs Koren (same grid, 20 steps each)
+python cases/super_heavy_descent.py --h 0.3 --fins parametric --fin-h 0.04 --aoa 15 --windward 90 --les --profile 20
+python cases/super_heavy_descent.py --h 0.3 --fins parametric --fin-h 0.04 --aoa 15 --windward 90 --les --scheme weno5z --profile 20
+# 1. continue the hull + fin LES with WENO-Z (same grid: exact restart, no transient); records
+#    the averaged refinement criterion and full-resolution snapshots
+python cases/super_heavy_descent.py --h 0.3 --wall-h 0.15 --fins parametric --fin-h 0.04 --aoa 15 --windward 90 --les --scheme weno5z --flowthroughs 2 --min-flowthroughs 2 --snapshots 300 --snap-volume 1 --probes --restart results/les_hull15 --out results/les_weno
+# 2. add 3 M cells where its averaged criterion is largest (bow shock, outer shock layer, wake)
+python cases/super_heavy_descent.py --h 0.3 --wall-h 0.15 --fins parametric --fin-h 0.04 --aoa 15 --windward 90 --les --scheme weno5z --adapt-from results/les_weno --adapt-h 0.15 --adapt-cells 3e6 --flowthroughs 3 --min-flowthroughs 3 --snapshots 400 --snap-volume 1 --snap-patch-cells 12e6 --probes --restart results/les_weno --out results/les_adapt
+# movies and maps of a run
+python -m rocketcfd.cinematic results/les_adapt --mode flow --no-streaks --oil-flow --start 100 --fps 24
+python -m rocketcfd.cinematic results/les_adapt --mode flow --no-streaks --volume --camera flyby --start 100 --fps 24
+python -m rocketcfd.cinematic results/les_adapt --mode schlieren --plane xy --start 100
+python -m rocketcfd.cinematic results/les_adapt --mode buffet --start 100
+```
+
+Add `--dry-run` first to see cells and memory. With `--snap-volume 1`, 400 snapshots of the
+adapted run take roughly 25-30 GB; use `--snapshots 250` or `--snap-volume 2` to halve that.
+
+### Next runs on the GPU (earlier list)
 
 ```bash
 git pull
