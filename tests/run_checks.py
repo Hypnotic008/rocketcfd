@@ -55,6 +55,17 @@ def check_shocks():
                                                              f"pressure {100*ps:+.1f} % (<3 %)")
 
 
+def check_weno():
+    import vortex_order as v
+    import weno_ib_shock as wi
+    ek, ew = v.run(32, "koren"), v.run(32, "weno5z")
+    so_k, ps_k = wi.cylinder_unsteady("koren", 3000)
+    so_w, ps_w = wi.cylinder_unsteady("weno5z", 3000)
+    ok = ew < 0.4 * ek and np.isfinite(so_w) and abs(so_w - so_k) < 0.02 and abs(ps_w) < 0.03
+    return ok, (f"WENO5-Z: vortex L1 {ew:.2e} vs Koren {ek:.2e} (<0.4x); time-accurate Mach 4 cylinder standoff "
+                f"{100*so_w:+.1f} % (Koren {100*so_k:+.1f} %), stagnation pressure {100*ps_w:+.1f} % (<3 %)")
+
+
 def check_backends():
     import subprocess
     r = subprocess.run([sys.executable, os.path.join(os.path.dirname(__file__), "compare_backends.py")],
@@ -92,7 +103,8 @@ def check_split_residual():
     return worst < 1e-4, f"split face/divergence residual vs fused kernel: worst relative difference {worst:.1e} (<1e-4)"
 
 
-CHECKS = dict(backends=check_backends, split_residual=check_split_residual, vortex=check_vortex, shocks=check_shocks, low_mach=check_low_mach,
+CHECKS = dict(backends=check_backends, split_residual=check_split_residual, vortex=check_vortex, weno=check_weno,
+              shocks=check_shocks, low_mach=check_low_mach,
               patch_blasius=check_patch_blasius, patch_sphere=check_patch_sphere, carbuncle=check_carbuncle,
               patch_turbulent=check_patch_turbulent)
 
