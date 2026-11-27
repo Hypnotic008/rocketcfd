@@ -312,6 +312,8 @@ def main(argv=None):
     ap.add_argument("--no-shocks", action="store_true", help="flow: no shock surfaces")
     ap.add_argument("--trail", type=int, default=14, help="flow: streak length in frames")
     ap.add_argument("--no-streaks", action="store_true", help="flow: no tracer streaks")
+    ap.add_argument("--start", type=int, default=0,
+                    help="flow / schlieren: skip this many snapshots at the start (a start-up transient)")
     ap.add_argument("--refine", type=int, default=None,
                     help="flow: cut the shock / vortex surfaces from the flow resampled this many times finer "
                          "(default: 2 on volumes recorded coarser than 0.45 m, else 1)")
@@ -334,14 +336,14 @@ def main(argv=None):
         if (a.xlim or a.ylim) and not a.out:
             out = out[:-4] + "_zoom.mp4"
         render_schlieren2d(a.folder, out, a.plane, a.width, a.height, a.fps, title=a.title, progress=prog,
-                           xlim=a.xlim, ylim=a.ylim)
+                           xlim=a.xlim, ylim=a.ylim, start=a.start)
     elif a.mode in ("flow", "flow-orbit"):
         if a.still_frame is not None and not a.out:
             out = out[:-4] + f"_f{a.still_frame}.png"
         render_flow(a.folder, out, a.width, a.height, a.fps, a.q, a.title, a.frames,
                     "evolve" if a.mode == "flow" else "orbit", prog, not a.no_vortices, a.camera,
                     surface=a.surface, plane=a.flow_plane, shocks=not a.no_shocks, trail=a.trail,
-                    still_frame=a.still_frame, streaks=not a.no_streaks, refine=a.refine)
+                    still_frame=a.still_frame, streaks=not a.no_streaks, refine=a.refine, start=a.start)
     elif a.mode == "still":
         render_still(a.folder, out, a.style, a.width, a.height, a.q, a.title)
     elif a.mode == "orbit":
@@ -429,7 +431,7 @@ def _schlieren_layers(mesh, plane, snap0):
 
 
 def render_schlieren2d(folder, out, plane="xz", width=1920, height=1080, fps=30, k=5.0, title=None,
-                       progress=None, xlim=None, ylim=None):
+                       progress=None, xlim=None, ylim=None, start=0):
     """Side-on numerical schlieren of the recorded snapshots, like a wind-tunnel schlieren film:
     gradient magnitude on the plane through the axis (dark = steep), the vehicle a black silhouette.
 
@@ -442,7 +444,7 @@ def render_schlieren2d(folder, out, plane="xz", width=1920, height=1080, fps=30,
     from scipy.ndimage import distance_transform_edt
     sd = os.path.join(folder, "snapshots")
     mesh = dict(np.load(os.path.join(sd, "mesh.npz")))
-    files = sorted(glob.glob(os.path.join(sd, "snap_*.npz")))
+    files = sorted(glob.glob(os.path.join(sd, "snap_*.npz")))[start:]
     if not files:
         raise SystemExit(f"no snapshots in {sd}")
     layers, kind = _schlieren_layers(mesh, plane, np.load(files[0]))
@@ -771,7 +773,7 @@ def _streak_poly(tr, mach_interp, fade=1.6, m_inf=None, dm=0.3):
 
 def render_flow(folder, out, width=1920, height=1080, fps=30, q=None, title=None, frames=360, mode="evolve",
                 progress=None, show_vortices=True, camera="three-quarter", surface="cp", plane="schlieren",
-                shocks=True, trail=14, still_frame=None, streaks=True, refine=None):
+                shocks=True, trail=14, still_frame=None, streaks=True, refine=None, start=0):
     """The full 3-D model (body + grid fins) with the flow around it, LAVA-style:
 
       * tracer streaks through the hull boundary layer and the fins, coloured by Mach, with fading
@@ -801,7 +803,7 @@ def render_flow(folder, out, width=1920, height=1080, fps=30, q=None, title=None
         mesh = dict(np.load(os.path.join(sd, "mesh.npz")))
         if "vx" not in mesh:
             raise SystemExit("needs 3-D snapshots: run with --snapshots N --snap-volume 1")
-        files = sorted(glob.glob(os.path.join(sd, "snap_*.npz")))
+        files = sorted(glob.glob(os.path.join(sd, "snap_*.npz")))[start:]
         x, y, z = (mesh[k].astype(float) for k in ("vx", "vy", "vz"))
         solid = mesh["vol_solid"].astype(bool)
         p_inf = float(mesh["p_inf"])
