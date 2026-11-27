@@ -71,7 +71,13 @@ def _reseed_near_walls(n, vals, h_src, verbose=True, band=1.5):
     those land in the free flow and an LES restarted that way blew up within 50 steps at the
     windward fin. The solver rebuilds the near-wall flow from the re-seeded state in a few steps."""
     shape = h_src.shape
+    V = vals.reshape(vals.shape[0], -1)
+    ok = np.isfinite(V).all(0).reshape(shape)
     if not hasattr(n, "phi") or n.phi.shape != shape:
+        if not ok.all():                                  # no geometry: just patch non-finite values
+            from scipy.ndimage import distance_transform_edt
+            idx = distance_transform_edt(~ok, return_distances=False, return_indices=True)
+            V[:] = V[:, np.ravel_multi_index(tuple(idx), shape).ravel()]
         return
     dist = np.asarray(n.phi, float).copy()
     td = getattr(n, "_thin_dist", None)
@@ -80,17 +86,26 @@ def _reseed_near_walls(n, vals, h_src, verbose=True, band=1.5):
         dist[sub] = np.minimum(dist[sub], d_thin)
     fluid = np.asarray(n.fluid, bool)
     near = fluid & (dist < band * h_src)
-    far = fluid & ~near
-    if not near.any() or not far.any():
+    # clean source cells: open flow, away from walls, finite and physical
+    rho_, p_ = vals[0].reshape(shape), vals[4].reshape(shape)
+    good = fluid & ok
+    rmed = np.median(rho_[good]) if good.any() else 1.0
+    pmed = np.median(p_[good]) if good.any() else 1.0
+    far = good & ~near & (rho_ > 0.02 * rmed) & (p_ > 0.02 * pmed)
+    if not far.any():
         return
+    # everything else, solid and boxed-in cells included, takes the nearest clean state:
+    # interpolated solid / ghost / non-finite values there leak back through the masked
+    # kernels (0 * NaN = NaN) and through the immersed-boundary stencils
+    fix = ~far
     from scipy.ndimage import distance_transform_edt
-    idx = distance_transform_edt(~far, return_distances=False, return_indices=True)
-    flat = np.ravel_multi_index(tuple(idx), shape)[near]
-    V = vals.reshape(vals.shape[0], -1)
-    nz = np.flatnonzero(near.ravel())
+    idx = distance_transform_edt(fix, return_distances=False, return_indices=True)
+    flat = np.ravel_multi_index(tuple(idx), shape)[fix]
+    nz = np.flatnonzero(fix.ravel())
     V[:, nz] = V[:, flat]
     if verbose:
-        print(f"restart: {len(nz)} near-wall cells re-seeded from the flow clear of the walls")
+        print(f"restart: {int(near.sum())} near-wall + {int((~fluid).sum())} solid cells re-seeded"
+              + (f", {int((~ok).sum())} non-finite" if not ok.all() else ""))
 
 
 def load(runner, path, gamma=None, verbose=True, rotate_x=0.0):
@@ -128,6 +143,9 @@ def load(runner, path, gamma=None, verbose=True, rotate_x=0.0):
             o = old[i]
             h_old.append(float(max(np.max(np.diff(o["faces"][d])) for d in range(3))))
             ax = _centres(o["faces"])
+            nbad = int((~np.isfinite(o["U"]).all(0)).sum())
+            if nbad and verbose:
+                print(f"restart: WARNING old grid {i} holds {nbad} non-finite cells")
             W = cons_to_prim(torch.as_tensor(o["U"], dtype=torch.float64), gam, 1e-9, 1e-6).numpy()
             if rotate_x:
                 cr, sr = np.cos(rotate_x), np.sin(rotate_x)
