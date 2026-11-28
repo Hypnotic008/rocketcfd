@@ -253,7 +253,7 @@ def render_hotstage(folder, out, quantity="temperature", camera="cutaway", width
             # no hot gas next to the wall (thin gas, or outside the plume): plain steel
             pd.point_data["q"] = np.where(np.isfinite(vals), np.maximum(vals, clim[0]), np.nan)
             pl.add_mesh(pd, scalars="q", cmap=cmap, clim=clim, log_scale=log, smooth_shading=True,
-                        nan_color="#7d838b", specular=0.35 if name.startswith("plate") else 0.2, specular_power=25,
+                        nan_color="#7d838b", specular=0.35 if "plate" in name else 0.2, specular_power=25,
                         show_scalar_bar=False, render=False)
         for r_ in rims:
             pl.add_mesh(r_, color="#f2f2f2", smooth_shading=True, render=False)
@@ -313,7 +313,7 @@ def render_hotstage(folder, out, quantity="temperature", camera="cutaway", width
         thr = min(1.0, t / max(t_ign, 1e-9))
         names = hm["names"]
         def part_stat(prefix, arr, fn):
-            vals = [arr[sl] for nm, sl, _ in HS.part_slices(hm) if nm.startswith(prefix)]
+            vals = [arr[sl] for nm, sl, _ in HS.part_slices(hm) if (prefix in nm if prefix == "plate" else nm.startswith(prefix))]
             v = np.concatenate(vals) if vals else np.array([np.nan])
             v = v[np.isfinite(v)]
             return fn(v) if v.size else np.nan
