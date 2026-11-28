@@ -282,6 +282,7 @@ def main(argv=None):
             g_.jet_throttle = a.throttle
     if s.n_ib_fallback:
         print(f"note: {s.n_ib_fallback} ghost cells used nearest-fluid fallback (thin features)")
+    restart_kind = None
     if a.restart:
         from rocketcfd import restart
         import json as _json
@@ -296,7 +297,7 @@ def main(argv=None):
             if abs(co.get("aoa_from_engines_first", a.aoa) - a.aoa) > 0.5 or abs(co.get("mach", a.mach) - a.mach) > 0.02:
                 print(f"note: restart flow was M {co.get('mach')} aoa {co.get('aoa_from_engines_first')}; "
                       f"expect a longer start-up transient")
-        restart.load(runner, a.restart, rotate_x=rot)
+        restart_kind = restart.load(runner, a.restart, rotate_x=rot)
 
     # steps for the requested number of flow-throughs (estimated from the freestream)
     cs = c
@@ -349,6 +350,11 @@ def main(argv=None):
                        time_accurate=bool(a.time_accurate))
         return None
 
+    # first-order start-up steps: a cold or interpolated start needs them; an exact continuation
+    # of a developed run would only have its flow smeared by them
+    n_first = 0 if restart_kind == "exact" else 400
+    if restart_kind == "exact":
+        print("exact restart: continuing at second order from the first step")
     t0 = time.time()
     chunk = max(100, int(round(nsteps / 40 / 50)) * 50)       # ~40 load checks over the max length
     chunk = min(chunk, nsteps)
@@ -398,7 +404,7 @@ def main(argv=None):
             per = math.gcd(per, int(e_))
         snap = (max(per, 1), _hook)
     if patches and a.explicit:
-        runner.run_explicit(nsteps, chunk=chunk, report=report, first_order_steps=400,
+        runner.run_explicit(nsteps, chunk=chunk, report=report, first_order_steps=n_first,
                             time_accurate=a.time_accurate, snapshot=snap)
     elif patches:
         runner.run(nsteps, chunk=chunk, first_order_steps=200, report=report, snapshot=snap,
@@ -407,7 +413,7 @@ def main(argv=None):
         s.run(nsteps, chunk=chunk, first_order_steps=200, report=report, steady=True, snapshot=snap,
               implicit=True, cfl_max=a.cfl_max, cfl_ramp=300)
     else:
-        s.run(nsteps, chunk=chunk, first_order_steps=400, report=report, steady=not a.time_accurate,
+        s.run(nsteps, chunk=chunk, first_order_steps=n_first, report=report, steady=not a.time_accurate,
               snapshot=snap)
     if a.snapshots:
         rec.close()                        # queued background snapshot writes
