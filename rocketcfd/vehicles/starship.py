@@ -42,17 +42,18 @@ class StarshipParams:
     truss_tube_radius: float = 0.12
     truss_band: float = 0.35           # height of the lower and upper rings
     truss_band_thickness: float = 0.15
-    # forward-dome protection plates (photos): six plates in a flower round a concentric-ring
-    # disc at the apex. Three inner plates, trapezoids widening outward, under the ship's three
-    # sea-level engines; three outer plates, bent V's (chevrons) between them, under the RVacs,
-    # pointing inward with their arms wrapped round the trapezoids' outer ends. Plan-view sizes
-    # [m] (estimates from photos): apex disc radius; trapezoid inner / outer radius and half
-    # angle [deg]; chevron apex radius, slope of its edges [m per rad], width, outer cap radius
-    # and half angle [deg]; gap between plates; standoff above the dome
+    # forward-dome protection plates (photos): six rounded plates in a flower round a
+    # concentric-ring disc at the apex. Three inner plates start at the disc and widen outward
+    # (rounded trapezoids) under the ship's sea-level engines; three outer plates fill the
+    # wedge-shaped gaps between them, starting further out (rounded V's pointing inward, bent over
+    # the dome), under the RVacs. Plan-view sizes [m] (estimates from photos): apex disc radius;
+    # inner plate inner / outer radius and inner / outer width; outer plate inner / outer radius;
+    # corner rounding radius; gap between plates; standoff above the dome
     plate_apex_r: float = 0.9
-    plate_trap: tuple = (1.05, 2.5, 24.0)
-    plate_chevron: tuple = (1.05, 1.5, 1.45, 3.95, 58.0)
-    plate_gap: float = 0.1
+    plate_inner: tuple = (1.0, 3.1, 1.0, 2.5)
+    plate_outer: tuple = (1.85, 3.7)
+    plate_round: float = 0.5
+    plate_gap: float = 0.12
     plate_standoff: float = 0.05
     apex_disc: bool = True
     # engine cant [deg, outward = the exhaust pointing away from the axis], about each engine's
@@ -180,27 +181,119 @@ def _wrap(a):
     return np.arctan2(np.sin(a), np.cos(a))
 
 
-def _trapezoid_2d(Y, Z, az, P):
-    """Plan-view signed distance (approx.) to an inner plate centred on azimuth az."""
-    r0, r1, half = P.plate_trap
-    rho = np.sqrt(Y * Y + Z * Z)
-    dth = np.abs(_wrap(np.arctan2(Z, Y) - az))
-    side = np.sin(np.clip(dth - np.radians(half), -np.pi / 2, np.pi / 2)) * rho      # distance to the straight side
-    return np.maximum(np.maximum(r0 - rho, rho - r1), side)
+def _convex_sdf_2d(Y, Z, V):
+    """Signed distance to a convex polygon (vertices V, counter-clockwise) in the plane."""
+    n = len(V)
+    inside = None
+    out2 = None
+    for i in range(n):
+        a, b = V[i], V[(i + 1) % n]
+        e = b - a
+        L = np.hypot(*e)
+        nx, nz = e[1] / L, -e[0] / L                       # outward normal of a CCW polygon
+        dl = (Y - a[0]) * nx + (Z - a[1]) * nz             # signed distance to the edge's line
+        inside = dl if inside is None else np.maximum(inside, dl)
+        t = np.clip(((Y - a[0]) * e[0] + (Z - a[1]) * e[1]) / (L * L), 0.0, 1.0)
+        d2 = (Y - a[0] - t * e[0]) ** 2 + (Z - a[1] - t * e[1]) ** 2
+        out2 = d2 if out2 is None else np.minimum(out2, d2)
+    return np.where(inside > 0, np.sqrt(out2), inside)
 
 
-def _chevron_2d(Y, Z, az, P):
-    """Plan-view signed distance (approx.) to an outer, bent-V plate centred on azimuth az."""
-    r_apex, slope, width, r_cap, half = P.plate_chevron
-    rho = np.sqrt(Y * Y + Z * Z)
-    dth = np.abs(_wrap(np.arctan2(Z, Y) - az))
-    r_in = r_apex + slope * dth
-    band = np.maximum(r_in - rho, rho - np.minimum(r_in + width, r_cap)) / np.sqrt(1 + (slope / np.maximum(rho, 0.3)) ** 2)
-    ang = np.sin(np.clip(dth - np.radians(half), -np.pi / 2, np.pi / 2)) * rho
-    d = np.maximum(band, ang)
-    for k in range(3):                       # clear of the neighbouring trapezoids, with the gap
-        d = np.maximum(d, P.plate_gap - _trapezoid_2d(Y, Z, np.radians(P.sea_level[5]) + 2 * np.pi * k / 3, P))
-    return d
+def _ccw(V):
+    V = np.asarray(V, float)
+    area = 0.5 * np.sum(V[:, 0] * np.roll(V[:, 1], -1) - np.roll(V[:, 0], -1) * V[:, 1])
+    return V if area > 0 else V[::-1]
+
+
+def _rot(az):
+    return np.array([[np.cos(az), -np.sin(az)], [np.sin(az), np.cos(az)]])
+
+
+def _inner_plate_poly(az, P):
+    """Corners (y, z) of an inner plate before rounding: a trapezoid along azimuth az."""
+    r0, r1, w0, w1 = P.plate_inner
+    # straight sides, outer end an arc of radius r1 (about the axis)
+    a1 = np.arcsin(min(0.99, (w1 / 2) / r1))
+    arc = [[r1 * np.cos(t), r1 * np.sin(t)] for t in np.linspace(-a1, a1, 7)]
+    loc = np.array([[r0, -w0 / 2]] + arc + [[r0, w0 / 2]])      # (radial, tangential)
+    return _ccw(loc @ _rot(az).T)
+
+
+def _outer_plate_poly(az, P):
+    """Corners of an outer plate before rounding: the gap between the two neighbouring inner
+    plates (their facing sides moved over by the plate gap), from radius ra to rb."""
+    ra, rb = P.plate_outer
+    R = _rot(az)
+    sides = []
+    for sgn in (+1, -1):                                   # neighbours at az + 60 deg and az - 60 deg
+        T = _inner_plate_poly(az + sgn * np.pi / 3, P) @ R  # into the outer plate's frame (radial, tangential)
+        # the neighbour's side facing this plate: the edge whose midpoint is nearest the axis u
+        best = None
+        for i in range(len(T)):
+            a, b = T[i], T[(i + 1) % len(T)]
+            m = 0.5 * (a + b)
+            if abs(np.hypot(*a) - np.hypot(*b)) < 1e-6:
+                continue                                   # (inner / outer ends, both corners at one radius: skip)
+            key = abs(m[1])
+            if best is None or key < best[0]:
+                best = (key, a, b)
+        _, a, b = best
+        if np.hypot(*b) < np.hypot(*a):
+            a, b = b, a                                    # along the side, outward
+        e = (b - a) / np.hypot(*(b - a))
+        nrm = np.array([-e[1], e[0]])
+        if nrm @ (np.array([0.5 * (ra + rb), 0.0]) - a) < 0:
+            nrm = -nrm                                     # toward this plate
+        sides.append((a + P.plate_gap * nrm, e))
+    # each side from u = ra out to where it meets the circle of radius rb; the outer end an arc
+    inner, outer = [], []
+    for p0, e in sides:
+        inner.append(p0 + (ra - p0[0]) / e[0] * e)
+        # |p0 + t e| = rb, the root beyond the inner end
+        bq = 2 * (p0 @ e)
+        cq = p0 @ p0 - rb * rb
+        t = (-bq + np.sqrt(bq * bq - 4 * cq)) / 2
+        outer.append(p0 + t * e)
+    t0, t1 = sorted(np.arctan2(q[1], q[0]) for q in outer)
+    arc = [[rb * np.cos(t), rb * np.sin(t)] for t in np.linspace(t0, t1, 9)]
+    lo_in = min(inner, key=lambda q: q[1])
+    hi_in = max(inner, key=lambda q: q[1])
+    loc = np.array([lo_in] + arc + [hi_in])
+    return _ccw(loc @ R.T)
+
+
+_ROUND_CACHE = {}
+
+
+def _rounded_field(V, r, h=0.01):
+    """Plan-view signed distance of the polygon V with every corner rounded to radius r (a
+    morphological opening on a 1 cm raster: erode by r, dilate by r), as an interpolator."""
+    key = (V.tobytes(), r, h)
+    if key in _ROUND_CACHE:
+        return _ROUND_CACHE[key]
+    from scipy.ndimage import distance_transform_edt as edt
+    from scipy.interpolate import RegularGridInterpolator
+    lo = V.min(0) - r - 0.3
+    hi = V.max(0) + r + 0.3
+    ay = np.arange(lo[0], hi[0] + h, h)
+    az = np.arange(lo[1], hi[1] + h, h)
+    Y, Z = np.meshgrid(ay, az, indexing="ij")
+    inside = _convex_sdf_2d(Y, Z, V) < 0
+    core = edt(inside) * h > r                               # eroded
+    opened = edt(~core) * h <= r                             # dilated back: corners rounded
+    sd = np.where(opened, -edt(opened) * h, edt(~opened) * h)
+    f = RegularGridInterpolator((ay, az), sd, bounds_error=False, fill_value=None)
+    _ROUND_CACHE[key] = (f, lo, hi)
+    return _ROUND_CACHE[key]
+
+
+def _rounded(Y, Z, V, r):
+    f, lo, hi = _rounded_field(V, r)
+    Yc = np.clip(Y, lo[0], hi[0])
+    Zc = np.clip(Z, lo[1], hi[1])
+    d = f(np.stack([np.ravel(Yc), np.ravel(Zc)], -1)).reshape(np.shape(Y))
+    # beyond the raster: add the distance to it (a bound, enough for the plates' thin layer)
+    return d + np.hypot(Y - Yc, Z - Zc)
 
 
 def dome_plate_footprints(P: StarshipParams = StarshipParams()):
@@ -210,12 +303,13 @@ def dome_plate_footprints(P: StarshipParams = StarshipParams()):
     if P.apex_disc:
         out.append(("apex disc", lambda Y, Z: np.sqrt(Y * Y + Z * Z) - P.plate_apex_r))
     az_sl = np.radians(P.sea_level[5])
+    rr = P.plate_round
     for k in range(3):
-        a = az_sl + 2 * np.pi * k / 3
-        out.append((f"inner plate {k + 1}", (lambda a_: lambda Y, Z: _trapezoid_2d(Y, Z, a_, P))(a)))
+        V = _inner_plate_poly(az_sl + 2 * np.pi * k / 3, P)
+        out.append((f"inner plate {k + 1}", (lambda V_: lambda Y, Z: _rounded(Y, Z, V_, rr))(V)))
     for k in range(3):
-        a = az_sl + np.pi / 3 + 2 * np.pi * k / 3
-        out.append((f"outer plate {k + 1}", (lambda a_: lambda Y, Z: _chevron_2d(Y, Z, a_, P))(a)))
+        V = _outer_plate_poly(az_sl + np.pi / 3 + 2 * np.pi * k / 3, P)
+        out.append((f"outer plate {k + 1}", (lambda V_: lambda Y, Z: _rounded(Y, Z, V_, rr))(V)))
     return out
 
 

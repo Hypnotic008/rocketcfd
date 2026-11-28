@@ -597,10 +597,11 @@ truss tubes. The flow comes from the ship's nose, with time-accurate explicit st
 - V3 hot stage (`rocketcfd.vehicles.starship.hot_stage_truss_sdf`): a lower and an upper ring
   joined by a zig-zag of 40 round tubes (24 cm diameter, 20 V's), open between the tubes.
 - Forward-dome protection plates (`dome_plate_footprints`, `dome_plates_sdf`), 5 cm proud of the
-  dome: six plates in a flower round a concentric-ring apex disc (1.8 m).
-  - Three inner plates, trapezoids widening outward, under the ship's sea-level engines.
-  - Three outer plates, bent V's under the RVacs, pointing inward between the trapezoids with
-    their arms wrapped round the trapezoids' outer ends.
+  dome: six rounded plates in a flower round a concentric-ring apex disc (1.8 m).
+  - Three inner plates start at the disc and widen outward (rounded trapezoids), under the ship's
+    sea-level engines.
+  - Three outer plates fill the wedge-shaped gaps between them and start further out (rounded V's
+    pointing inward, bent over the dome), under the RVacs.
   - Sizes are `StarshipParams.plate_*` (estimates from photos); `apex_disc=False` drops the disc.
   - Plan view: [docs/media/hotstage_plates_plan.png](docs/media/hotstage_plates_plan.png).
 - `--ring vented` gives the earlier ring with straight struts.
