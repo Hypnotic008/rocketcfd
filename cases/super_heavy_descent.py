@@ -458,7 +458,7 @@ def main(argv=None):
     title = (f"Super Heavy V3, engines-first descent: alt {a.alt/1e3:.1f} km, M {a.mach}, "
              f"{a.aoa} deg off engines-first, windward {a.windward:g} deg, fins={a.fins}"
              f"{'' if which == 'all' else ', chines=' + which}, h={a.h} m{' uniform' if a.uniform else ' near body'}"
-             f"{', SST turbulent' if a.turbulent else ', inviscid'}")
+             f"{', SST turbulent' if a.turbulent else (', LES' + (' WENO5-Z' if a.scheme == 'weno5z' else '') if a.les else ', inviscid')}")
     plot_slices(f, f"{a.out}/slice_xz.png", title=title + "  [x-z plane: rudder fin +z]", p_inf=p, normal_axis=1)
     plot_slices(f, f"{a.out}/slice_xy.png", title=title + "  [x-y plane: catch fins]", p_inf=p, normal_axis=2)
     write_vtk(f, f"{a.out}/flow.vtk")
