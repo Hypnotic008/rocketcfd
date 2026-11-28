@@ -26,12 +26,13 @@ plates, the V3 truss and the ship's aft end, during the ship's engine start.
   python -m rocketcfd.hotstage report results/hot_staging        figures + summary of a run
 """
 import os
+import glob
 import json
 import numpy as np
 
 NG = 2
-CP_AIR = 1004.5
 R_AIR = 287.05
+CP_AIR = 3.5 * R_AIR       # gamma 1.4, consistent with the solver
 T_CHAMBER = 3600.0          # Raptor (methalox, ~O/F 3.6) chamber temperature [K], approximate
 
 
@@ -359,7 +360,27 @@ def report(folder, out=None):
     fig.savefig(os.path.join(out, "hotstage_history.png"), dpi=160)
     plt.close(fig)
 
-    # per plate: peak over the run
+    # full thrust: per-vertex time mean over the snapshots after the ignition ramp (the start-up
+    # shock sets the whole-run peaks; the steady impingement is what the plates live with)
+    t_ign = float(H.get("meta", {}).get("ignition", 0.0))
+    snaps = sorted(glob.glob(os.path.join(folder, "snapshots", "snap_*.npz")))
+    acc_p, acc_T, nT, n_s = None, None, None, 0
+    for fn in snaps:
+        with np.load(fn) as d:
+            if "hs_p" not in d or float(d["t"]) < t_ign:
+                continue
+            p_, T_ = d["hs_p"].astype(np.float64), d["hs_T"].astype(np.float64)
+        if acc_p is None:
+            acc_p, acc_T, nT = np.zeros_like(p_), np.zeros_like(T_), np.zeros_like(T_)
+        acc_p += np.nan_to_num(p_)
+        okT = np.isfinite(T_)
+        acc_T[okT] += T_[okT]
+        nT += okT
+        n_s += 1
+    mean_p = acc_p / n_s if n_s else None
+    mean_T = np.where(nT > 0, acc_T / np.maximum(nT, 1), np.nan) if n_s else None
+
+    # per plate: peak over the run, and the full-thrust mean
     names = m["names"]
     plates = [(i, n) for i, n in enumerate(names) if n.startswith("plate")]
     rows = []
@@ -369,22 +390,36 @@ def report(folder, out=None):
         ok = w & np.isfinite(peak_p[sl])
         if not ok.any():
             continue
-        rows.append((("centre plate" if n == "plate 0" else n) if n != "dome" else "bare dome",
-                     _p995(peak_p[sl][ok]), _p995(peak_T[sl][ok])))
+        lab = ("centre plate" if n == "plate 0" else n) if n != "dome" else "bare dome"
+        mp_ = _p995(mean_p[sl][ok]) if mean_p is not None else np.nan
+        mT_ = _p995(mean_T[sl][ok]) if mean_T is not None else np.nan
+        rows.append((lab, _p995(peak_p[sl][ok]), _p995(peak_T[sl][ok]), mp_, mT_))
     if rows:
-        fig, axs = plt.subplots(1, 2, figsize=(11, 0.42 * len(rows) + 1.4))
+        fig, axs = plt.subplots(1, 2, figsize=(11, 0.5 * len(rows) + 1.8))
         lab = [r[0] for r in rows]
-        for ax, k, sc, unit, title in ((axs[0], 1, 1e-3, "kPa", "Peak pressure"), (axs[1], 2, 1.0, "K", "Peak gas temperature")):
-            vals = np.array([r[k] for r in rows]) * sc
-            yy = np.arange(len(rows))[::-1]
-            ax.barh(yy, vals, color=CAT[0], height=0.62)
-            for y_, v_ in zip(yy, vals):
-                ax.text(v_, y_, f" {v_:,.0f}", va="center", fontsize=8.5, color=INK)
+        yy = np.arange(len(rows))[::-1].astype(float)
+        both = mean_p is not None
+        for ax, k, sc, unit, title in ((axs[0], 1, 1e-3, "kPa", "Pressure"), (axs[1], 2, 1.0, "K", "Gas temperature")):
+            series = [(k, "highest during the run (start-up included)", CAT[0])]
+            if both:
+                series.append((k + 2, f"full thrust, time mean ({n_s} snapshots)", CAT[1]))
+            hb = 0.36 if both else 0.62
+            vmax = 0.0
+            for si, (col, sname, colr) in enumerate(series):
+                vals = np.array([r[col] for r in rows]) * sc
+                off = (0.5 - si) * (hb + 0.04) if both else 0.0
+                ax.barh(yy + off, vals, color=colr, height=hb, label=sname)
+                for y_, v_ in zip(yy + off, vals):
+                    if np.isfinite(v_):
+                        ax.text(v_, y_, f" {v_:,.0f}", va="center", fontsize=8, color=INK)
+                vmax = max(vmax, np.nanmax(vals))
             ax.set_yticks(yy, lab)
-            ax.set_title(f"{title} [{unit}]")
+            ax.set_title(f"{title} [{unit}], 99.5th percentile over each plate")
             ax.grid(axis="y", visible=False)
-            ax.set_xlim(0, vals.max() * 1.18)
-        fig.tight_layout()
+            ax.set_xlim(0, vmax * 1.2)
+        h_, l_ = axs[0].get_legend_handles_labels()
+        fig.tight_layout(rect=(0, 0, 1, 0.93))
+        fig.legend(h_, l_, loc="upper left", ncol=2, fontsize=8.5, bbox_to_anchor=(0.01, 1.0))
         fig.savefig(os.path.join(out, "hotstage_plates.png"), dpi=160)
         plt.close(fig)
 
@@ -430,10 +465,15 @@ def report(folder, out=None):
         if ok.any():
             summ[n] = dict(peak_p_kPa=round(_p995(peak_p[sl][ok]) / 1e3, 1),
                            peak_T_K=round(_p995(peak_T[sl][ok])), points=int(ok.sum()))
+            if mean_p is not None:
+                summ[n].update(full_thrust_p_kPa=round(_p995(mean_p[sl][ok]) / 1e3, 1),
+                               full_thrust_T_K=round(_p995(mean_T[sl][ok])) if np.isfinite(_p995(mean_T[sl][ok])) else None)
     with open(os.path.join(out, "summary.json"), "w") as fh:
         json.dump(summ, fh, indent=1)
     for n, s in summ.items():
-        print(f"  {n:12s} peak p {s['peak_p_kPa']:9.1f} kPa   peak gas T {s['peak_T_K']:6d} K")
+        ft = (f"   full thrust: {s['full_thrust_p_kPa']:8.1f} kPa, {s['full_thrust_T_K'] or 0:5d} K"
+              if "full_thrust_p_kPa" in s else "")
+        print(f"  {n:12s} peak p {s['peak_p_kPa']:9.1f} kPa   peak gas T {s['peak_T_K']:6d} K{ft}")
     print(f"wrote {out}: hotstage_history.png, hotstage_plates.png, hotstage_dome_map.png, summary.json")
     return summ
 

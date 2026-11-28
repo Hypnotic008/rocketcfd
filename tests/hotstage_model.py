@@ -1,0 +1,62 @@
+"""Hot-staging model checks (no CFD): Raptor 3 nozzles make their rated thrust and published Isp;
+the solver jet state carries the exhaust's density, velocity and pressure; the exhaust
+temperature mapping is exact at the nozzle exit and at stagnation; the plates sit on the dome and
+the RVac bells clear the truss.
+
+  python tests/hotstage_model.py
+"""
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import numpy as np
+from rocketcfd import engines as EN, hotstage as HS
+from rocketcfd.vehicles.starship import (StarshipParams, engines as ship_engines, hot_stage_truss_sdf,
+                                         dome_plate_list, dome_distance)
+
+
+def main():
+    ok = True
+    G0 = EN.G0
+    for spec, pa, isp_pub in ((EN.RAPTOR3_SL, 101325.0, 350.0), (EN.RAPTOR3_VAC, 0.0, 380.0)):
+        e = EN.exit_state(spec, pa)
+        thr = abs(e["thrust"] / spec.thrust - 1)
+        isp = abs(e["isp"] / isp_pub - 1)
+        print(f"{spec.name}: thrust {e['thrust']/G0/1e3:.0f} tf (rated {spec.thrust/G0/1e3:.0f}), Isp {e['isp']:.0f} s "
+              f"(published {isp_pub:.0f}), V_e {e['V_e']:.0f} m/s, mdot {e['mdot']:.0f} kg/s")
+        ok &= thr < 1e-6 and isp < 0.04
+        j = EN.jet(spec, (0, 0, 0), p_amb=pa)
+        rho = j["p"] / (j["R"] * j["T"])
+        V = j["mach"] * np.sqrt(1.4 * j["R"] * j["T"])
+        ok &= abs(rho / e["rho_e"] - 1) < 1e-9 and abs(V / e["V_e"] - 1) < 1e-9
+    e = EN.exit_state(EN.RAPTOR3_SL, 10.0)
+    th = HS.thermo_constants(230.0, 1378.0, e)
+    # the model's state at the exit and at stagnation (same total enthalpy, V = 0)
+    Tm_exit = e["p_e"] / (e["rho_e"] * HS.R_AIR)
+    T_exit = HS.exhaust_temperature(np.array(Tm_exit), np.array(e["V_e"] ** 2), **th)
+    h0 = th["h0_jet"]
+    T_stag = HS.exhaust_temperature(np.array(h0 / HS.CP_AIR), np.array(0.0), **th)
+    T_air = HS.exhaust_temperature(np.array(230.0), np.array(1378.0 ** 2), **th)
+    print(f"exhaust temperature: exit {float(T_exit):.0f} K (T_e {e['T_e']:.0f}), stagnation {float(T_stag):.0f} K "
+          f"(T_c {e['T_c']:.0f}), freestream air {float(T_air):.0f} K (230)")
+    ok &= abs(T_exit / e["T_e"] - 1) < 1e-6 and abs(T_stag / e["T_c"] - 1) < 0.02 and abs(T_air - 230) < 1e-6
+    S = StarshipParams()
+    d = []
+    for cy, cz, rp in dome_plate_list(S):
+        x = 68.3 + 2.9 * np.sqrt(max(0.0, 1 - (np.hypot(cy, cz) / S.radius) ** 2))
+        d.append(float(dome_distance(np.array(x), np.array(cy), np.array(cz))))
+    print(f"plate centres on the dome surface: max |d| {max(map(abs, d)):.3f} m")
+    ok &= max(map(abs, d)) < 0.03
+    best = 9.0
+    for kind, y, z, xe, re_, bl in ship_engines(S):
+        if kind != "vacuum":
+            continue
+        a = np.linspace(0, 2 * np.pi, 400)
+        for xx in np.linspace(71.5, 72.3, 9):
+            best = min(best, float(hot_stage_truss_sdf(np.full(400, xx), y + re_ * np.cos(a), z + re_ * np.sin(a), S).min()))
+    print(f"RVac bell rims to the truss: {best:.3f} m clear")
+    ok &= best > 0.03
+    print("PASS" if ok else "FAIL")
+    return ok
+
+
+if __name__ == "__main__":
+    sys.exit(0 if main() else 1)

@@ -110,7 +110,10 @@ class Solver:
                      flow (landing burns, hot staging, retropropulsion). One perfect gas (the freestream
                      gamma and R): choose T so the exit velocity mach * sqrt(gamma R T) is right.
                      self.jet_throttle (0..1, or a list with one value per jet) blends from ambient
-                     (ignition transients). Warp backend.
+                     (ignition transients). Warp backend. Optional per jet: R (the exhaust's gas constant:
+                     density p / (R T)), lip=True (no exhaust cell borders the outside flow sideways),
+                     area (nominal exit area: the density is scaled so the resolved exit disk carries
+                     the engine's mass flow and momentum flux).
         thin_normals : thin-wall faces use the real plate normal for the wall pressure (default);
                      False = axis-aligned mirror (staircase), the earlier behaviour
         alloc      : optional callable(name, shape) -> tensor for the state arrays (U, W, K, O);
@@ -346,6 +349,7 @@ class Solver:
         cells, states, groups = [], [], []
         g = self.gamma
         self.jet_cells = []
+        self.jet_density_scale = []
         for ji, jt in enumerate(self.jets):
             c = np.asarray(jt["center"], float)
             d = np.asarray(jt["direction"], float)
@@ -360,6 +364,7 @@ class Solver:
             rng = [np.flatnonzero(np.abs(self.axes[k] - c[k]) <= ext) for k in range(3)]
             if any(len(q) == 0 for q in rng):
                 self.jet_cells.append(0)
+                self.jet_density_scale.append(1.0)
                 continue
             X, Y, Z = np.meshgrid(*[self.axes[k][rng[k]] for k in range(3)], indexing="ij")
             P = np.stack([X - c[0], Y - c[1], Z - c[2]], -1)
@@ -369,10 +374,37 @@ class Solver:
             sel = (sa < 0.0) & (sa > -depth) & (rad <= r) & (ph <= 0)
             ii = np.argwhere(sel)
             idx = np.stack([rng[k][ii[:, k]] for k in range(3)], -1)
+            if jt.get("lip", False) and len(idx):
+                # keep the exhaust cells off the rim: none may border fluid sideways (across the
+                # jet axis). Where the bell lip is thinner than a cell, the outermost exhaust
+                # cells otherwise sit next to the outside flow and blow exhaust sideways into it
+                # (into near vacuum at staging altitude: spurious ~20 000 K gas at the lip)
+                ax_ = int(np.argmax(np.abs(d)))
+                keep = np.ones(len(idx), bool)
+                for k in range(3):
+                    if k == ax_:
+                        continue
+                    for sgn in (-1, 1):
+                        nb = idx.copy()
+                        nb[:, k] = np.clip(nb[:, k] + sgn, 0, self.phi.shape[k] - 1)
+                        keep &= self.phi[nb[:, 0], nb[:, 1], nb[:, 2]] <= 0
+                if keep.sum() >= 0.3 * len(idx):
+                    idx = idx[keep]
+            dens_scale = 1.0
+            if jt.get("area") and len(idx):
+                # resolved exit area: the distinct cross-axis cell columns of the exhaust cells
+                ax_ = int(np.argmax(np.abs(d)))
+                lat = [k for k in range(3) if k != ax_]
+                cols = np.unique(idx[:, lat], axis=0)
+                a_res = float(np.sum(self.widths[lat[0]][cols[:, 0]] * self.widths[lat[1]][cols[:, 1]]))
+                # same velocity and pressure, density scaled: the engine's mass flow and momentum
+                # flux (its thrust) whatever the staircase of the exit disk
+                dens_scale = float(np.clip(float(jt["area"]) / max(a_res, 1e-12), 0.5, 2.0))
+            self.jet_density_scale.append(dens_scale)
             T, pe, M = float(jt["T"]), float(jt["p"]), float(jt["mach"])
             ce = np.sqrt(g * Rg * T)
             u = M * ce * d
-            q = np.array([pe / (Rg * T), u[0], u[1], u[2], pe], np.float32)
+            q = np.array([dens_scale * pe / (Rg * T), u[0], u[1], u[2], pe], np.float32)
             cells.append(idx)
             states.append(np.repeat(q[None], len(idx), 0))
             groups.append(np.full(len(idx), ji, np.int32))

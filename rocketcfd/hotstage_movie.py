@@ -162,7 +162,7 @@ def render_hotstage(folder, out, quantity="temperature", camera="cutaway", width
     cut = camera == "cutaway"
     if cut:                                   # remove the near half (y < 0, camera side)
         def keep_far(pd):
-            return pd.clip(normal=(0, -1, 0), origin=(0, -0.0, 0), invert=False) if pd.n_points else pd
+            return pd.clip(normal=(0, 1, 0), origin=(0, 0.0, 0), invert=False) if pd.n_points else pd   # keeps y > 0
         parts = [(n, sl, keep_far(pd) if n in ("truss", "ship aft") else pd) for n, sl, pd in parts]
         statics = [keep_far(s_) for s_ in statics]
     # per-part vertex map after clipping (clip keeps 'vtkOriginalPointIds' only when asked: map by nearest)
@@ -191,9 +191,9 @@ def render_hotstage(folder, out, quantity="temperature", camera="cutaway", width
             a = np.radians(-100 + 200 * sfrac)
             pos = focus + np.array([3.5, 24 * np.sin(a), 24 * np.cos(a) * 0.55 + 6])
         elif cut:
-            pos = focus + np.array([5.0, -17.0, 6.0])
+            pos = focus + np.array([9.0, -25.0, 9.0])
         else:
-            pos = focus + np.array([4.0, -21.0, 8.0])
+            pos = focus + np.array([6.0, -30.0, 11.0])
         return [tuple(pos), tuple(focus), (1, 0, 0)]
 
     pl = pv.Plotter(off_screen=True, window_size=(W3, height))
@@ -242,13 +242,13 @@ def render_hotstage(folder, out, quantity="temperature", camera="cutaway", width
         pv_ = blend(A["hs_p"], B["hs_p"], fr).astype(np.float64)
         if quantity != "temperature":
             qv = qv / 1e3
-        qv = np.where(np.isfinite(qv), qv, clim[0])
         pl.clear_actors()
         for (name, sl, pd), mp in zip(parts, maps):
             vals = qv[sl][mp]
-            pd.point_data["q"] = np.maximum(vals, clim[0] if log else -1e30)
+            # no hot gas next to the wall (thin gas, or outside the plume): plain steel
+            pd.point_data["q"] = np.where(np.isfinite(vals), np.maximum(vals, clim[0]), np.nan)
             pl.add_mesh(pd, scalars="q", cmap=cmap, clim=clim, log_scale=log, smooth_shading=True,
-                        specular=0.35 if name.startswith("plate") else 0.2, specular_power=25,
+                        nan_color="#7d838b", specular=0.35 if name.startswith("plate") else 0.2, specular_power=25,
                         show_scalar_bar=False, render=False)
         for r_ in rims:
             pl.add_mesh(r_, color="#f2f2f2", smooth_shading=True, render=False)
@@ -268,7 +268,7 @@ def render_hotstage(folder, out, quantity="temperature", camera="cutaway", width
                 Tg = _FinestGrid(levs)("T", np.asarray(img.points))
                 img.point_data["T"] = np.clip(np.nan_to_num(Tg, nan=th["T_inf"]), 200, 4000).astype(np.float32)
                 pl.add_volume(img, scalars="T", cmap="inferno", clim=[600.0, 3800.0],
-                              opacity=[0.0, 0.0, 0.03, 0.08, 0.16, 0.28], shade=False, mapper="fixed_point",
+                              opacity=[0.0, 0.0, 0.015, 0.05, 0.11, 0.2], shade=False, mapper="fixed_point",
                               show_scalar_bar=False, render=False)
         pl.camera_position = cam(fi / max(len(frames) - 1, 1))
         pl.camera.view_angle = 30.0

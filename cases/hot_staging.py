@@ -149,12 +149,24 @@ def main(argv=None):
     else:
         s = runner = Solver(None, None, None, fs, faces=faces, sdf=sdf, cfl=a.cfl, jets=jets)
     grids = runner.grids if patches else [runner]
+    # each engine on the finest grid holding its exit: cells and the density factor that keeps
+    # its mass flow and thrust on the staircased exit disk
+    for ji, j in enumerate(jets):
+        best = None
+        for g_ in grids:
+            nc = g_.jet_cells[ji] if ji < len(getattr(g_, "jet_cells", [])) else 0
+            if nc:
+                h_ = float(min(np.min(np.diff(f_)) for f_ in g_.faces))
+                if best is None or h_ < best[0]:
+                    best = (h_, nc, g_.jet_density_scale[ji])
+        if best:
+            print(f"  jet {ji}: {best[1]} exhaust cells of {best[0]:.3f} m, density x{best[2]:.3f} for the rated mass flow")
     ship_jet = np.zeros(len(jets), bool)
     ship_jet[len(jets) - n_ship:] = True
 
     # time step and run length
-    # (the summed wave speeds in the hot plume, ~11.5 km/s, as seen in runs)
-    dt_est = min(float(g_.cfl / (11500.0 / g_.h.min())) for g_ in grids)
+    # (the summed wave speeds in the hot plume, ~20 km/s with the Raptor 3 exit states, as seen in runs)
+    dt_est = min(float(g_.cfl / (20000.0 / g_.h.min())) for g_ in grids)
     nsteps = int(a.time / dt_est) + 1
     chunk = max(10, nsteps // 200)
     print(f"~{nsteps} steps of ~{dt_est:.2e} s")

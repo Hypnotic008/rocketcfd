@@ -66,6 +66,12 @@ def check_weno():
                 f"{100*so_w:+.1f} % (Koren {100*so_k:+.1f} %), stagnation pressure {100*ps_w:+.1f} % (<3 %)")
 
 
+def check_hotstage():
+    import hotstage_model as hm
+    ok = hm.main()
+    return ok, "Raptor 3 thrust / Isp, exhaust temperature at exit and stagnation, plates and truss clearances"
+
+
 def check_adapt():
     import adapt_budget as ab
     ok = ab.main()
@@ -109,7 +115,7 @@ def check_split_residual():
     return worst < 1e-4, f"split face/divergence residual vs fused kernel: worst relative difference {worst:.1e} (<1e-4)"
 
 
-CHECKS = dict(backends=check_backends, split_residual=check_split_residual, vortex=check_vortex, weno=check_weno, adapt=check_adapt,
+CHECKS = dict(backends=check_backends, split_residual=check_split_residual, vortex=check_vortex, weno=check_weno, adapt=check_adapt, hotstage=check_hotstage,
               shocks=check_shocks, low_mach=check_low_mach,
               patch_blasius=check_patch_blasius, patch_sphere=check_patch_sphere, carbuncle=check_carbuncle,
               patch_turbulent=check_patch_turbulent)

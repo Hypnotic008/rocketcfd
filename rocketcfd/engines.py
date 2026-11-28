@@ -111,15 +111,15 @@ def exit_state(spec: RaptorSpec, p_amb=0.0, throttle=1.0):
                 underexpansion=pe / max(p_amb, 1e-9))
 
 
-def jet(spec: RaptorSpec, center, direction=(-1.0, 0.0, 0.0), p_amb=0.0, gamma_solver=1.4, radius_frac=0.95):
+def jet(spec: RaptorSpec, center, direction=(-1.0, 0.0, 0.0), p_amb=0.0, gamma_solver=1.4, radius_frac=1.0):
     """A solver `jets` entry with Raptor's exit density, velocity and pressure. The solver's jet
     state is rho = p / (R T), u = mach sqrt(gamma_solver R T): with R and T of the exhaust and
     mach = V_e / sqrt(gamma_solver R T_e) it imposes exactly (rho_e, V_e, p_e)."""
     e = exit_state(spec, p_amb)
     m_solver = e["V_e"] / np.sqrt(gamma_solver * e["R"] * e["T_e"])
     return dict(center=tuple(float(c) for c in center), direction=tuple(direction),
-                radius=radius_frac * 0.5 * e["exit_diameter"], mach=float(m_solver), p=float(e["p_e"]),
-                T=float(e["T_e"]), R=float(e["R"]), engine=e)
+                radius=radius_frac * 0.5 * e["exit_diameter"], area=float(np.pi * e["exit_diameter"] ** 2 / 4), mach=float(m_solver), p=float(e["p_e"]),
+                T=float(e["T_e"]), R=float(e["R"]), lip=True, engine=e)
 
 
 def table(p_amb=10.0):
