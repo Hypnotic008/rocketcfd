@@ -172,3 +172,12 @@ class MeshSDF:
             p = [pts[d][~inside_box] - c[d] for d in range(3)]
             out[~inside_box] = box_local(p[0], p[1], p[2], *hh) + self.phi.max()
         return out
+
+
+def capsule(X, Y, Z, p0, p1, r):
+    """Round tube of radius r between points p0 and p1 (exact distance)."""
+    p0 = np.asarray(p0, float)
+    d = np.asarray(p1, float) - p0
+    L2 = float(d @ d)
+    t = np.clip(((X - p0[0]) * d[0] + (Y - p0[1]) * d[1] + (Z - p0[2]) * d[2]) / max(L2, 1e-12), 0.0, 1.0)
+    return np.sqrt((X - p0[0] - t * d[0]) ** 2 + (Y - p0[1] - t * d[1]) ** 2 + (Z - p0[2] - t * d[2]) ** 2) - r

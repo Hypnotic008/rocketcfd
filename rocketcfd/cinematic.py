@@ -317,7 +317,7 @@ def render_evolve(folder, out, style="lava", width=1920, height=1080, fps=30, q=
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("folder")
-    ap.add_argument("--mode", choices=["still", "orbit", "evolve", "schlieren", "flow", "flow-orbit", "buffet"],
+    ap.add_argument("--mode", choices=["still", "orbit", "evolve", "schlieren", "flow", "flow-orbit", "buffet", "hotstage"],
                     default="still",
                     help="schlieren: 2-D side-on schlieren film of the snapshots (no model); flow: the 3-D model "
                          "with tracer streaks through the recorded flow; flow-orbit: the same on a steady result")
@@ -326,8 +326,12 @@ def main(argv=None):
                     help="schlieren: zoom to this axial window [m] (x from the engine end)")
     ap.add_argument("--ylim", type=float, nargs=2, default=None, metavar=("Y0", "Y1"),
                     help="schlieren: zoom to this cross window [m] (recorded out to +/-15 m)")
-    ap.add_argument("--camera", choices=["three-quarter", "fins", "flyby"], default="three-quarter",
-                    help="flow: framing (flyby: wide, then a push in along the hull to the fins)")
+    ap.add_argument("--camera", choices=["three-quarter", "fins", "flyby", "cutaway", "outside", "orbit"], default=None,
+                    help="flow: framing (three-quarter (default), fins, flyby: wide, then a push in along the hull "
+                         "to the fins); hotstage: cutaway (default), outside, orbit")
+    ap.add_argument("--quantity", choices=["temperature", "pressure"], default="temperature",
+                    help="hotstage: surface colouring")
+    ap.add_argument("--no-volume", action="store_true", help="hotstage: no plume volume rendering (faster)")
     ap.add_argument("--no-vortices", action="store_true", help="flow: no vortex surfaces")
     ap.add_argument("--surface", choices=["cp", "metal"], default="cp", help="flow: vehicle coloured by Cp, or steel")
     ap.add_argument("--flow-plane", choices=["schlieren", "mach", "none"], default="schlieren",
@@ -360,6 +364,18 @@ def main(argv=None):
     ap.add_argument("--q", type=float, default=None, help="Q-criterion level (default: automatic)")
     ap.add_argument("--title", default=None)
     a = ap.parse_args(argv)
+    if a.camera is None:
+        a.camera = "cutaway" if a.mode == "hotstage" else "three-quarter"
+    if a.mode == "hotstage":
+        from .hotstage_movie import render_hotstage
+        ext = "png" if a.still_frame is not None else "mp4"
+        out = a.out or os.path.join(a.folder, f"hotstage_{a.quantity}_{a.camera}" +
+                                    (f"_f{a.still_frame}" if a.still_frame is not None else "") + f".{ext}")
+        render_hotstage(a.folder, out, a.quantity, a.camera, a.width, a.height, a.fps, tween=max(a.tween, 1),
+                        start=a.start, still_frame=a.still_frame, title=a.title, volume=not a.no_volume,
+                        progress=lambda i, n: print(f"frame {i}/{n}", flush=True))
+        print(f"wrote {out}")
+        return
     ext = "png" if a.mode in ("still", "buffet") else "mp4"
     tag = a.style if a.mode in ("still", "orbit", "evolve") else (a.plane if a.mode == "schlieren" else a.camera)
     out = a.out or os.path.join(a.folder, f"cinematic_{a.mode}_{tag}.{ext}")

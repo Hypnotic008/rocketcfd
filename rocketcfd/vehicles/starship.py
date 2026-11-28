@@ -23,7 +23,7 @@ class StarshipParams:
     nose_length: float = 19.0          # tangent ogive
     # engines: (count, pitch radius, exit radius, bell length, exit x above x_aft, azimuth offset deg)
     sea_level: tuple = (3, 1.05, 0.65, 2.0, 0.3, 0.0)
-    vacuum: tuple = (3, 3.15, 1.15, 3.0, -0.3, 60.0)
+    vacuum: tuple = (3, 3.0, 1.15, 3.0, -0.3, 60.0)    # pitch radius 3.0: the bell rims clear the truss
     # flaps: (x0, x1 above x_aft, radial reach from the hull, thickness)
     aft_flaps: tuple = (2.5, 11.5, 3.6, 0.35)
     fwd_flaps: tuple = (35.0, 41.5, 2.4, 0.3)
@@ -34,6 +34,18 @@ class StarshipParams:
     ring_struts: int = 20
     ring_strut_width: float = 0.6
     ring_thickness: float = 0.2
+    # V3 hot-stage truss (photos: a zig-zag of round tubes between two rings, the forward dome
+    # inside it): `truss_nodes` tube joints on the lower ring, as many on the upper ring half a
+    # pitch round, each lower joint the apex of a V. Estimates from pictures, not drawings.
+    ring_style: str = "v3_truss"       # 'v3_truss' | 'vented' (the earlier straight-strut ring)
+    truss_nodes: int = 20
+    truss_tube_radius: float = 0.12
+    truss_band: float = 0.35           # height of the lower and upper rings
+    truss_band_thickness: float = 0.15
+    # forward-dome protection plates (photos: a centre disc and a ring of round plates, a
+    # "flower"): (radius of the centre plate, number in the ring, ring radius, plate radius,
+    # standoff above the dome) [m]
+    dome_plates: tuple = (1.1, 7, 2.45, 0.95, 0.05)
 
     @property
     def length(self):
@@ -91,6 +103,75 @@ def starship_sdf(X, Y, Z, P: StarshipParams = StarshipParams()):
             parts.append(g.radial_box(X, Y, Z, th_, xc, rbase + 0.5 * reach - 0.2, 0.5 * (x1 - x0),
                                       0.5 * reach + 0.2, 0.5 * th))
     return g.union(*parts)
+
+
+def truss_tubes(P: StarshipParams = StarshipParams()):
+    """[(p0, p1)] end points of the V3 truss tubes (lower joint -> upper joint)."""
+    R = P.radius - P.truss_tube_radius - 0.03       # the tubes form the outer skin, as in the photos
+    x0 = P.ring_x0 + P.truss_band
+    x1 = P.x_aft - P.truss_band
+    n = P.truss_nodes
+    out = []
+    for k in range(n):
+        tb = 2 * np.pi * k / n
+        lo = (x0, R * np.cos(tb), R * np.sin(tb))
+        for s_ in (+1, -1):                       # the two legs of the V
+            tt = tb + s_ * np.pi / n
+            out.append((lo, (x1, R * np.cos(tt), R * np.sin(tt))))
+    return out
+
+
+def hot_stage_truss_sdf(X, Y, Z, P: StarshipParams = StarshipParams()):
+    """V3 hot stage: lower and upper rings joined by a zig-zag of round tubes, open between."""
+    R = P.radius
+    rr = np.sqrt(Y * Y + Z * Z)
+    t = P.truss_band_thickness
+    shell = np.abs(rr - (R - t / 2)) - t / 2
+    b = P.truss_band
+    x0, x1 = P.ring_x0, P.x_aft
+    parts = [np.maximum(shell, np.abs(X - (x0 + b / 2)) - b / 2),
+             np.maximum(shell, np.abs(X - (x1 - b / 2)) - b / 2)]
+    for p0, p1 in truss_tubes(P):
+        parts.append(g.capsule(X, Y, Z, p0, p1, P.truss_tube_radius))
+    return g.union(*parts)
+
+
+def dome_plate_list(P: StarshipParams = StarshipParams()):
+    """[(y, z, radius)] of the forward-dome protection plates (centre plate first)."""
+    rc, n, ring_r, rp, _ = P.dome_plates
+    out = [(0.0, 0.0, rc)]
+    for k in range(n):
+        a = 2 * np.pi * (k + 0.5) / n
+        out.append((ring_r * np.cos(a), ring_r * np.sin(a), rp))
+    return out
+
+
+def dome_distance(X, Y, Z, tank_top_x=68.3, dome_rise=2.9, R=4.5):
+    """Approximate signed distance to the booster's forward dome (half ellipsoid)."""
+    rho = np.sqrt(Y * Y + Z * Z)
+    return (np.sqrt(((X - tank_top_x) / dome_rise) ** 2 + (rho / R) ** 2) - 1.0) * min(dome_rise, R)
+
+
+def dome_plates_sdf(X, Y, Z, P: StarshipParams = StarshipParams(), tank_top_x=68.3, dome_rise=2.9, which=None):
+    """The protection plates as thin caps standing `standoff` proud of the dome. which: plate
+    index (or None for all)."""
+    standoff = P.dome_plates[4]
+    d = dome_distance(X, Y, Z, tank_top_x, dome_rise, P.radius)
+    layer = np.maximum(d - standoff, -d - 0.02)
+    layer = np.maximum(layer, tank_top_x - X)
+    parts = []
+    for k, (cy, cz, rp) in enumerate(dome_plate_list(P)):
+        if which is not None and k != which:
+            continue
+        parts.append(np.maximum(layer, np.sqrt((Y - cy) ** 2 + (Z - cz) ** 2) - rp))
+    return g.union(*parts)
+
+
+def interstage_sdf(X, Y, Z, P: StarshipParams = StarshipParams(), tank_top_x=68.3, dome_rise=2.9):
+    """The hot stage as built for P.ring_style: truss (+ dome plates) or the vented ring."""
+    if P.ring_style == "vented":
+        return hot_stage_ring_sdf(X, Y, Z, P)
+    return np.minimum(hot_stage_truss_sdf(X, Y, Z, P), dome_plates_sdf(X, Y, Z, P, tank_top_x, dome_rise))
 
 
 def hot_stage_ring_sdf(X, Y, Z, P: StarshipParams = StarshipParams()):

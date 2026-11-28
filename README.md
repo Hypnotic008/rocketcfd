@@ -587,26 +587,114 @@ python -m rocketcfd.cinematic results/landing_burn --mode orbit --style plume
 
 ## Hot staging
 
-`cases/hot_staging.py`: Starship (approximate public dimensions: 9 m, ~52 m, ogive nose, flaps,
-3 sea-level + 3 vacuum Raptors) sits on the booster's vented hot-stage ring; its engines ramp up
-(`--ignition` seconds) while the booster's centre engines keep running, and the plumes hit the
-booster's dome and blow out through the vents. Ascent flow from the ship's nose, time-accurate
-explicit steps, ship and booster axial forces over time.
+`cases/hot_staging.py`: Starship sits on the booster's hot stage at Mach 4.5, 65 km. Its six
+Raptor 3s ramp up (`--ignition` seconds) while the booster's three centre engines keep running.
+The plumes hit the booster's forward dome and its protection plates, then blow out between the
+truss tubes. The flow comes from the ship's nose, with time-accurate explicit steps.
+
+**Geometry** (`--ring v3`, the default; estimates from photos, not drawings):
+
+- V3 hot stage (`rocketcfd.vehicles.starship.hot_stage_truss_sdf`): a lower and an upper ring
+  joined by a zig-zag of 40 round tubes (24 cm diameter, 20 V's), open between the tubes.
+- Forward-dome protection plates (`dome_plates_sdf`): the "flower", a 2.2 m centre plate and a
+  ring of seven 1.9 m plates, standing 5 cm proud of the dome.
+- `--ring vented` gives the earlier ring with straight struts.
+
+**Engines** (`rocketcfd.engines`, `python -m rocketcfd.engines` prints the table):
+
+| | Raptor 3 sea level (×3 ship, ×3 booster centre) | Raptor 3 vacuum (×3 ship) |
+|---|---|---|
+| propellant | CH4 / LOX, O/F 3.6 | CH4 / LOX, O/F 3.6 |
+| chamber | 350 bar, 3600 K | 350 bar, 3600 K |
+| chamber (injector face) / throat / exit diameter | 0.44 / 0.24 / 1.30 m | 0.44 / 0.24 / 2.30 m |
+| area ratio, exit Mach | 31, 3.7 | 100, 4.4 |
+| exit velocity, temperature, pressure | 3306 m/s, 1891 K, 130 kPa | 3567 m/s, 1610 K, 32 kPa |
+| mass flow | 819 kg/s | 804 kg/s |
+| thrust | 2746 kN at sea level (280 tf, rated); 2880 kN at 65 km | 3001 kN in vacuum (306 tf, rated) |
+| Isp | 342 s at sea level (published ~350) | 381 s in vacuum (published 380) |
+| exhaust | 22.6 g/mol (H2O, CO2, CO, H2) | same |
+
+- **How the numbers are made.** A 1-D ideal nozzle sized so each engine makes its rated thrust.
+  The isentropic exponent is an effective 1.13, the value that reproduces the published Isp; the
+  real exhaust keeps recombining as it expands, and the frozen γ ≈ 1.20 gives ~7 % less Isp.
+- **No particles in the plume.** Methalox burns essentially soot-free; the plume is gas at
+  22.6 g/mol, not a particle-laden flow like a solid motor's alumina.
+- **Inflow at the nozzle exit.** The CFD does not simulate the injector, the chamber or the
+  nozzle. Each engine is an inflow at its exit disk: the cells just inside the exit hold the
+  exhaust's density, velocity and pressure. Mass flow, momentum flux (thrust) and exit pressure
+  are Raptor's.
+- **Why the nozzle isn't meshed.** The flow inside a nozzle is the 1-D solution to within a few
+  per cent. A 24 cm throat would need ~1 cm cells, and the injector (hundreds of coaxial
+  elements, millimetre scale) is far below any grid.
+
+**Temperature.** The solver carries one gas (γ 1.4), so the exhaust stores its internal energy
+the wrong way. Read raw, the gas where the plume stops on the dome would show ~5000 K instead of
+Raptor's ~3600 K stagnation temperature. `rocketcfd.hotstage.exhaust_temperature` recovers the
+temperature from the enthalpy instead:
+
+- the exhaust fraction comes from the total enthalpy, which is conserved through mixing and
+  shocks;
+- the temperature then uses the mixture's heat capacity;
+- this is exact at the nozzle exit and at stagnation.
+
+Temperatures count only where the gas density exceeds `--rho-min` (5e-3 kg/m³, ~30× ambient).
+At 65 km the almost empty cells round the plume have no meaningful p/ρ. The thin air the starting
+plume shocks really does reach ~8000 K, but it carries no heat. Peaks are 99.5th percentiles.
+These are gas temperatures next to the wall, not wall temperatures: there is no heat transfer
+or ablation model.
+
+**Data** (`rocketcfd.hotstage`): every snapshot holds the gas pressure and temperature next to
+each surface vertex (1 fine cell out along the normal, from the finest grid there) of:
+
+- the bare dome between the plates;
+- each protection plate;
+- the truss;
+- the ship's aft end and its engine bells.
+
+At the end of the run:
+
+- `hotstage.json`: time histories per part (peak and area-weighted mean);
+- `hotstage_peaks.npz`: peak maps;
+- `hotstage_<part>.vtk`: surfaces with the peak pressure and temperature, for ParaView.
+
+`python -m rocketcfd.hotstage report <run>` makes the history, per-plate and top-down dome-map
+figures plus `summary.json`.
+
+**Grid.** `--ring-h` refines a cylinder (r < 6 m) from below the dome to above the ship's bells:
+the gap, and the plume leaving between the tubes. `--wall-h` adds a finer shell (`--wall-shell`
+thick) on the dome, the plates, the truss and the ship's aft end and engines.
 
 ```bash
-python cases/hot_staging.py --dry-run                         # 0.95 M cells at the default 0.5 m
-# movie: 4.8 M cells, 10 cm cells around the interstage, 0.25 s of flow
-python cases/hot_staging.py --h 0.4 --ring-h 0.1 --time 0.25 --snapshots 150 --snap-volume 1 --probes --out results/hot_staging
-python -m rocketcfd.cinematic results/hot_staging --mode evolve --style plume
+python -m rocketcfd.engines                                         # the engine table
+python cases/hot_staging.py --dry-run --h 0.4 --ring-h 0.08 --wall-h 0.04 --wall-shell 0.2
+# preview (~1.5 M cells, minutes on the GPU)
+python cases/hot_staging.py --h 0.4 --ring-h 0.1 --time 0.03 --snapshots 60 --snap-volume 2 --probes --out results/hot_staging_preview
+# main run: 8 cm cylinder + 4 cm wall shell, 50 ms (20 ms ignition ramp + 30 ms at full thrust)
+python cases/hot_staging.py --h 0.4 --ring-h 0.08 --wall-h 0.04 --wall-shell 0.2 --time 0.05 --snapshots 150 --snap-volume 2 --probes --out results/hot_staging
+python -m rocketcfd.hotstage report results/hot_staging
+python -m rocketcfd.cinematic results/hot_staging --mode hotstage --tween 3                          # temperature, cutaway
+python -m rocketcfd.cinematic results/hot_staging --mode hotstage --tween 3 --quantity pressure
+python -m rocketcfd.cinematic results/hot_staging --mode hotstage --tween 3 --camera outside
 ```
 
-Preview from a coarse CPU test (1 m cells, 55 ms): [movie](docs/media/hot_staging_test_1m.mp4),
-[still](docs/media/hot_staging_test_1m.png): the ship's exhaust blows out of the interstage vents as
-the engines light; the booster's centre-engine plumes at the far end.
+The film (`--mode hotstage`):
 
-The plume-to-ambient pressure ratio at staging altitude is ~10^4: the density / pressure floors keep
-the run going and the near-field (interstage, dome, vents) is the meaningful part; the outer plume
-expanding into near vacuum is qualitative. One gas (see Engine plumes).
+- **Left, 3-D.** The dome, each protection plate (white rims), the truss and the ship's aft end,
+  coloured by the gas temperature (or pressure) at the wall, with the plume volume-rendered by
+  gas temperature.
+  - `cutaway` (default) removes the near half to show the plumes hitting the plates.
+  - `outside` shows the plume venting between the tubes.
+  - `orbit` goes once round the outside.
+- **Right.** Gas temperature and pressure on the pitch plane, from the finest grid.
+
+**Limits.**
+
+- The stages don't move apart: this is the start of hot staging, before separation.
+- The flow is inviscid, so there are no boundary layers and no wall heat flux.
+- One gas, γ 1.4 (see Temperature).
+- The plume-to-ambient pressure ratio is ~10^4. The density and pressure floors keep the run going,
+  but the outer plume expanding into near vacuum is qualitative. The near field (gap, dome, plates,
+  truss) is the meaningful part.
 
 ## Starship re-entry
 

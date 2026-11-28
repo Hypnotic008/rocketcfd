@@ -18,9 +18,14 @@ NG = 2
 
 class SnapshotRecorder:
     def __init__(self, solver, folder, q_inf, p_inf, region, half=15.0, volume_stride=0, patches=None,
-                 max_patch_cells=8e6):
+                 max_patch_cells=8e6, planes_full=False, volume_patches=None):
         from skimage.measure import marching_cubes
         self.s = solver
+        # planes_full: pressure (float32) and speed on the axis planes too, not only density
+        # (hot staging: temperature and pressure films). extras: callables returning more
+        # fields for each snapshot (e.g. rocketcfd.hotstage.WallSampler)
+        self.planes_full = planes_full
+        self.extras = []
         self.dir = os.path.join(folder, "snapshots")
         os.makedirs(self.dir, exist_ok=True)
         for f in os.listdir(self.dir):
@@ -74,16 +79,17 @@ class SnapshotRecorder:
         # refinement patches (e.g. the 6 cm grids around the fins): their interiors at the same
         # stride, so 3-D movies can draw the flow through the fins from the finest grid
         self.patches = []
-        if volume_stride and patches:
+        vpatches = patches if volume_patches is None else volume_patches   # (a subset for the 3-D volumes)
+        if volume_stride and vpatches:
             total = 0
             # finest first: if the cap bites, the coarse patches (hull shell, adapted) go first
-            patches = sorted(patches, key=lambda g_: float(np.min([np.min(np.diff(a_)) for a_ in g_.axes])))
-            for g in patches:
+            vpatches = sorted(vpatches, key=lambda g_: float(np.min([np.min(np.diff(a_)) for a_ in g_.axes])))
+            for g in vpatches:
                 ii = [np.arange(NG, len(a_) - NG)[::volume_stride] for a_ in g.axes]
                 n = int(np.prod([len(a_) for a_ in ii]))
                 if total + n > max_patch_cells:
                     print(f"snapshots: patch volumes capped at {max_patch_cells / 1e6:.0f} M cells "
-                          f"({len(self.patches)} of {len(patches)} patches recorded; raise --snap-patch-cells "
+                          f"({len(self.patches)} of {len(vpatches)} patches recorded; raise --snap-patch-cells "
                           f"or --snap-volume to keep them all)")
                     break
                 total += n
@@ -172,6 +178,20 @@ class SnapshotRecorder:
                 else:
                     pl = r[i0][:, jj][:, torch.as_tensor(inn[2], device=r.device)]
                 out[f"pp{k}_{name}_rho"] = pl.half().cpu().numpy()
+                if self.planes_full:
+                    def cut(a_):
+                        if name == "xy":
+                            return a_[i0][:, torch.as_tensor(inn[1], device=r.device), jj]
+                        return a_[i0][:, jj][:, torch.as_tensor(inn[2], device=r.device)]
+                    out[f"pp{k}_{name}_p"] = cut(Wg[4]).float().cpu().numpy()
+                    out[f"pp{k}_{name}_V"] = torch.sqrt(cut(Wg[1]) ** 2 + cut(Wg[2]) ** 2 + cut(Wg[3]) ** 2).half().cpu().numpy()
+        if self.planes_full:
+            for name, cut in (("xz", lambda a_: a_[ir][:, self.jy0][:, kr]), ("xy", lambda a_: a_[ir][:, jr][:, :, self.kz0])):
+                W = self._device_primitive()
+                out[f"p_{name}"] = cut(W[4]).float().cpu().numpy()
+                out[f"V_{name}"] = torch.sqrt(cut(W[1]) ** 2 + cut(W[2]) ** 2 + cut(W[3]) ** 2).half().cpu().numpy()
+        for fn in self.extras:
+            out.update(fn(step, t))
         self._write(os.path.join(self.dir, f"snap_{self.k:04d}.npz"), out)
         self.k += 1
 
