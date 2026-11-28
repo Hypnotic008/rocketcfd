@@ -525,6 +525,8 @@ The background is graded, and translucent layers are depth-peeled so they stack 
 
 More options for the flow movie:
 - `--no-streaks`: drop the tracer streaks, leaving the surfaces and the plane.
+- `--q-frac F` (default 0.97): vortex-surface level, as a quantile of the positive Q; lower shows
+  more and fatter vortex tubes. `--shock-opacity` (default 0.08): opacity of the shock sheets.
 - `--oil-flow`: oil-flow lines on the hull, as in a wind-tunnel oil-flow test. They come from the
   near-wall velocity, taken 0.45 m off the wall and integrated on the surface. They show
   separation and attachment lines and the flow around the chines.
