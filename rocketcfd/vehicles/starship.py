@@ -18,12 +18,13 @@ from .. import geometry as g
 class StarshipParams:
     radius: float = 4.5
     x_aft: float = 72.3                # ship aft end = top of the booster's hot-stage ring
-    skirt_height: float = 2.2          # aft skirt (open at the bottom) around the engines
+    skirt_height: float = 3.2          # aft skirt (open at the bottom): encloses all six engines, the 3 m
+                                       # RVac bells included (seen side-on, no engine shows below it)
     barrel_length: float = 33.0        # aft end to the start of the nose
     nose_length: float = 19.0          # tangent ogive
     # engines: (count, pitch radius, exit radius, bell length, exit x above x_aft, azimuth offset deg)
     sea_level: tuple = (3, 1.05, 0.65, 2.0, 0.3, 0.0)
-    vacuum: tuple = (3, 3.0, 1.15, 3.0, -0.3, 60.0)    # pitch radius 3.0: the bell rims clear the truss
+    vacuum: tuple = (3, 3.0, 1.15, 3.0, 0.1, 60.0)     # pitch radius 3.0; exits 0.1 m inside the skirt's edge
     # flaps: (x0, x1 above x_aft, radial reach from the hull, thickness)
     aft_flaps: tuple = (2.5, 11.5, 3.6, 0.35)
     fwd_flaps: tuple = (35.0, 41.5, 2.4, 0.3)

@@ -594,6 +594,9 @@ truss tubes. The flow comes from the ship's nose, with time-accurate explicit st
 
 **Geometry** (`--ring v3`, the default; estimates from photos, not drawings):
 
+- Ship's aft section: a 3.2 m skirt, open at the bottom, encloses all six engines. The RVac exits
+  sit 0.1 m inside its edge and the sea-level exits 0.3 m inside, so side-on no engine shows.
+
 - V3 hot stage (`rocketcfd.vehicles.starship.hot_stage_truss_sdf`): a lower and an upper ring
   joined by a zig-zag of 40 round tubes (24 cm diameter, 20 V's), open between the tubes.
 - Forward-dome protection plates (`dome_plate_footprints`, `dome_plates_sdf`), 5 cm proud of the

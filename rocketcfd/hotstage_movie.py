@@ -165,9 +165,15 @@ def render_hotstage(folder, out, quantity="temperature", camera="cutaway", width
     rims = _plate_rims(S, PB) if ring == "v3" else []
     statics = _static_meshes(S, PB)
     cut = camera == "cutaway"
+    ghosts = []
     if cut:                                   # remove the near half (y < 0, camera side)
         def keep_far(pd):
             return pd.clip(normal=(0, 1, 0), origin=(0, 0.0, 0), invert=False) if pd.n_points else pd   # keeps y > 0
+
+        def near(pd):
+            return pd.clip(normal=(0, -1, 0), origin=(0, 0.0, 0), invert=False) if pd.n_points else pd  # keeps y < 0
+        # the removed near half stays as a faint ghost: the ship's aft skirt round the engines, the truss
+        ghosts = [near(pd) for n, sl, pd in parts if n in ("truss", "ship aft")] + [near(s_) for s_ in statics]
         parts = [(n, sl, keep_far(pd) if n in ("truss", "ship aft") else pd) for n, sl, pd in parts]
         statics = [keep_far(s_) for s_ in statics]
     # per-part vertex map after clipping (clip keeps 'vtkOriginalPointIds' only when asked: map by nearest)
@@ -259,6 +265,8 @@ def render_hotstage(folder, out, quantity="temperature", camera="cutaway", width
             pl.add_mesh(r_, color="#f2f2f2", smooth_shading=True, render=False)
         for s_ in statics:
             pl.add_mesh(s_, color="#8e949c", metallic=0.6, roughness=0.45, pbr=True, smooth_shading=True, render=False)
+        for g_ in ghosts:
+            pl.add_mesh(g_, color="#c8ced6", opacity=0.13, smooth_shading=True, render=False)
         if volume:
             levs_a = field.levels(A)
             levs = levs_a if not fr else [((ax_), {k: blend(fa[k], fb[k], fr) for k in fa})
@@ -334,7 +342,7 @@ def render_hotstage(folder, out, quantity="temperature", camera="cutaway", width
         fig.text(0.012, 0.06, f"protection plates: {Tp:5.0f} K  {Pp:6.0f} kPa   bare dome: {Td:5.0f} K   truss: {Tt:5.0f} K"
                               "   (99.5th percentile, gas next to the wall)", color="#c8c8c8", fontsize=10.5, family="monospace")
         fig.text(0.012, 0.03, f"surfaces: {qlab.lower()} [{unit}]   plume: gas temperature (volume)   "
-                              f"white rims: dome protection plates" + ("   (cutaway: near half removed)" if cut else ""),
+                              f"white rims: dome protection plates" + ("   (cutaway: near half see-through)" if cut else ""),
                  color="#8c8c8c", fontsize=9.5)
         # colour bar for the surfaces
         cax = fig.add_axes([0.62, 0.11, 0.012, 0.3])

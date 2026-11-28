@@ -52,15 +52,16 @@ def main():
         d.append(float(dome_distance(np.array(x), np.array(cy), np.array(cz))))
     print(f"plates: {names}; overlapping: {int((cover > 1).sum())} cells; centroids on the dome: max |d| {max(map(abs, d)):.3f} m")
     ok &= len(fps) == 7 and int((cover > 1).sum()) == 0 and max(map(abs, d)) < 0.03
+    from rocketcfd.vehicles.starship import engine_frames
     best = 9.0
-    for kind, y, z, xe, re_, bl in ship_engines(S):
-        if kind != "vacuum":
-            continue
+    for e in engine_frames(S):
         a = np.linspace(0, 2 * np.pi, 400)
-        for xx in np.linspace(71.5, 72.3, 9):
-            best = min(best, float(hot_stage_truss_sdf(np.full(400, xx), y + re_ * np.cos(a), z + re_ * np.sin(a), S).min()))
-    print(f"RVac bell rims to the truss: {best:.3f} m clear")
-    ok &= best > 0.03
+        y, z = e["exit"][1] + e["exit_r"] * np.cos(a), e["exit"][2] + e["exit_r"] * np.sin(a)
+        best = min(best, float(hot_stage_truss_sdf(np.full(400, e["exit"][0]), y, z, S).min()))
+    lowest = min(e["exit"][0] for e in engine_frames(S))
+    print(f"engine exits: lowest at x {lowest:.2f}, the skirt's edge at {S.x_aft:.2f} (inside: {lowest > S.x_aft}); "
+          f"bell rims to the truss {best:.3f} m clear")
+    ok &= best > 0.03 and lowest > S.x_aft
     print("PASS" if ok else "FAIL")
     return ok
 
