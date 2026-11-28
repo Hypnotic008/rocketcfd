@@ -105,22 +105,25 @@ def _static_meshes(S, PB):
     """Booster tank below the dome and the ship's tank above its skirt, plain steel."""
     tank = pv.Cylinder(center=(PB.tank_top_x - 6.0, 0, 0), direction=(1, 0, 0), radius=S.radius, height=12.0,
                        resolution=160, capping=False)
-    ship = pv.Cylinder(center=(S.x_aft + S.skirt_height + 6.0, 0, 0), direction=(1, 0, 0), radius=S.radius,
+    ship = pv.Cylinder(center=(S.x_ship_aft + S.skirt_height + 6.0, 0, 0), direction=(1, 0, 0), radius=S.radius,
                        height=12.0, resolution=160, capping=False)
-    aft_bulkhead = pv.Disc(center=(S.x_aft + S.skirt_height, 0, 0), normal=(1, 0, 0), inner=0.0, outer=S.radius, c_res=160)
+    aft_bulkhead = pv.Disc(center=(S.x_ship_aft + S.skirt_height, 0, 0), normal=(1, 0, 0), inner=0.0, outer=S.radius, c_res=160)
     return [tank, ship, aft_bulkhead]
 
 
 def _plate_rims(S, PB):
-    from .vehicles.starship import dome_plate_list, dome_distance
+    """The protection plates' edges as thin white tubes on the dome (they read as separate plates)."""
+    from .vehicles.starship import dome_plate_outlines
     rims = []
-    stand = S.dome_plates[4]
-    for cy, cz, rp in dome_plate_list(S):
-        a = np.linspace(0, 2 * np.pi, 121)
-        y, z = cy + rp * np.cos(a), cz + rp * np.sin(a)
-        rho = np.hypot(y, z) / S.radius
-        x = PB.tank_top_x + PB.dome_rise * np.sqrt(np.clip(1 - rho ** 2, 0, 1)) + stand
-        rims.append(pv.Spline(np.column_stack([x, y, z]), 240).tube(radius=0.035))
+    for cs in dome_plate_outlines(S, h=0.02).values():
+        for c in cs:
+            c = c[:: max(1, len(c) // 300)]
+            y, z = c[:, 0], c[:, 1]
+            rho = np.hypot(y, z) / S.radius
+            x = PB.tank_top_x + PB.dome_rise * np.sqrt(np.clip(1 - rho ** 2, 0, 1)) + S.plate_standoff + 0.01
+            pts = np.column_stack([x, y, z])
+            line = pv.lines_from_points(np.vstack([pts, pts[:1]]))
+            rims.append(line.tube(radius=0.03))
     return rims
 
 
@@ -145,7 +148,9 @@ def render_hotstage(folder, out, quantity="temperature", camera="cutaway", width
         with open(os.path.join(folder, "loads.json")) as fh:
             meta = json.load(fh)
     ring = meta.get("grid", {}).get("ring", "v3")
-    S = StarshipParams(ring_style="v3_truss" if ring == "v3" else "vented")
+    geo = meta.get("geometry", {})
+    S = StarshipParams(ring_style="v3_truss" if ring == "v3" else "vented", sl_cant=float(geo.get("sl_cant", 0.0)),
+                       vac_cant=float(geo.get("vac_cant", 0.0)), sep_gap=float(geo.get("gap", 0.0)))
     PB = v3_params(fin_model="none")
     field = _Field(mesh, th)
 
@@ -180,9 +185,9 @@ def render_hotstage(folder, out, quantity="temperature", camera="cutaway", width
         qlab = "Pressure at the wall"
 
     # framing
-    xc = 0.5 * (PB.tank_top_x + S.x_aft + 1.0)
+    xc = 0.5 * (PB.tank_top_x + S.x_ship_aft + 1.0)
     focus = np.array([xc, 0.0, 0.0])
-    box = (PB.tank_top_x - 1.5, S.x_aft + S.skirt_height + 1.0, -6.5, 6.5, -6.5, 6.5)
+    box = (PB.tank_top_x - 1.5, S.x_ship_aft + S.skirt_height + 1.0, -6.5, 6.5, -6.5, 6.5)
     W3 = int(width * 2 / 3)
     WP = width - W3
 
@@ -231,7 +236,7 @@ def render_hotstage(folder, out, quantity="temperature", camera="cutaway", width
         import imageio.v2 as imageio
         writer = imageio.get_writer(out, fps=fps, codec="libx264", quality=None, bitrate=None,
                                     ffmpeg_params=["-crf", "20", "-preset", "medium", "-pix_fmt", "yuv420p"])
-    xs_r, zs_r = (PB.tank_top_x - 2.0, S.x_aft + S.skirt_height + 2.5), (-7.0, 7.0)
+    xs_r, zs_r = (PB.tank_top_x - 2.0, S.x_ship_aft + S.skirt_height + 2.5), (-7.0, 7.0)
     peak = None
     for fi, (i, fr) in enumerate(frames):
         A = snap(i)
@@ -318,7 +323,9 @@ def render_hotstage(folder, out, quantity="temperature", camera="cutaway", width
         Tt = part_stat("truss", Tv, lambda v: np.percentile(v, 99.5))
         fig = plt.figure(figsize=(width / dpi, height / dpi), dpi=dpi)
         fig.figimage(frame, 0, 0, origin="upper")
-        txt = title or "Hot staging — Starship's 6 Raptor 3s lighting on the V3 hot stage"
+        txt = title or ("Hot staging — Starship's 6 Raptor 3s lighting on the V3 hot stage"
+                        + (f", sea-level engines canted {S.sl_cant:g}° out" if S.sl_cant else "")
+                        + (f", {S.sep_gap:g} m apart" if S.sep_gap else ""))
         fig.text(0.012, 0.955, txt, color="#efefef", fontsize=15, fontweight="bold")
         fig.text(0.012, 0.92, f"t = {t * 1e3:6.1f} ms after ignition command   ship engines {100 * thr:3.0f} %   "
                                f"Mach {meta.get('condition', {}).get('mach', 4.5):.1f}, "

@@ -596,9 +596,25 @@ truss tubes. The flow comes from the ship's nose, with time-accurate explicit st
 
 - V3 hot stage (`rocketcfd.vehicles.starship.hot_stage_truss_sdf`): a lower and an upper ring
   joined by a zig-zag of 40 round tubes (24 cm diameter, 20 V's), open between the tubes.
-- Forward-dome protection plates (`dome_plates_sdf`): the "flower", a 2.2 m centre plate and a
-  ring of seven 1.9 m plates, standing 5 cm proud of the dome.
+- Forward-dome protection plates (`dome_plate_footprints`, `dome_plates_sdf`), 5 cm proud of the
+  dome: six plates in a flower round a concentric-ring apex disc (1.8 m).
+  - Three inner plates, trapezoids widening outward, under the ship's sea-level engines.
+  - Three outer plates, bent V's under the RVacs, pointing inward between the trapezoids with
+    their arms wrapped round the trapezoids' outer ends.
+  - Sizes are `StarshipParams.plate_*` (estimates from photos); `apex_disc=False` drops the disc.
+  - Plan view: [docs/media/hotstage_plates_plan.png](docs/media/hotstage_plates_plan.png).
 - `--ring vented` gives the earlier ring with straight struts.
+
+**Engine cant and separation.** Two options cover the dome-protection gimbal you can see on
+the flights, with the sea-level engines swung outward at ignition and back as the ship pulls away:
+
+- `--sl-cant DEG` (and `--vac-cant`) swings each bell and its plume outward about its gimbal
+  point at the top of the bell.
+- `--gap M` lifts the ship that far off the hot stage; the truss stays with the booster.
+
+The solver cannot move bodies during a run, so the separation is a sweep of frozen moments.
+Each is a short run at one gap with that gap's cant; compare the dome and plate loads across
+them (see the commands).
 
 **Engines** (`rocketcfd.engines`, `python -m rocketcfd.engines` prints the table):
 
@@ -623,6 +639,10 @@ truss tubes. The flow comes from the ship's nose, with time-accurate explicit st
   nozzle. Each engine is an inflow at its exit disk: the cells just inside the exit hold the
   exhaust's density, velocity and pressure. Mass flow, momentum flux (thrust) and exit pressure
   are Raptor's.
+- **Rim cells.** No exhaust cell may sit beside the outside flow at the bell rim; otherwise
+  exhaust leaks sideways into near vacuum and makes spurious ~20 000 K gas. The density is
+  scaled so the resolved, staircased exit disk still carries the rated mass flow and thrust:
+  ×1.1–1.3 at 4 cm cells. The run log prints the factor per engine.
 - **Why the nozzle isn't meshed.** The flow inside a nozzle is the 1-D solution to within a few
   per cent. A 24 cm throat would need ~1 cm cells, and the injector (hundreds of coaxial
   elements, millimetre scale) is far below any grid.
@@ -634,8 +654,13 @@ temperature from the enthalpy instead:
 
 - the exhaust fraction comes from the total enthalpy, which is conserved through mixing and
   shocks;
-- the temperature then uses the mixture's heat capacity;
+- the temperature then uses the exhaust's heat capacity for the exhaust part, and the enthalpy
+  of equilibrium air (O2 and N2 dissociation) for the air part;
 - this is exact at the nozzle exit and at stagnation.
+
+The air part matters in the ship's engine bay and the gap. There, the thin 65 km air is
+shock-compressed about 10^4 times as the plumes fill the space. As an ideal gas it would read
+7000+ K; real air spends that energy dissociating (~3500 K).
 
 Temperatures count only where the gas density exceeds `--rho-min` (5e-3 kg/m³, ~30× ambient).
 At 65 km the almost empty cells round the plume have no meaningful p/ρ. The thin air the starting
@@ -675,6 +700,11 @@ python -m rocketcfd.hotstage report results/hot_staging
 python -m rocketcfd.cinematic results/hot_staging --mode hotstage --tween 3                          # temperature, cutaway
 python -m rocketcfd.cinematic results/hot_staging --mode hotstage --tween 3 --quantity pressure
 python -m rocketcfd.cinematic results/hot_staging --mode hotstage --tween 3 --camera outside
+# the sea-level engines canted out 10 deg (compare the dome / plate loads with the run above)
+python cases/hot_staging.py --h 0.4 --ring-h 0.08 --wall-h 0.04 --wall-shell 0.2 --time 0.05 --sl-cant 10 --snapshots 150 --snap-volume 2 --probes --out results/hot_staging_cant10
+# separation as frozen moments (no ramp: engines at full thrust; each ~1 h)
+python cases/hot_staging.py --h 0.4 --ring-h 0.08 --wall-h 0.04 --wall-shell 0.2 --time 0.02 --ignition 0.001 --gap 2 --sl-cant 10 --snapshots 40 --snap-volume 2 --out results/hot_staging_gap2
+python cases/hot_staging.py --h 0.4 --ring-h 0.08 --wall-h 0.04 --wall-shell 0.2 --time 0.02 --ignition 0.001 --gap 6 --sl-cant 0 --snapshots 40 --snap-volume 2 --out results/hot_staging_gap6
 ```
 
 The film (`--mode hotstage`):

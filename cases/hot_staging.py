@@ -32,6 +32,11 @@ def main(argv=None):
     ap.add_argument("--aoa", type=float, default=0.0, help="angle of attack [deg]")
     ap.add_argument("--h", type=float, default=0.5, help="cell size near the stack [m]")
     ap.add_argument("--ring", default="v3", choices=["v3", "vented"], help="hot-stage geometry")
+    ap.add_argument("--sl-cant", type=float, default=0.0,
+                    help="ship sea-level engines canted outward by this angle [deg] (bell and plume, about the gimbal point)")
+    ap.add_argument("--vac-cant", type=float, default=0.0, help="the same for the vacuum engines [deg]")
+    ap.add_argument("--gap", type=float, default=0.0,
+                    help="separation: the ship this far above the hot stage [m] (a frozen moment of the separation)")
     ap.add_argument("--ring-h", type=float, default=0.0,
                     help="refine a cylinder round the hot stage (r < --ring-r, the ship's engines to below the dome) [m]")
     ap.add_argument("--ring-r", type=float, default=6.0)
@@ -60,7 +65,7 @@ def main(argv=None):
     from rocketcfd import Solver, atmosphere
     from rocketcfd.grid import Zone, stretched_faces, describe
     from rocketcfd.vehicles.super_heavy import super_heavy_sdf, v3_params, engine_positions
-    from rocketcfd.vehicles.starship import StarshipParams, starship_sdf, interstage_sdf, engines as ship_engines
+    from rocketcfd.vehicles.starship import StarshipParams, starship_sdf, interstage_sdf, engine_frames
     from rocketcfd.output import write_vtk
 
     os.makedirs(a.out, exist_ok=True)
@@ -71,7 +76,8 @@ def main(argv=None):
     q = 0.5 * rho * V * V
     print(f"alt {a.alt/1e3:.1f} km  p {p:.2f} Pa  rho {rho:.2e}  V {V:.0f} m/s  M {a.mach}  q {q/1e3:.2f} kPa")
     PB = v3_params(fin_model="none")
-    S = StarshipParams(ring_style="v3_truss" if a.ring == "v3" else "vented")
+    S = StarshipParams(ring_style="v3_truss" if a.ring == "v3" else "vented", sl_cant=a.sl_cant, vac_cant=a.vac_cant,
+                       sep_gap=a.gap)
     ring_sdf = lambda X, Y, Z: interstage_sdf(X, Y, Z, S, PB.tank_top_x, PB.dome_rise)
     sdf = lambda X, Y, Z: np.minimum(np.minimum(super_heavy_sdf(X, Y, Z, PB), ring_sdf(X, Y, Z)),
                                      starship_sdf(X, Y, Z, S))
@@ -91,12 +97,13 @@ def main(argv=None):
             jets.append(j)
     n_ship = 0
     if a.ship_engines != "none":
-        for kind, y, z, xe, re_, bl in ship_engines(S):
+        for fr in engine_frames(S):
+            kind = fr["kind"]
             if a.ship_engines == "sea-level" and kind != "sea level":
                 continue
             spec = EN.RAPTOR3_SL if kind == "sea level" else EN.RAPTOR3_VAC
-            spec = dataclasses.replace(spec, exit_diameter=2 * re_)
-            jets.append(EN.jet(spec, (xe, y, z), (-1.0, 0.0, 0.0), p_amb=p))
+            spec = dataclasses.replace(spec, exit_diameter=2 * fr["exit_r"])
+            jets.append(EN.jet(spec, fr["exit"], fr["dir"], p_amb=p))
             n_ship += 1
     print(f"{len(jets)} jets ({n_ship} ship engines, ramp {a.ignition} s):")
     seen = set()
@@ -119,7 +126,7 @@ def main(argv=None):
     faces = stretched_faces(lo, hi, 4 * a.h, zones, growth=a.growth)
     print(describe(faces))
     patches, ring_patches = [], []
-    x_lo, x_hi = PB.tank_top_x - 2.5, S.x_aft + S.skirt_height + 1.5      # below the dome .. above the bells
+    x_lo, x_hi = PB.tank_top_x - 2.5, S.x_ship_aft + S.skirt_height + 1.5      # below the dome .. above the bells
     if a.ring_h:
         from rocketcfd.patches import wall_patches
         Rr = a.ring_r
@@ -130,11 +137,11 @@ def main(argv=None):
         patches += ring_patches
     if a.wall_h:
         from rocketcfd.patches import wall_patches
-        ship_aft = lambda X, Y, Z: np.maximum(starship_sdf(X, Y, Z, S), X - (S.x_aft + S.skirt_height + 0.3))
+        ship_aft = lambda X, Y, Z: np.maximum(starship_sdf(X, Y, Z, S), X - (S.x_ship_aft + S.skirt_height + 0.3))
         dome = lambda X, Y, Z: np.maximum(super_heavy_sdf(X, Y, Z, PB), PB.tank_top_x - 0.3 - X)
         walls = lambda X, Y, Z: np.minimum(np.minimum(ring_sdf(X, Y, Z), ship_aft(X, Y, Z)), dome(X, Y, Z))
         reg = ((PB.tank_top_x - 0.3, -S.radius - 0.6, -S.radius - 0.6),
-               (S.x_aft + S.skirt_height + 0.3, S.radius + 0.6, S.radius + 0.6))
+               (S.x_ship_aft + S.skirt_height + 0.3, S.radius + 0.6, S.radius + 0.6))
         patches += wall_patches(faces, a.wall_h, a.wall_shell, sdf=walls, region=reg, box=(48, 48, 48))
     if a.dry_run:
         n = np.prod([len(f) - 1 for f in faces]) + sum(int(np.prod([len(f) - 1 for f in pf])) for pf in patches)
@@ -165,8 +172,8 @@ def main(argv=None):
     ship_jet[len(jets) - n_ship:] = True
 
     # time step and run length
-    # (the summed wave speeds in the hot plume, ~20 km/s with the Raptor 3 exit states, as seen in runs)
-    dt_est = min(float(g_.cfl / (20000.0 / g_.h.min())) for g_ in grids)
+    # (the summed wave speeds in the hot plume, ~13 km/s with the Raptor 3 exit states, as seen in runs)
+    dt_est = min(float(g_.cfl / (13000.0 / g_.h.min())) for g_ in grids)
     nsteps = int(a.time / dt_est) + 1
     chunk = max(10, nsteps // 200)
     print(f"~{nsteps} steps of ~{dt_est:.2e} s")
@@ -193,15 +200,15 @@ def main(argv=None):
     prb = None
     if a.probes:
         from rocketcfd.probes import ProbeRecorder
-        from rocketcfd.vehicles.starship import dome_plate_list
-        cy, cz, _ = dome_plate_list(S)[1]
+        from rocketcfd.vehicles.starship import dome_plate_centroids
+        cy, cz = dome_plate_centroids(S)["outer plate 1"] if S.ring_style != "vented" else (2.5, 0.0)
         apex = PB.tank_top_x + PB.dome_rise
         pts = {"between the truss tubes, outside": (70.3, S.radius + 1.0, 0.0),
-               "between the stages, axis": (0.5 * (apex + S.x_aft + S.sea_level[4]), 0.0, 0.0),
+               "between the stages, axis": (0.5 * (apex + S.x_ship_aft + S.sea_level[4]), 0.0, 0.0),
                "above the centre plate": (apex + 0.25, 0.0, 0.0),
-               "above a ring plate": (float(PB.tank_top_x + PB.dome_rise * np.sqrt(max(0.0, 1 - (np.hypot(cy, cz) / S.radius) ** 2))) + 0.25, cy, cz),
-               "ship aft, outside": (S.x_aft + 4.0, S.radius + 2.0, 0.0),
-               "behind the ship's flap": (S.x_aft + 13.0, S.radius + 2.0, 0.0)}
+               "above an outer plate": (float(PB.tank_top_x + PB.dome_rise * np.sqrt(max(0.0, 1 - (np.hypot(cy, cz) / S.radius) ** 2))) + 0.25, cy, cz),
+               "ship aft, outside": (S.x_ship_aft + 4.0, S.radius + 2.0, 0.0),
+               "behind the ship's flap": (S.x_ship_aft + 13.0, S.radius + 2.0, 0.0)}
         prb = ProbeRecorder(runner, list(pts.values()), a.out, names=list(pts))
         hooks.append((1, prb.record))
     snap = None
@@ -227,7 +234,8 @@ def main(argv=None):
 
     hist = []
     t0 = time.time()
-    parts = {"ship": (0, S.x_aft - 0.05, 1e9), "booster": (0, -10.0, S.x_aft - 0.05)}
+    x_split = S.x_aft - 0.05 if a.gap < 0.4 else S.x_aft + 0.02         # (the RVacs hang 0.3 m below the ship)
+    parts = {"ship": (0, x_split, 1e9), "booster": (0, -10.0, x_split)}
     REF = dict(S_ref=63.6, L_ref=72.3, x_ref=(0.4 * 72.3, 0.0, 0.0))
     done = 0
     while s.t < a.time - 1e-12:
@@ -251,6 +259,7 @@ def main(argv=None):
     if a.snapshots:
         rec.close()
     wall.save(a.out, meta=dict(alt=a.alt, mach=a.mach, ring=a.ring, ring_h=a.ring_h, wall_h=a.wall_h, ignition=a.ignition,
+                               sl_cant=a.sl_cant, vac_cant=a.vac_cant, gap=a.gap,
                                booster_engines=a.booster_engines, ship_engines=a.ship_engines, **thermo))
     f = runner.fields(0) if patches else s.fields()
     write_vtk(f, f"{a.out}/flow.vtk")
@@ -263,6 +272,7 @@ def main(argv=None):
                                        grids=runner.grids if patches else None)
     write_vtk_surface(f"{a.out}/surface_cp.vtk", xyz, tris, cp_s)
     res = dict(condition=dict(alt=a.alt, mach=a.mach, aoa=a.aoa, V=V, q=q, p=p, rho=rho, T=T),
+               geometry=dict(ring=a.ring, sl_cant=a.sl_cant, vac_cant=a.vac_cant, gap=a.gap),
                grid=dict(h=a.h, ring=a.ring, ring_h=a.ring_h, wall_h=a.wall_h, cells=int(sum(np.prod(g_.n) for g_ in grids)), steps=s.step_count,
                          wall_s=time.time() - t0, solver="explicit time-accurate"),
                jets=dict(n=len(jets), ship=n_ship, ignition=a.ignition, engines=engine_info),

@@ -15,9 +15,10 @@ plates, the V3 truss and the ship's aft end, during the ship's engine start.
     enthalpy instead: the exhaust fraction f = (h0 - h0_inf) / (h0_jet - h0_inf) from the total
     enthalpy (conserved through mixing and shocks in adiabatic flow), the real static enthalpy
     h = h_model + f dh (dh: the exhaust's internal energy the gamma-1.4 model leaves out at the
-    exit), T = h / (f cp_exh + (1 - f) cp_air). Exact at the nozzle exit (T_e) and where the
-    plume stops (T_c); approximate between: constant cp, no dissociation of shocked air, no wall
-    heat transfer. Gas temperature next to the wall, not the wall's own temperature.
+    exit), split as f cp_exh T + (1 - f) h_air(T) with h_air the enthalpy of equilibrium air
+    (dissociation above ~2500 K). Exact at the nozzle exit (T_e) and where the plume stops (T_c);
+    approximate between. No wall heat transfer: gas temperature next to the wall, not the wall's
+    own temperature.
   * Near vacuum (65 km: 10 Pa, 1.6e-4 kg/m^3) p / rho is noise in the almost empty cells around
     the plume, and the thin air the starting plume shocks really is heated to ~8000 K but carries
     no heat. Temperatures count only where the gas density exceeds rho_min (default 5e-3 kg/m^3,
@@ -49,11 +50,32 @@ def thermo_constants(T_inf, V_inf, engine, gamma_solver=1.4, rho_min=5e-3):
                 dh_exh=float(cp_exh * Te - h_model), rho_min=float(rho_min), T_c=float(engine["T_c"]), T_inf=float(T_inf))
 
 
+def air_enthalpy(T):
+    """Specific enthalpy of air in chemical equilibrium near 1 atm [J/kg] (numpy or torch),
+    approximately: cp_air T, vibration (+250 J/kg/K above 1000 K), O2 dissociation (3.6 MJ/kg
+    of air over 2500-4500 K) and N2 dissociation (25.9 MJ/kg over 4500-9000 K). Within ~10 % of
+    the equilibrium-air tables up to 7000 K (3000 K: 4.4 MJ/kg, 4000 K: 7.5, 5000 K: 12.5)."""
+    return (CP_AIR * T + 250.0 * (T - 1000.0).clip(0.0, 1e9) + 3.6e6 / 2000.0 * (T - 2500.0).clip(0.0, 2000.0)
+            + 25.9e6 / 4500.0 * (T - 4500.0).clip(0.0, 4500.0))
+
+
 def exhaust_temperature(T_model, V2, h0_inf, h0_jet, cp_exh, dh_exh, **_):
-    """Gas temperature of the air / exhaust mixture (numpy or torch). T_model = p / (rho R_air)."""
+    """Gas temperature of the air / exhaust mixture (numpy or torch). T_model = p / (rho R_air).
+
+    The real static enthalpy h = h_model + f dh_exh is split as f cp_exh T + (1 - f) h_air(T),
+    h_air the equilibrium-air enthalpy: the thin air a starting plume shocks into the engine bay
+    would read 7000+ K as an ideal gas; real air spends that energy dissociating."""
     h = CP_AIR * T_model
     f = ((h + 0.5 * V2 - h0_inf) / (h0_jet - h0_inf)).clip(0.0, 1.0)
-    return (h + f * dh_exh) / (f * cp_exh + (1.0 - f) * CP_AIR)
+    H = h + f * dh_exh
+    lo = 0.0 * H
+    hi = 0.0 * H + 40000.0
+    for _ in range(36):                                    # bisection: h_mix(T) is increasing
+        mid = 0.5 * (lo + hi)
+        below = (f * cp_exh * mid + (1.0 - f) * air_enthalpy(mid)) < H
+        lo = lo + below * (mid - lo)
+        hi = mid + below * (hi - mid)
+    return 0.5 * (lo + hi)
 
 
 # ---------------------------------------------------------------- geometry
@@ -97,19 +119,22 @@ def part_meshes(S, PB, h=0.04, verbose=True):
     v, f = _march(dome, (x0 - 0.1, -R - 0.1, -R - 0.1), (x0 + rise + 0.1, R + 0.1, R + 0.1), h)
     out["dome"] = dict(v=v, f=f, sdf=lambda X, Y, Z: st.dome_distance(X, Y, Z, x0, rise, R))
     if S.ring_style != "vented":
-        for k, (cy, cz, rp) in enumerate(st.dome_plate_list(S)):
+        outl = st.dome_plate_outlines(S, h=0.02)
+        for k, (name, _) in enumerate(st.dome_plate_footprints(S)):
             sd = (lambda kk: lambda X, Y, Z: st.dome_plates_sdf(X, Y, Z, S, x0, rise, which=kk))(k)
-            lo = (x0 + 0.5, cy - rp - 0.06, cz - rp - 0.06)
-            hi = (x0 + rise + 0.2, cy + rp + 0.06, cz + rp + 0.06)
+            pts = np.concatenate(outl[name])
+            lo = (x0 + 0.3, pts[:, 0].min() - 0.08, pts[:, 1].min() - 0.08)
+            hi = (x0 + rise + 0.2, pts[:, 0].max() + 0.08, pts[:, 1].max() + 0.08)
             v, f = _march(sd, lo, hi, 0.5 * h)
-            out[f"plate {k}"] = dict(v=v, f=f, sdf=sd)
+            out[name] = dict(v=v, f=f, sdf=sd)
         tr = lambda X, Y, Z: st.hot_stage_truss_sdf(X, Y, Z, S)
     else:
         tr = lambda X, Y, Z: st.hot_stage_ring_sdf(X, Y, Z, S)
     v, f = _march(tr, (S.ring_x0 - 0.1, -R - 0.1, -R - 0.1), (S.x_aft + 0.1, R + 0.1, R + 0.1), h)
     out["truss"] = dict(v=v, f=f, sdf=tr)
-    ship = lambda X, Y, Z: np.maximum(st.starship_sdf(X, Y, Z, S), X - (S.x_aft + S.skirt_height + 0.6))
-    v, f = _march(ship, (S.x_aft - 0.6, -R - 0.1, -R - 0.1), (S.x_aft + S.skirt_height + 0.7, R + 0.1, R + 0.1), h)
+    xa = S.x_ship_aft
+    ship = lambda X, Y, Z: np.maximum(st.starship_sdf(X, Y, Z, S), X - (xa + S.skirt_height + 0.6))
+    v, f = _march(ship, (xa - 0.6, -R - 0.5, -R - 0.5), (xa + S.skirt_height + 0.7, R + 0.5, R + 0.5), h)
     out["ship aft"] = dict(v=v, f=f, sdf=lambda X, Y, Z: st.starship_sdf(X, Y, Z, S))
     if verbose:
         print("hot-stage surfaces: " + ", ".join(f"{k} {len(p['v'])}" for k, p in out.items()) + " vertices")
@@ -118,12 +143,12 @@ def part_meshes(S, PB, h=0.04, verbose=True):
 
 def dome_mask(v, S):
     """Dome vertices not under a protection plate (the bare dome between the plates)."""
-    from .vehicles.starship import dome_plate_list
+    from .vehicles.starship import dome_plate_footprints
     if S.ring_style == "vented":
         return np.ones(len(v), bool)
     ok = np.ones(len(v), bool)
-    for cy, cz, rp in dome_plate_list(S):
-        ok &= np.hypot(v[:, 1] - cy, v[:, 2] - cz) > rp
+    for _, f in dome_plate_footprints(S):
+        ok &= f(v[:, 1], v[:, 2]) > 0
     return ok
 
 
@@ -240,7 +265,7 @@ class WallSampler:
             if name == "plates":
                 sel = np.zeros(self.n, bool)
                 for j, nm in enumerate(self.names):
-                    if nm.startswith("plate"):
+                    if "plate" in nm:
                         sel[self.split[j]:self.split[j + 1]] = True
             else:
                 sel = np.zeros(self.n, bool)
@@ -382,7 +407,7 @@ def report(folder, out=None):
 
     # per plate: peak over the run, and the full-thrust mean
     names = m["names"]
-    plates = [(i, n) for i, n in enumerate(names) if n.startswith("plate")]
+    plates = [(i, n) for i, n in enumerate(names) if "plate" in n or n == "apex disc"]
     rows = []
     for i, n in plates + [(names.index("dome"), "dome")]:
         sl = slice(int(m["split"][i]), int(m["split"][i + 1]))
@@ -390,7 +415,7 @@ def report(folder, out=None):
         ok = w & np.isfinite(peak_p[sl])
         if not ok.any():
             continue
-        lab = ("centre plate" if n == "plate 0" else n) if n != "dome" else "bare dome"
+        lab = n if n != "dome" else "bare dome"
         mp_ = _p995(mean_p[sl][ok]) if mean_p is not None else np.nan
         mT_ = _p995(mean_T[sl][ok]) if mean_T is not None else np.nan
         rows.append((lab, _p995(peak_p[sl][ok]), _p995(peak_T[sl][ok]), mp_, mT_))
@@ -424,7 +449,7 @@ def report(folder, out=None):
         plt.close(fig)
 
     # top-down peak maps of the dome and plates (looking down the axis from the ship)
-    sel = [i for i, n in enumerate(names) if n == "dome" or n.startswith("plate")]
+    sel = [i for i, n in enumerate(names) if n == "dome" or "plate" in n or n == "apex disc"]
     fig, axs = plt.subplots(1, 2, figsize=(11, 5.2))
     for ax, arr, sc, cmap, unit, title in ((axs[0], peak_p, 1e-3, "viridis", "kPa", "Peak pressure"),
                                           (axs[1], peak_T, 1.0, "inferno", "K", "Peak gas temperature")):
@@ -444,10 +469,11 @@ def report(folder, out=None):
                 continue
             val = np.nan_to_num(arr[sl] * sc, nan=lo_)
             tri = ax.tripcolor(v[:, 1], v[:, 2], f[keep], val, cmap=cmap, vmin=lo_, vmax=hi_, shading="gouraud",
-                               zorder=2 if names[i].startswith("plate") else 1)
-        from .vehicles.starship import dome_plate_list, StarshipParams
-        for cy, cz, rp in dome_plate_list(StarshipParams()):
-            ax.add_patch(plt.Circle((cy, cz), rp, fill=False, color="white", lw=0.9, zorder=3))
+                               zorder=1 if names[i] == "dome" else 2)
+        from .vehicles.starship import dome_plate_outlines, StarshipParams
+        for cs in dome_plate_outlines(StarshipParams(), h=0.02).values():
+            for c in cs:
+                ax.plot(c[:, 0], c[:, 1], color="white", lw=0.9, zorder=3)
         ax.set_aspect("equal")
         ax.set_title(f"{title} [{unit}] — dome and plates, from above")
         ax.set_xlabel("y [m]")

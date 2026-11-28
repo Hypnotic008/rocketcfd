@@ -42,28 +42,64 @@ class StarshipParams:
     truss_tube_radius: float = 0.12
     truss_band: float = 0.35           # height of the lower and upper rings
     truss_band_thickness: float = 0.15
-    # forward-dome protection plates (photos: a centre disc and a ring of round plates, a
-    # "flower"): (radius of the centre plate, number in the ring, ring radius, plate radius,
-    # standoff above the dome) [m]
-    dome_plates: tuple = (1.1, 7, 2.45, 0.95, 0.05)
+    # forward-dome protection plates (photos): six plates in a flower round a concentric-ring
+    # disc at the apex. Three inner plates, trapezoids widening outward, under the ship's three
+    # sea-level engines; three outer plates, bent V's (chevrons) between them, under the RVacs,
+    # pointing inward with their arms wrapped round the trapezoids' outer ends. Plan-view sizes
+    # [m] (estimates from photos): apex disc radius; trapezoid inner / outer radius and half
+    # angle [deg]; chevron apex radius, slope of its edges [m per rad], width, outer cap radius
+    # and half angle [deg]; gap between plates; standoff above the dome
+    plate_apex_r: float = 0.9
+    plate_trap: tuple = (1.05, 2.5, 24.0)
+    plate_chevron: tuple = (1.05, 1.5, 1.45, 3.95, 58.0)
+    plate_gap: float = 0.1
+    plate_standoff: float = 0.05
+    apex_disc: bool = True
+    # engine cant [deg, outward = the exhaust pointing away from the axis], about each engine's
+    # gimbal point at the top of its bell; and the separation: the ship moved this far up off
+    # the hot stage [m] (the truss stays with the booster)
+    sl_cant: float = 0.0
+    vac_cant: float = 0.0
+    sep_gap: float = 0.0
 
     @property
     def length(self):
         return self.barrel_length + self.nose_length
 
     @property
+    def x_ship_aft(self):
+        """The ship's aft end (x_aft is the top of the booster's hot stage; they part by sep_gap)."""
+        return self.x_aft + self.sep_gap
+
+    @property
     def x_nose(self):
-        return self.x_aft + self.length
+        return self.x_ship_aft + self.length
+
+
+def engine_frames(P: StarshipParams):
+    """The six ship engines: [dict(kind, exit=(x, y, z) exit centre, dir = exhaust direction,
+    exit_r, top_r, length (bell, exit to gimbal point), pivot)]. Cant (P.sl_cant, P.vac_cant)
+    swings each bell about its gimbal point at the top, outward for positive angles."""
+    xs = P.x_ship_aft
+    out = []
+    for kind, (n, pr, re_, bl, dx, az0), cant in (("sea level", P.sea_level, P.sl_cant), ("vacuum", P.vacuum, P.vac_cant)):
+        for k in range(n):
+            a = np.radians(az0 + 360.0 * k / n)
+            xe = xs + dx
+            top_x = min(xe + bl, xs + P.skirt_height + 0.05)
+            L = top_x - xe
+            pivot = np.array([top_x, pr * np.cos(a), pr * np.sin(a)])
+            c = np.radians(cant)
+            d = np.array([-np.cos(c), np.sin(c) * np.cos(a), np.sin(c) * np.sin(a)])
+            out.append(dict(kind=kind, exit=tuple(pivot + L * d), dir=tuple(d), exit_r=re_,
+                            top_r=0.32 if kind == "sea level" else 0.45, length=L, pivot=tuple(pivot)))
+    return out
 
 
 def engines(P: StarshipParams):
-    """[(kind, y, z, exit_x, exit_radius)] of the six ship engines."""
-    out = []
-    for kind, (n, pr, re_, bl, dx, az0) in (("sea level", P.sea_level), ("vacuum", P.vacuum)):
-        for k in range(n):
-            a = np.radians(az0 + 360.0 * k / n)
-            out.append((kind, pr * np.cos(a), pr * np.sin(a), P.x_aft + dx, re_, bl))
-    return out
+    """[(kind, y, z, exit_x, exit_radius, bell_length)] of the six ship engines (exit centres)."""
+    return [(e["kind"], e["exit"][1], e["exit"][2], e["exit"][0], e["exit_r"], P.sea_level[3] if e["kind"] == "sea level"
+             else P.vacuum[3]) for e in engine_frames(P)]
 
 
 def ogive_radius(xx, R, L):
@@ -75,7 +111,7 @@ def ogive_radius(xx, R, L):
 def starship_sdf(X, Y, Z, P: StarshipParams = StarshipParams()):
     R = P.radius
     rr = np.sqrt(Y * Y + Z * Z)
-    xs = P.x_aft
+    xs = P.x_ship_aft
     parts = []
     # tank body from the aft bulkhead (top of the skirt) to the nose base
     parts.append(g.cylinder_x(X, Y, Z, R, xs + P.skirt_height, xs + P.barrel_length))
@@ -91,9 +127,13 @@ def starship_sdf(X, Y, Z, P: StarshipParams = StarshipParams()):
     shell = np.abs(rr - (R - t / 2)) - t / 2
     parts.append(np.maximum(shell, np.abs(X - (xs + P.skirt_height / 2)) - P.skirt_height / 2))
     # engines: bells hanging from the aft bulkhead
-    for kind, y, z, xe, re_, bl in engines(P):
-        top_r = 0.32 if kind == "sea level" else 0.45
-        parts.append(g.frustum_x(X, Y, Z, re_, top_r, xe, min(xe + bl, xs + P.skirt_height + 0.05), y, z))
+    for e in engine_frames(P):
+        ax_ = -np.asarray(e["dir"])                    # exit -> gimbal point
+        if ax_[0] > 0.999999:
+            parts.append(g.frustum_x(X, Y, Z, e["exit_r"], e["top_r"], e["exit"][0], e["exit"][0] + e["length"],
+                                     e["exit"][1], e["exit"][2]))
+        else:
+            parts.append(g.frustum_axis(X, Y, Z, e["exit"], ax_, e["exit_r"], e["top_r"], e["length"]))
     # flaps (radial plates)
     for (x0, x1, reach, th), r_at in ((P.aft_flaps, None), (P.fwd_flaps, "nose")):
         for az in P.flap_azimuths:
@@ -136,13 +176,70 @@ def hot_stage_truss_sdf(X, Y, Z, P: StarshipParams = StarshipParams()):
     return g.union(*parts)
 
 
-def dome_plate_list(P: StarshipParams = StarshipParams()):
-    """[(y, z, radius)] of the forward-dome protection plates (centre plate first)."""
-    rc, n, ring_r, rp, _ = P.dome_plates
-    out = [(0.0, 0.0, rc)]
-    for k in range(n):
-        a = 2 * np.pi * (k + 0.5) / n
-        out.append((ring_r * np.cos(a), ring_r * np.sin(a), rp))
+def _wrap(a):
+    return np.arctan2(np.sin(a), np.cos(a))
+
+
+def _trapezoid_2d(Y, Z, az, P):
+    """Plan-view signed distance (approx.) to an inner plate centred on azimuth az."""
+    r0, r1, half = P.plate_trap
+    rho = np.sqrt(Y * Y + Z * Z)
+    dth = np.abs(_wrap(np.arctan2(Z, Y) - az))
+    side = np.sin(np.clip(dth - np.radians(half), -np.pi / 2, np.pi / 2)) * rho      # distance to the straight side
+    return np.maximum(np.maximum(r0 - rho, rho - r1), side)
+
+
+def _chevron_2d(Y, Z, az, P):
+    """Plan-view signed distance (approx.) to an outer, bent-V plate centred on azimuth az."""
+    r_apex, slope, width, r_cap, half = P.plate_chevron
+    rho = np.sqrt(Y * Y + Z * Z)
+    dth = np.abs(_wrap(np.arctan2(Z, Y) - az))
+    r_in = r_apex + slope * dth
+    band = np.maximum(r_in - rho, rho - np.minimum(r_in + width, r_cap)) / np.sqrt(1 + (slope / np.maximum(rho, 0.3)) ** 2)
+    ang = np.sin(np.clip(dth - np.radians(half), -np.pi / 2, np.pi / 2)) * rho
+    d = np.maximum(band, ang)
+    for k in range(3):                       # clear of the neighbouring trapezoids, with the gap
+        d = np.maximum(d, P.plate_gap - _trapezoid_2d(Y, Z, np.radians(P.sea_level[5]) + 2 * np.pi * k / 3, P))
+    return d
+
+
+def dome_plate_footprints(P: StarshipParams = StarshipParams()):
+    """[(name, f(Y, Z) -> plan-view signed distance)] of the protection plates; 'apex disc' first
+    (if P.apex_disc), then 'inner plate 1..3' (under the sea-level engines) and 'outer plate 1..3'."""
+    out = []
+    if P.apex_disc:
+        out.append(("apex disc", lambda Y, Z: np.sqrt(Y * Y + Z * Z) - P.plate_apex_r))
+    az_sl = np.radians(P.sea_level[5])
+    for k in range(3):
+        a = az_sl + 2 * np.pi * k / 3
+        out.append((f"inner plate {k + 1}", (lambda a_: lambda Y, Z: _trapezoid_2d(Y, Z, a_, P))(a)))
+    for k in range(3):
+        a = az_sl + np.pi / 3 + 2 * np.pi * k / 3
+        out.append((f"outer plate {k + 1}", (lambda a_: lambda Y, Z: _chevron_2d(Y, Z, a_, P))(a)))
+    return out
+
+
+def dome_plate_outlines(P: StarshipParams = StarshipParams(), h=0.01):
+    """{name: [(N, 2) arrays of (y, z)]} plan-view outlines of the plates (for drawings)."""
+    from skimage.measure import find_contours
+    ax = np.arange(-4.6, 4.6 + h / 2, h)
+    Y, Z = np.meshgrid(ax, ax, indexing="ij")
+    out = {}
+    for name, f in dome_plate_footprints(P):
+        cs = find_contours(f(Y, Z), 0.0)
+        out[name] = [np.column_stack([np.interp(c[:, 0], np.arange(len(ax)), ax),
+                                      np.interp(c[:, 1], np.arange(len(ax)), ax)]) for c in cs if len(c) > 20]
+    return out
+
+
+def dome_plate_centroids(P: StarshipParams = StarshipParams(), h=0.05):
+    """{name: (y, z)} area centroid of each plate's plan view."""
+    ax = np.arange(-4.6, 4.6 + h / 2, h)
+    Y, Z = np.meshgrid(ax, ax, indexing="ij")
+    out = {}
+    for name, f in dome_plate_footprints(P):
+        m = f(Y, Z) < 0
+        out[name] = (float(Y[m].mean()), float(Z[m].mean())) if m.any() else (0.0, 0.0)
     return out
 
 
@@ -153,17 +250,17 @@ def dome_distance(X, Y, Z, tank_top_x=68.3, dome_rise=2.9, R=4.5):
 
 
 def dome_plates_sdf(X, Y, Z, P: StarshipParams = StarshipParams(), tank_top_x=68.3, dome_rise=2.9, which=None):
-    """The protection plates as thin caps standing `standoff` proud of the dome. which: plate
-    index (or None for all)."""
-    standoff = P.dome_plates[4]
+    """The protection plates as thin caps standing `plate_standoff` proud of the dome. which:
+    index into dome_plate_footprints (or None for all)."""
+    standoff = P.plate_standoff
     d = dome_distance(X, Y, Z, tank_top_x, dome_rise, P.radius)
     layer = np.maximum(d - standoff, -d - 0.02)
     layer = np.maximum(layer, tank_top_x - X)
     parts = []
-    for k, (cy, cz, rp) in enumerate(dome_plate_list(P)):
+    for k, (name, f) in enumerate(dome_plate_footprints(P)):
         if which is not None and k != which:
             continue
-        parts.append(np.maximum(layer, np.sqrt((Y - cy) ** 2 + (Z - cz) ** 2) - rp))
+        parts.append(np.maximum(layer, f(Y, Z)))
     return g.union(*parts)
 
 

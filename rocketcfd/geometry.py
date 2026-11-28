@@ -181,3 +181,17 @@ def capsule(X, Y, Z, p0, p1, r):
     L2 = float(d @ d)
     t = np.clip(((X - p0[0]) * d[0] + (Y - p0[1]) * d[1] + (Z - p0[2]) * d[2]) / max(L2, 1e-12), 0.0, 1.0)
     return np.sqrt((X - p0[0] - t * d[0]) ** 2 + (Y - p0[1] - t * d[1]) ** 2 + (Z - p0[2] - t * d[2]) ** 2) - r
+
+
+def frustum_axis(X, Y, Z, base, axis, r0, r1, length):
+    """Capped cone frustum from `base` (radius r0) along the unit vector `axis` for `length`
+    (radius r1 at the far end), any orientation (approximate SDF)."""
+    a = np.asarray(axis, float)
+    a = a / np.linalg.norm(a)
+    PX, PY, PZ = X - base[0], Y - base[1], Z - base[2]
+    s_ = PX * a[0] + PY * a[1] + PZ * a[2]
+    rho = np.sqrt(np.maximum((PX - s_ * a[0]) ** 2 + (PY - s_ * a[1]) ** 2 + (PZ - s_ * a[2]) ** 2, 0.0))
+    t = np.clip(s_ / length, 0.0, 1.0)
+    r = r0 + (r1 - r0) * t
+    cosa = length / np.hypot(length, r1 - r0)
+    return _combine((rho - r) * cosa, np.abs(s_ - 0.5 * length) - 0.5 * length)

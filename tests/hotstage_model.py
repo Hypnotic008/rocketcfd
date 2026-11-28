@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import numpy as np
 from rocketcfd import engines as EN, hotstage as HS
 from rocketcfd.vehicles.starship import (StarshipParams, engines as ship_engines, hot_stage_truss_sdf,
-                                         dome_plate_list, dome_distance)
+                                         dome_plate_footprints, dome_plate_centroids, dome_distance)
 
 
 def main():
@@ -39,12 +39,19 @@ def main():
           f"(T_c {e['T_c']:.0f}), freestream air {float(T_air):.0f} K (230)")
     ok &= abs(T_exit / e["T_e"] - 1) < 1e-6 and abs(T_stag / e["T_c"] - 1) < 0.02 and abs(T_air - 230) < 1e-6
     S = StarshipParams()
+    # plates: seven parts (apex disc + 3 + 3), no overlaps, each on the dome surface
+    h = 0.02
+    ax = np.arange(-4.6, 4.6, h)
+    Y, Z = np.meshgrid(ax, ax, indexing="ij")
+    fps = dome_plate_footprints(S)
+    cover = sum((f(Y, Z) < 0).astype(int) for _, f in fps)
+    names = [n for n, _ in fps]
     d = []
-    for cy, cz, rp in dome_plate_list(S):
+    for n, (cy, cz) in dome_plate_centroids(S).items():
         x = 68.3 + 2.9 * np.sqrt(max(0.0, 1 - (np.hypot(cy, cz) / S.radius) ** 2))
         d.append(float(dome_distance(np.array(x), np.array(cy), np.array(cz))))
-    print(f"plate centres on the dome surface: max |d| {max(map(abs, d)):.3f} m")
-    ok &= max(map(abs, d)) < 0.03
+    print(f"plates: {names}; overlapping: {int((cover > 1).sum())} cells; centroids on the dome: max |d| {max(map(abs, d)):.3f} m")
+    ok &= len(fps) == 7 and int((cover > 1).sum()) == 0 and max(map(abs, d)) < 0.03
     best = 9.0
     for kind, y, z, xe, re_, bl in ship_engines(S):
         if kind != "vacuum":
